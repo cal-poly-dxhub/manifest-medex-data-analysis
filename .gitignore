@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+
+# CDK
+cdk.out/
+cdk.context.json
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Large or sensitive healthcare data must not be committed
+sample_data/
+raw_data/
+*.hl7
+*.er7
+*.ccda
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
