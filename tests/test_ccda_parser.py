@@ -115,3 +115,22 @@ def test_ccda_parser_rejects_excessive_markup(monkeypatch: pytest.MonkeyPatch) -
 
     with pytest.raises(ParseError, match="structural complexity"):
         parse_ccda_document(SYNTHETIC_CCDA, SourceReference(bucket="raw", key="large.xml"))
+
+
+def test_ccda_parser_handles_sparse_document_and_unknown_section() -> None:
+    sparse = b"""<ClinicalDocument xmlns="urn:hl7-org:v3">
+      <effectiveTime value="not-a-timestamp"/>
+      <component><structuredBody><component><section>
+        <code code="unknown-section"/>
+      </section></component></structuredBody></component>
+    </ClinicalDocument>"""
+
+    document = parse_ccda_document(
+        sparse,
+        SourceReference(bucket="raw", key="sparse.xml"),
+    )
+
+    assert document["documentTime"] is None
+    assert document["participantId"] is None
+    assert document["CD"] == {}
+    assert document["sectionCounts"] == {"unknown-section": 1}
