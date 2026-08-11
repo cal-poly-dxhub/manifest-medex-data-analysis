@@ -213,6 +213,24 @@ wheels = [
 ]
 
 [[package]]
+name = "defusedxml"
+version = "0.7.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/0f/d5/c66da9b79e5bdb124974bfe172b4daf3c984ebd9c2a06e2b8a4dc7331c72/defusedxml-0.7.1.tar.gz", hash = "sha256:1bb3032db185915b62d7c6209c5a8792be6a32ab2fedacc84e01b52c51aa3e69", size = 75520, upload-time = "2021-03-08T10:59:26.269Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/07/6c/aa3f2f849e01cb6a001cd8554a88d4c77c5c1a31c95bdf1cf9301e6d9ef4/defusedxml-0.7.1-py2.py3-none-any.whl", hash = "sha256:a352e7e428770286cc899e2542b6cdaedb2b4953ff269a210103ec58f6198a61", size = 25604, upload-time = "2021-03-08T10:59:24.45Z" },
+]
+
+[[package]]
+name = "hl7"
+version = "0.4.5"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/b4/3a/67e8f7b695423eecbc38a1e8439bbb69fb234945dd3527fbdfdcec869cd0/hl7-0.4.5.tar.gz", hash = "sha256:b6eb97499ebe236e00c3009d43e6b0f040de002df12a292fa5efbd2ce2a8a838", size = 48796, upload-time = "2022-03-31T11:30:18.604Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8d/2b/024977b044ca3aa79153e0a4ff13cc465064ccf9cf7b60df46e6eab8340e/hl7-0.4.5-py2.py3-none-any.whl", hash = "sha256:f46bf7c165801fd40e8fcc9f2be41c5794415039adc97646aee7ee6b20ce8ccd", size = 25495, upload-time = "2022-03-31T11:30:16.696Z" },
+]
+
+[[package]]
 name = "iniconfig"
 version = "2.3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -284,6 +302,8 @@ source = { virtual = "." }
 dependencies = [
     { name = "aws-cdk-lib" },
     { name = "constructs" },
+    { name = "defusedxml" },
+    { name = "hl7" },
     { name = "pydantic" },
 ]
 
@@ -300,6 +320,8 @@ dev = [
 requires-dist = [
     { name = "aws-cdk-lib", specifier = "==2.263.0" },
     { name = "constructs", specifier = "==10.8.1" },
+    { name = "defusedxml", specifier = "==0.7.1" },
+    { name = "hl7", specifier = "==0.4.5" },
     { name = "pydantic", specifier = "==2.13.4" },
 ]
 

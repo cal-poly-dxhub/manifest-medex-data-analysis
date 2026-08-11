@@ -1,0 +1,112 @@
+import pytest
+from src.parser import ParseError, SourceReference, parse_hl7_file, split_hl7_messages
+
+SYNTHETIC_BATCH = (
+    "MSH|^~\\&|SYNTH|FACILITY_A|RECEIVER|DEST|20260810123045-0700||ORU^R01^ORU_R01|MSG-1|P|2.5.1\r"
+    "PID|1||PATIENT-1^^^FACILITY_A^MR||Example^Synthetic||20000101|F\r"
+    "PV1|1|O|||||1234567890^Doctor^One|2345678901^Doctor^Two|3456789012^Doctor^Three||||||||4567890123^Doctor^Four|||||||||||||||||||||||||||20260810110000|20260810120000\r"
+    "PV2|||TEST^Synthetic reason^L\r"
+    "OBR|1|||1234-5^Synthetic test^LN||||||||||||||||||20260810124000||LAB|F\r"
+    "OBX|1|NM|1234-5^Synthetic result^LN||42|mg/dL|||||F\r"
+    "OBX|2|ST|6789-0^Synthetic text^LOINC||present||||||C\r"
+    "MSH|^~\\&|SYNTH|FACILITY_A|RECEIVER|DEST|20260810130000||ADT^A01|MSG-2|P|2.5.1\r"
+    "PID|1||PATIENT-2^^^FACILITY_A^MR||Example^Second||19991231|M\r"
+)
+
+
+def test_split_and_parse_batch_with_legacy_query_paths() -> None:
+    documents = parse_hl7_file(
+        SYNTHETIC_BATCH.encode(),
+        SourceReference(
+            bucket="synthetic-raw",
+            key="participant=FACILITY_A/type=ORU/synthetic.hl7",
+            version_id="version-1",
+        ),
+        ingested_at="2026-08-10T19:30:00Z",
+    )
+
+    assert len(documents) == 2
+    oru = documents[0]
+    assert oru["messageType"] == "ORU"
+    assert oru["triggerEvent"] == "R01"
+    assert oru["sourceFacilityId"] == "FACILITY_A"
+    assert oru["participantId"] == "FACILITY_A"
+    assert oru["messageTime"] == "2026-08-10T19:30:45Z"
+    assert oru["segmentCounts"]["OBX"] == 2
+    assert oru["ROOT"]["MSH"]["MSH_9_Message_Type"] == {"MSG_1": "ORU", "MSG_2": "R01"}
+    assert oru["ROOT"]["PID"]["PID_3_Patient_Identifier_List"]["CX_1"] == "PATIENT-1"
+    assert oru["ROOT"]["PV1"]["PV1_7_Attending_Doctor"]["XCN_1"] == "1234567890"
+    assert oru["ROOT"]["PV2"]["PV2_3_Admit_Reason"]["CWE_2"] == "Synthetic reason"
+    assert oru["ROOT"]["OBR"]["OBR_24_Diagnostic_Serv_Sect_ID"] == "LAB"
+    assert oru["ROOT"]["OBX"]["OBX_11_Observation_Result_Status"] == ["F", "C"]
+    assert oru["ROOT"]["OBX"]["OBX_3_Observation_Identifier"]["CWE_3"] == [
+        "LN",
+        "LOINC",
+    ]
+
+    adt = documents[1]
+    assert adt["messageType"] == "ADT"
+    assert adt["messageOrdinal"] == 1
+    assert adt["documentId"] != oru["documentId"]
+
+
+def test_document_id_is_stable_for_the_same_object_version() -> None:
+    source = SourceReference(bucket="raw", key="synthetic.hl7", version_id="v1")
+
+    first = parse_hl7_file(SYNTHETIC_BATCH.encode(), source)
+    second = parse_hl7_file(SYNTHETIC_BATCH.encode(), source)
+
+    assert [item["documentId"] for item in first] == [item["documentId"] for item in second]
+
+
+def test_split_tolerates_mllp_and_newline_delimiters() -> None:
+    payload = "\x0bMSH|^~\\&|S|F|||||ADT^A01|1|P|2.5\nPID|1\x1c\n"
+
+    messages = split_hl7_messages(payload)
+
+    assert messages == ["MSH|^~\\&|S|F|||||ADT^A01|1|P|2.5\rPID|1"]
+
+
+def test_invalid_input_is_rejected_without_echoing_payload() -> None:
+    with pytest.raises(ParseError, match="Content appeared before the first MSH segment"):
+        parse_hl7_file(b"not an hl7 message", SourceReference(bucket="raw", key="bad.hl7"))
+
+
+def test_split_preserves_trailing_field_whitespace() -> None:
+    message = "MSH|^~\\&|S|F|||||ADT^A01|1|P|2.5\rPID|1|value  \r"
+
+    assert split_hl7_messages(message)[0].endswith("PID|1|value  ")
+
+
+def test_library_parsing_handles_custom_delimiters_and_unknown_segments() -> None:
+    payload = (
+        "MSH*$%!?*APP*FACILITY$OID***20260810120000**ORU$R01*ID-1*P*2.5\r"
+        "PID*1**FIRST%SECOND**Family!S!Suffix$Given\r"
+        "Z99*accepted\r"
+    )
+
+    document = parse_hl7_file(payload.encode(), SourceReference(bucket="raw", key="custom.hl7"))[0]
+
+    assert document["parserVersion"] == "0.2.0"
+    assert document["sourceFacilityId"] == "FACILITY"
+    assert document["messageType"] == "ORU"
+    assert document["triggerEvent"] == "R01"
+    assert document["ROOT"]["PID"]["PID_3_Patient_Identifier_List"]["CX_1"] == "FIRST"
+    assert document["ROOT"]["PID"]["PID_5_Patient_Name"]["XPN_1"]["FN_1"] == ("Family$Suffix")
+    assert document["segmentCounts"]["Z99"] == 1
+
+
+def test_library_parsing_preserves_spaces_in_the_final_projected_field() -> None:
+    payload = "MSH|^~\\&|S|F|||||ORU^R01|1|P|2.5\rOBX|1|ST|CODE||value||||||F  \r"
+
+    document = parse_hl7_file(payload.encode(), SourceReference(bucket="raw", key="spaces.hl7"))[0]
+
+    assert document["ROOT"]["OBX"]["OBX_11_Observation_Result_Status"] == "F  "
+
+
+def test_library_parse_failures_are_sanitized() -> None:
+    with pytest.raises(ParseError, match="HL7 message has an invalid MSH segment"):
+        parse_hl7_file(
+            b"MSH|broken",
+            SourceReference(bucket="raw", key="malformed.hl7"),
+        )
