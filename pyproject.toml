@@ -7,6 +7,8 @@ requires-python = ">=3.12,<3.14"
 dependencies = [
   "aws-cdk-lib==2.263.0",
   "constructs==10.8.1",
+  "defusedxml==0.7.1",
+  "hl7==0.4.5",
   "pydantic==2.13.4",
 ]
 
@@ -69,5 +71,5 @@ files = ["app.py", "src", "tests"]
 exclude = ["cdk.out"]
 
 [[tool.mypy.overrides]]
-module = ["aws_cdk.*", "cdk_nag.*", "constructs.*"]
+module = ["aws_cdk.*", "cdk_nag.*", "constructs.*", "defusedxml.*", "hl7.*"]
 ignore_missing_imports = true
