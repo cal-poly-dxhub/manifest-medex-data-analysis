@@ -40,6 +40,11 @@ class AppConfig(BaseModel):
     account: str | None = Field(default=None, pattern=r"^\d{12}$")
     region: str | None = Field(default=None, pattern=r"^[a-z]{2}(?:-gov)?-[a-z]+-\d$")
     enable_cdk_nag: bool = True
+    enable_public_dashboard: bool = False
+    dashboard_principal_arn: str | None = Field(
+        default=None,
+        pattern=r"^arn:(?:aws|aws-us-gov|aws-cn):iam::\d{12}:role/.+$",
+    )
     termination_protection: bool = False
 
     @model_validator(mode="after")
@@ -51,6 +56,21 @@ class AppConfig(BaseModel):
         if (self.account is None) != (self.region is None):
             msg = "CDK account and region must be provided together"
             raise ValueError(msg)
+        if self.enable_public_dashboard:
+            if self.environment is not DeploymentEnvironment.DEV:
+                msg = "Public Dashboard access is allowed only in development"
+                raise ValueError(msg)
+            if self.dashboard_principal_arn is None:
+                msg = "Public Dashboard access requires dashboard_principal_arn"
+                raise ValueError(msg)
+        elif self.dashboard_principal_arn is not None:
+            msg = "dashboard_principal_arn requires enable_public_dashboard=true"
+            raise ValueError(msg)
+        if self.account is not None and self.dashboard_principal_arn is not None:
+            principal_account = self.dashboard_principal_arn.split(":", maxsplit=5)[4]
+            if principal_account != self.account:
+                msg = "Dashboard principal must belong to the deployment account"
+                raise ValueError(msg)
         return self
 
     @classmethod
@@ -87,6 +107,15 @@ class AppConfig(BaseModel):
             enable_cdk_nag=_context_bool(
                 node.try_get_context("enable_cdk_nag"),
                 default=True,
+            ),
+            enable_public_dashboard=_context_bool(
+                node.try_get_context("enable_public_dashboard"),
+                default=False,
+            ),
+            dashboard_principal_arn=(
+                str(value).strip()
+                if (value := node.try_get_context("dashboard_principal_arn")) is not None
+                else None
             ),
             termination_protection=termination_protection,
         )

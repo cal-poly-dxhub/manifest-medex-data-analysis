@@ -27,6 +27,7 @@ cdk.context.json
 # Large or sensitive healthcare data must not be committed
 sample_data/
 raw_data/
+test-output/
 *.hl7
 *.er7
 *.ccda
@@ -35,3 +36,9 @@ raw_data/
 build/
 dist/
 *.egg-info/
+
+# Test scripts
+run.py
+run_ccda_parser.py
+run_hl7_parser.py
+docs/
