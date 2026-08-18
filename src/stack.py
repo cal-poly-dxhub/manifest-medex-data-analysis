@@ -8,6 +8,7 @@ from aws_cdk import (
     BundlingOptions,
     CfnDeletionPolicy,
     CfnOutput,
+    CfnResource,
     Duration,
     Environment,
     ILocalBundling,
@@ -16,45 +17,26 @@ from aws_cdk import (
     Stack,
     Tags,
 )
-from aws_cdk import (
-    aws_cloudwatch as cloudwatch,
-)
-from aws_cdk import (
-    aws_ec2 as ec2,
-)
-from aws_cdk import (
-    aws_events as events,
-)
-from aws_cdk import (
-    aws_events_targets as events_targets,
-)
-from aws_cdk import (
-    aws_iam as iam,
-)
-from aws_cdk import (
-    aws_kms as kms,
-)
-from aws_cdk import (
-    aws_lambda as lambda_,
-)
-from aws_cdk import (
-    aws_lambda_event_sources as lambda_event_sources,
-)
-from aws_cdk import (
-    aws_logs as logs,
-)
-from aws_cdk import (
-    aws_opensearchserverless as opensearchserverless,
-)
-from aws_cdk import (
-    aws_s3 as s3,
-)
-from aws_cdk import (
-    aws_sqs as sqs,
-)
+from aws_cdk import aws_cloudwatch as cloudwatch
+from aws_cdk import aws_ec2 as ec2
+from aws_cdk import aws_events as events
+from aws_cdk import aws_events_targets as events_targets
+from aws_cdk import aws_iam as iam
+from aws_cdk import aws_kms as kms
+from aws_cdk import aws_lambda as lambda_
+from aws_cdk import aws_lambda_event_sources as lambda_event_sources
+from aws_cdk import aws_logs as logs
+from aws_cdk import aws_opensearchserverless as opensearchserverless
+from aws_cdk import aws_rds as rds
+from aws_cdk import aws_s3 as s3
+from aws_cdk import aws_sqs as sqs
 from cdk_nag import NagSuppressions
 from constructs import Construct
 from src.config import AppConfig, DeploymentEnvironment
+
+METADATA_DATABASE_NAME = "manifest_medex"
+METADATA_TABLE_NAME = "document_metadata"
+AURORA_CREDENTIALS_MISSING = "Aurora generated credentials did not produce a secret"
 
 
 @jsii.implements(ILocalBundling)
@@ -105,7 +87,7 @@ class _LambdaBundler:
 
 
 class DataQualityStack(Stack):
-    """Secure event-driven parsing and OpenSearch indexing platform."""
+    """Private format-specific clinical ingestion and metadata platform."""
 
     def __init__(
         self,
@@ -120,7 +102,7 @@ class DataQualityStack(Stack):
         super().__init__(
             scope,
             construct_id,
-            description="Manifest MedEx secure HL7 and CCDA parsing and indexing platform",
+            description="Manifest MedEx private HL7 and CCDA ingestion platform",
             env=env,
             stack_name=self.stack_prefix,
             termination_protection=config.termination_protection,
@@ -134,43 +116,73 @@ class DataQualityStack(Stack):
         self.error_bucket = self._create_data_bucket("ErrorBucket", "error/")
         self._enable_raw_bucket_event_bridge()
 
-        self.parse_queue, self.parse_dead_letter_queue = self._create_queue_pair(
-            "Parse",
-            visibility_timeout=Duration.minutes(15),
-        )
-        self.index_queue, self.index_dead_letter_queue = self._create_queue_pair(
-            "Index",
-            visibility_timeout=Duration.minutes(6),
-        )
-        self._create_raw_object_rule()
+        self.hl7_queue, self.hl7_dead_letter_queue = self._create_queue_pair("Hl7")
+        self.ccda_queue, self.ccda_dead_letter_queue = self._create_queue_pair("Ccda")
 
-        self.vpc = self._create_search_vpc()
-        self.indexer_security_group = ec2.SecurityGroup(
+        self.vpc = self._create_ingestion_vpc()
+        self.ingestion_security_group = ec2.SecurityGroup(
             self,
-            "IndexerSecurityGroup",
+            "IngestionSecurityGroup",
             vpc=self.vpc,
             allow_all_outbound=True,
-            description="Network access for the OpenSearch index Lambda",
+            description="Network access for the format-specific ingestion Lambdas",
         )
-        self.serverless_endpoint_security_group = ec2.SecurityGroup(
-            self,
+        self.serverless_endpoint_security_group = self._create_endpoint_security_group(
             "ServerlessEndpointSecurityGroup",
-            vpc=self.vpc,
-            allow_all_outbound=True,
-            description="Allows HTTPS to the OpenSearch Serverless VPC endpoint from the indexer",
+            "OpenSearch Serverless",
         )
-        self.serverless_endpoint_security_group.add_ingress_rule(
-            self.indexer_security_group,
-            ec2.Port.tcp(443),
-            "HTTPS from index Lambda",
+        self.data_api_endpoint_security_group = self._create_endpoint_security_group(
+            "DataApiEndpointSecurityGroup",
+            "RDS Data API",
         )
 
-        self.indexer_role = self._create_indexer_role()
+        self.hl7_role = self._create_ingestion_role("Hl7", "incoming/hl7/*", "hl7/*")
+        self.ccda_role = self._create_ingestion_role("Ccda", "incoming/ccda/*", "ccda/*")
+
         self.serverless_vpc_endpoint = self._create_serverless_vpc_endpoint()
         self.search_collection = self._create_search_collection()
-        self._grant_indexer_collection_access()
-        self.parser_function = self._create_parser_function()
-        self.indexer_function = self._create_indexer_function()
+        self._grant_collection_access()
+
+        self.metadata_cluster = self._create_metadata_cluster()
+        NagSuppressions.add_resource_suppressions_by_path(
+            self,
+            f"/{self.node.path}/MetadataCluster/Secret/Resource",
+            [
+                {
+                    "id": "AwsSolutions-SMG4",
+                    "reason": (
+                        "The v1 Data API-only design intentionally has no database-connected "
+                        "rotation Lambda or port 5432 ingress; rotate this retained demo secret "
+                        "through an explicitly approved maintenance operation."
+                    ),
+                }
+            ],
+        )
+        self.data_api_endpoint = self._create_data_api_endpoint()
+        self._grant_metadata_access(self.hl7_role)
+        self._grant_metadata_access(self.ccda_role)
+
+        self.hl7_function = self._create_ingestion_function(
+            "Hl7",
+            handler="src.hl7_handler.handler",
+            role=self.hl7_role,
+            source_format="hl7-v2",
+            reserved_concurrency=10,
+        )
+        self.ccda_function = self._create_ingestion_function(
+            "Ccda",
+            handler="src.ccda_handler.handler",
+            role=self.ccda_role,
+            source_format="ccda",
+            reserved_concurrency=5,
+        )
+
+        self.hl7_raw_object_rule = self._create_raw_object_rule(
+            "Hl7", "incoming/hl7/", self.hl7_queue, self.hl7_dead_letter_queue
+        )
+        self.ccda_raw_object_rule = self._create_raw_object_rule(
+            "Ccda", "incoming/ccda/", self.ccda_queue, self.ccda_dead_letter_queue
+        )
         self._connect_event_sources()
         self._create_operational_alarms()
         self._create_outputs()
@@ -190,17 +202,17 @@ class DataQualityStack(Stack):
             self,
             "EncryptionKey",
             alias=f"alias/{self.stack_prefix}",
-            description="Encrypts Manifest MedEx data, messages, logs, and function configuration",
+            description="Encrypts Manifest MedEx data, messages, logs, secrets, and Aurora",
             enable_key_rotation=True,
             pending_window=Duration.days(30),
             removal_policy=RemovalPolicy.RETAIN,
         )
         log_group_arns = [
-            (f"arn:{self.partition}:logs:{self.region}:{self.account}:log-group:{log_group_name}")
-            for log_group_name in (
+            f"arn:{self.partition}:logs:{self.region}:{self.account}:log-group:{name}"
+            for name in (
                 f"/aws/vpc/{self.stack_prefix}",
-                f"/aws/lambda/{self.stack_prefix}-parser",
-                f"/aws/lambda/{self.stack_prefix}-indexer",
+                f"/aws/lambda/{self.stack_prefix}-hl7",
+                f"/aws/lambda/{self.stack_prefix}-ccda",
             )
         ]
         key.add_to_resource_policy(
@@ -215,11 +227,7 @@ class DataQualityStack(Stack):
                     "kms:Describe*",
                 ],
                 resources=["*"],
-                conditions={
-                    "ArnEquals": {
-                        "kms:EncryptionContext:aws:logs:arn": log_group_arns,
-                    }
-                },
+                conditions={"ArnEquals": {"kms:EncryptionContext:aws:logs:arn": log_group_arns}},
             )
         )
         NagSuppressions.add_resource_suppressions(
@@ -288,12 +296,7 @@ class DataQualityStack(Stack):
             )
         )
 
-    def _create_queue_pair(
-        self,
-        construct_id: str,
-        *,
-        visibility_timeout: Duration,
-    ) -> tuple[sqs.Queue, sqs.Queue]:
+    def _create_queue_pair(self, construct_id: str) -> tuple[sqs.Queue, sqs.Queue]:
         dead_letter_queue = sqs.Queue(
             self,
             f"{construct_id}DeadLetterQueue",
@@ -315,41 +318,53 @@ class DataQualityStack(Stack):
             encryption_master_key=self.encryption_key,
             enforce_ssl=True,
             retention_period=Duration.days(14),
-            visibility_timeout=visibility_timeout,
+            visibility_timeout=Duration.minutes(15),
         )
         return queue, dead_letter_queue
 
-    def _create_raw_object_rule(self) -> None:
-        self.raw_object_rule = events.Rule(
+    def _create_raw_object_rule(
+        self,
+        construct_id: str,
+        prefix: str,
+        queue: sqs.Queue,
+        dead_letter_queue: sqs.Queue,
+    ) -> events.Rule:
+        rule = events.Rule(
             self,
-            "RawObjectRule",
-            description="Routes newly created raw objects to the parse queue",
+            f"{construct_id}RawObjectRule",
+            description=(
+                f"Routes newly created {construct_id.upper()} objects to its ingestion queue"
+            ),
             event_pattern=events.EventPattern(
                 source=["aws.s3"],
                 detail_type=["Object Created"],
-                detail={"bucket": {"name": [self.raw_bucket.bucket_name]}},
+                detail={
+                    "bucket": {"name": [self.raw_bucket.bucket_name]},
+                    "object": {"key": [{"prefix": prefix}]},
+                },
             ),
         )
-        self.raw_object_rule.add_target(
+        rule.add_target(
             events_targets.SqsQueue(
-                self.parse_queue,
-                dead_letter_queue=self.parse_dead_letter_queue,
+                queue,
+                dead_letter_queue=dead_letter_queue,
                 max_event_age=Duration.hours(2),
                 retry_attempts=10,
             )
         )
+        return rule
 
-    def _create_search_vpc(self) -> ec2.Vpc:
+    def _create_ingestion_vpc(self) -> ec2.Vpc:
         availability_zones = 3 if self.config.environment is DeploymentEnvironment.PROD else 2
         vpc = ec2.Vpc(
             self,
-            "SearchVpc",
+            "IngestionVpc",
             ip_addresses=ec2.IpAddresses.cidr("10.42.0.0/16"),
             max_azs=availability_zones,
             nat_gateways=0,
             subnet_configuration=[
                 ec2.SubnetConfiguration(
-                    name="Search",
+                    name="Ingestion",
                     subnet_type=ec2.SubnetType.PRIVATE_ISOLATED,
                     cidr_mask=24,
                 )
@@ -367,12 +382,34 @@ class DataQualityStack(Stack):
         )
         return vpc
 
-    def _create_indexer_role(self) -> iam.Role:
+    def _create_endpoint_security_group(
+        self, construct_id: str, service_name: str
+    ) -> ec2.SecurityGroup:
+        security_group = ec2.SecurityGroup(
+            self,
+            construct_id,
+            vpc=self.vpc,
+            allow_all_outbound=False,
+            description=f"Allows HTTPS to {service_name} only from ingestion Lambdas",
+        )
+        security_group.add_ingress_rule(
+            self.ingestion_security_group,
+            ec2.Port.tcp(443),
+            f"HTTPS from ingestion Lambdas to {service_name}",
+        )
+        return security_group
+
+    def _create_ingestion_role(
+        self,
+        construct_id: str,
+        raw_key_pattern: str,
+        parsed_key_pattern: str,
+    ) -> iam.Role:
         role = iam.Role(
             self,
-            "IndexerRole",
+            f"{construct_id}IngestionRole",
             assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
-            description="Least-privilege execution role for the OpenSearch index Lambda",
+            description=f"Least-privilege execution role for {construct_id.upper()} ingestion",
         )
         role.add_to_policy(
             iam.PolicyStatement(
@@ -386,21 +423,39 @@ class DataQualityStack(Stack):
                 resources=["*"],
             )
         )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["s3:GetObject", "s3:GetObjectVersion"],
+                resources=[self.raw_bucket.arn_for_objects(raw_key_pattern)],
+            )
+        )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["s3:PutObject"],
+                resources=[
+                    self.parsed_bucket.arn_for_objects(parsed_key_pattern),
+                    self.error_bucket.arn_for_objects(f"processing/{construct_id.lower()}/*"),
+                ],
+            )
+        )
+        self.encryption_key.grant_encrypt_decrypt(role)
         NagSuppressions.add_resource_suppressions(
             role,
             [
                 {
                     "id": "AwsSolutions-IAM5",
-                    "reason": "Lambda VPC networking APIs do not support resource scoping.",
+                    "reason": (
+                        "Lambda VPC APIs require wildcard resources; S3 object and log-stream "
+                        "permissions use suffix wildcards within named prefixes; KMS APIs use "
+                        "service-defined wildcards."
+                    ),
                 }
             ],
             apply_to_children=True,
         )
         return role
 
-    def _create_serverless_vpc_endpoint(
-        self,
-    ) -> opensearchserverless.CfnVpcEndpoint:
+    def _create_serverless_vpc_endpoint(self) -> opensearchserverless.CfnVpcEndpoint:
         return opensearchserverless.CfnVpcEndpoint(
             self,
             "ServerlessVpcEndpoint",
@@ -494,7 +549,7 @@ class DataQualityStack(Stack):
                         ],
                     }
                 ],
-                "Principal": [self.indexer_role.role_arn],
+                "Principal": [self.hl7_role.role_arn, self.ccda_role.role_arn],
             }
         ]
         if self.config.enable_public_dashboard:
@@ -505,10 +560,7 @@ class DataQualityStack(Stack):
                         {
                             "ResourceType": "index",
                             "Resource": index_resources,
-                            "Permission": [
-                                "aoss:DescribeIndex",
-                                "aoss:ReadDocument",
-                            ],
+                            "Permission": ["aoss:DescribeIndex", "aoss:ReadDocument"],
                         }
                     ],
                     "Principal": [cast(str, self.config.dashboard_principal_arn)],
@@ -519,7 +571,7 @@ class DataQualityStack(Stack):
             "SearchDataAccessPolicy",
             name=f"{collection_name}-access",
             type="data",
-            description="Indexer write and optional development Dashboard read access",
+            description="Format-specific ingestion write and optional Dashboard read access",
             policy=self.to_json_string(access_rules),
         )
 
@@ -541,137 +593,154 @@ class DataQualityStack(Stack):
         access_policy.node.add_dependency(collection)
         return collection
 
-    def _grant_indexer_collection_access(self) -> None:
-        self.indexer_role.add_to_policy(
-            iam.PolicyStatement(
-                actions=["aoss:APIAccessAll"],
-                resources=[self.search_collection.attr_arn],
+    def _grant_collection_access(self) -> None:
+        for role in (self.hl7_role, self.ccda_role):
+            role.add_to_policy(
+                iam.PolicyStatement(
+                    actions=["aoss:APIAccessAll"],
+                    resources=[self.search_collection.attr_arn],
+                )
             )
-        )
 
-    def _create_parser_function(self) -> lambda_.Function:
-        function_name = f"{self.stack_prefix}-parser"
-        log_group = self._create_log_group(
-            "ParserLogGroup",
-            f"/aws/lambda/{function_name}",
-        )
-        role = iam.Role(
+    def _create_metadata_cluster(self) -> rds.DatabaseCluster:
+        cluster = rds.DatabaseCluster(
             self,
-            "ParserRole",
-            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
-            description="Least-privilege execution role for the clinical parser Lambda",
+            "MetadataCluster",
+            engine=rds.DatabaseClusterEngine.aurora_postgres(
+                version=rds.AuroraPostgresEngineVersion.VER_16_8
+            ),
+            writer=rds.ClusterInstance.serverless_v2(
+                "Writer",
+                publicly_accessible=False,
+            ),
+            readers=[],
+            credentials=rds.Credentials.from_generated_secret(
+                "metadata_admin",
+                encryption_key=self.encryption_key,
+                secret_name=f"{self.stack_prefix}/aurora/metadata-admin",
+            ),
+            default_database_name=METADATA_DATABASE_NAME,
+            enable_data_api=True,
+            iam_authentication=True,
+            serverless_v2_min_capacity=0.5,
+            serverless_v2_max_capacity=2,
+            storage_encrypted=True,
+            storage_encryption_key=self.encryption_key,
+            backup=rds.BackupProps(
+                retention=Duration.days(
+                    35 if self.config.environment is DeploymentEnvironment.PROD else 7
+                )
+            ),
+            copy_tags_to_snapshot=True,
+            deletion_protection=self.config.environment is DeploymentEnvironment.PROD,
+            removal_policy=RemovalPolicy.RETAIN,
+            vpc=self.vpc,
+            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_ISOLATED),
         )
-        log_group.grant_write(role)
-        role.add_to_policy(
-            iam.PolicyStatement(
-                actions=["s3:GetObject", "s3:GetObjectVersion"],
-                resources=[self.raw_bucket.arn_for_objects("*")],
-            )
-        )
-        role.add_to_policy(
-            iam.PolicyStatement(
-                actions=["s3:PutObject"],
-                resources=[
-                    self.parsed_bucket.arn_for_objects("*"),
-                    self.error_bucket.arn_for_objects("*"),
-                ],
-            )
-        )
-        role.add_to_policy(
-            iam.PolicyStatement(
-                actions=["sqs:SendMessage"],
-                resources=[self.index_queue.queue_arn],
-            )
-        )
-        self.encryption_key.grant_encrypt_decrypt(role)
+        if cluster.secret is None:
+            raise RuntimeError(AURORA_CREDENTIALS_MISSING)
+        cluster.secret.apply_removal_policy(RemovalPolicy.RETAIN)
+        credential_secret = cluster.secret.node.scope
+        if credential_secret is None:
+            raise RuntimeError(AURORA_CREDENTIALS_MISSING)
+        secret_resource = cast(CfnResource, credential_secret.node.default_child)
+        secret_resource.apply_removal_policy(RemovalPolicy.RETAIN)
         NagSuppressions.add_resource_suppressions(
-            role,
+            cluster,
             [
                 {
-                    "id": "AwsSolutions-IAM5",
+                    "id": "AwsSolutions-RDS10",
                     "reason": (
-                        "S3 object and log-stream permissions require suffix wildcards within "
-                        "named buckets/log groups; KMS APIs use service-defined wildcards."
+                        "Development and staging retain the cluster on stack deletion but permit "
+                        "explicit replacement; production enables deletion protection."
                     ),
                 }
             ],
-            apply_to_children=True,
         )
-        function = lambda_.Function(
-            self,
-            "ParserFunction",
-            function_name=function_name,
-            runtime=lambda_.Runtime.PYTHON_3_14,
-            architecture=lambda_.Architecture.ARM_64,
-            code=self._lambda_code(),
-            handler="src.parse_handler.handler",
-            role=role,
-            description="Parses HL7 batches and CCDA documents into deterministic records",
-            environment={
-                "ERROR_BUCKET": self.error_bucket.bucket_name,
-                "INDEX_QUEUE_URL": self.index_queue.queue_url,
-                "MAX_OBJECT_BYTES": str(50 * 1024 * 1024),
-                "PARSED_BUCKET": self.parsed_bucket.bucket_name,
-            },
-            environment_encryption=self.encryption_key,
-            ephemeral_storage_size=Size.mebibytes(1024),
-            log_group=log_group,
-            memory_size=2048,
-            reserved_concurrent_executions=10,
-            timeout=Duration.minutes(2),
-            tracing=lambda_.Tracing.ACTIVE,
-        )
-        return function
+        return cluster
 
-    def _create_indexer_function(self) -> lambda_.Function:
-        function_name = f"{self.stack_prefix}-indexer"
+    def _create_data_api_endpoint(self) -> ec2.InterfaceVpcEndpoint:
+        endpoint = self.vpc.add_interface_endpoint(
+            "RdsDataEndpoint",
+            service=ec2.InterfaceVpcEndpointAwsService.RDS_DATA,
+            private_dns_enabled=True,
+            open=False,
+            security_groups=[self.data_api_endpoint_security_group],
+            subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_ISOLATED),
+        )
+        endpoint.add_to_policy(
+            iam.PolicyStatement(
+                principals=[self.hl7_role, self.ccda_role],
+                actions=["rds-data:ExecuteStatement", "rds-data:BatchExecuteStatement"],
+                resources=[self.metadata_cluster.cluster_arn],
+            )
+        )
+        return endpoint
+
+    def _grant_metadata_access(self, role: iam.Role) -> None:
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["rds-data:ExecuteStatement", "rds-data:BatchExecuteStatement"],
+                resources=[self.metadata_cluster.cluster_arn],
+            )
+        )
+        if self.metadata_cluster.secret is None:
+            raise RuntimeError(AURORA_CREDENTIALS_MISSING)
+        self.metadata_cluster.secret.grant_read(role)
+
+    def _create_ingestion_function(
+        self,
+        construct_id: str,
+        *,
+        handler: str,
+        role: iam.Role,
+        source_format: str,
+        reserved_concurrency: int,
+    ) -> lambda_.Function:
+        function_name = f"{self.stack_prefix}-{construct_id.lower()}"
         log_group = self._create_log_group(
-            "IndexerLogGroup",
+            f"{construct_id}LogGroup",
             f"/aws/lambda/{function_name}",
         )
-        log_group.grant_write(self.indexer_role)
-        self.indexer_role.add_to_policy(
-            iam.PolicyStatement(
-                actions=["s3:GetObject"],
-                resources=[self.parsed_bucket.arn_for_objects("*")],
-            )
-        )
-        self.indexer_role.add_to_policy(
-            iam.PolicyStatement(
-                actions=["s3:PutObject"],
-                resources=[self.error_bucket.arn_for_objects("*")],
-            )
-        )
-        self.encryption_key.grant_encrypt_decrypt(self.indexer_role)
-        function = lambda_.Function(
+        log_group.grant_write(role)
+        if self.metadata_cluster.secret is None:
+            raise RuntimeError(AURORA_CREDENTIALS_MISSING)
+        return lambda_.Function(
             self,
-            "IndexerFunction",
+            f"{construct_id}Function",
             function_name=function_name,
             runtime=lambda_.Runtime.PYTHON_3_14,
             architecture=lambda_.Architecture.ARM_64,
             code=self._lambda_code(),
-            handler="src.index_handler.handler",
-            role=self.indexer_role,
-            description="Bulk indexes deterministic HL7 and CCDA documents into OpenSearch",
+            handler=handler,
+            role=role,
+            description=f"Parses, indexes, and persists {source_format} document metadata",
             environment={
                 "ERROR_BUCKET": self.error_bucket.bucket_name,
+                "MAX_BULK_BYTES": str(5 * 1024 * 1024),
+                "MAX_OBJECT_BYTES": str(50 * 1024 * 1024),
+                "METADATA_CLUSTER_ARN": self.metadata_cluster.cluster_arn,
+                "METADATA_DATABASE": METADATA_DATABASE_NAME,
+                "METADATA_SECRET_ARN": self.metadata_cluster.secret.secret_arn,
+                "METADATA_TABLE": METADATA_TABLE_NAME,
                 "OPENSEARCH_ENDPOINT": self.search_collection.attr_collection_endpoint,
                 "OPENSEARCH_SERVICE": "aoss",
                 "OPENSEARCH_HL7_INDEX": "hl7-messages-v1",
                 "OPENSEARCH_CCDA_INDEX": "ccda-documents-v1",
+                "PARSED_BUCKET": self.parsed_bucket.bucket_name,
+                "SOURCE_FORMAT": source_format,
             },
             environment_encryption=self.encryption_key,
             ephemeral_storage_size=Size.mebibytes(1024),
             log_group=log_group,
             memory_size=2048,
-            reserved_concurrent_executions=5,
-            security_groups=[self.indexer_security_group],
-            timeout=Duration.minutes(1),
+            reserved_concurrent_executions=reserved_concurrency,
+            security_groups=[self.ingestion_security_group],
+            timeout=Duration.minutes(10),
             tracing=lambda_.Tracing.ACTIVE,
             vpc=self.vpc,
             vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_ISOLATED),
         )
-        return function
 
     def _lambda_code(self) -> lambda_.Code:
         return lambda_.Code.from_asset(
@@ -703,6 +772,7 @@ class DataQualityStack(Stack):
                 ".venv/**",
                 "cdk.out/**",
                 "tests/**",
+                "tools/**",
                 ".coverage",
             ],
         )
@@ -718,43 +788,37 @@ class DataQualityStack(Stack):
         )
 
     def _connect_event_sources(self) -> None:
-        self.parser_function.add_event_source(
-            lambda_event_sources.SqsEventSource(
-                self.parse_queue,
-                batch_size=1,
-                max_concurrency=10,
-                report_batch_item_failures=True,
+        for function, queue, concurrency in (
+            (self.hl7_function, self.hl7_queue, 10),
+            (self.ccda_function, self.ccda_queue, 5),
+        ):
+            function.add_event_source(
+                lambda_event_sources.SqsEventSource(
+                    queue,
+                    batch_size=1,
+                    max_concurrency=concurrency,
+                    report_batch_item_failures=True,
+                )
             )
-        )
-        self.indexer_function.add_event_source(
-            lambda_event_sources.SqsEventSource(
-                self.index_queue,
-                batch_size=10,
-                max_batching_window=Duration.seconds(5),
-                max_concurrency=5,
-                report_batch_item_failures=True,
-            )
-        )
 
     def _create_operational_alarms(self) -> None:
-        self._create_queue_alarms("Parse", self.parse_queue, self.parse_dead_letter_queue)
-        self._create_queue_alarms("Index", self.index_queue, self.index_dead_letter_queue)
+        self._create_queue_alarms("Hl7", self.hl7_queue, self.hl7_dead_letter_queue)
+        self._create_queue_alarms("Ccda", self.ccda_queue, self.ccda_dead_letter_queue)
         for construct_id, function in (
-            ("Parser", self.parser_function),
-            ("Indexer", self.indexer_function),
+            ("Hl7", self.hl7_function),
+            ("Ccda", self.ccda_function),
         ):
             cloudwatch.Alarm(
                 self,
                 f"{construct_id}FunctionErrorAlarm",
-                alarm_description=f"{construct_id.lower()} Lambda reported an invocation error",
-                metric=function.metric_errors(
-                    period=Duration.minutes(5),
-                    statistic="Sum",
-                ),
+                alarm_description=f"{construct_id.upper()} Lambda reported an invocation error",
+                metric=function.metric_errors(period=Duration.minutes(5), statistic="Sum"),
                 threshold=1,
                 evaluation_periods=1,
                 datapoints_to_alarm=1,
-                comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+                comparison_operator=(
+                    cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD
+                ),
                 treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
             )
 
@@ -768,7 +832,7 @@ class DataQualityStack(Stack):
             self,
             f"{construct_id}QueueAgeAlarm",
             alarm_description=(
-                f"{construct_id.lower()} queue has unprocessed messages older than 15 minutes"
+                f"{construct_id.upper()} queue has unprocessed messages older than 15 minutes"
             ),
             comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
             datapoints_to_alarm=1,
@@ -783,8 +847,8 @@ class DataQualityStack(Stack):
         cloudwatch.Alarm(
             self,
             f"{construct_id}DeadLetterQueueAlarm",
-            alarm_description=f"{construct_id.lower()} dead-letter queue contains failed messages",
-            comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+            alarm_description=f"{construct_id.upper()} dead-letter queue contains failed messages",
+            comparison_operator=(cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD),
             datapoints_to_alarm=1,
             evaluation_periods=1,
             metric=dead_letter_queue.metric_approximate_number_of_messages_visible(
@@ -799,20 +863,27 @@ class DataQualityStack(Stack):
         return f"manifest-medex-{self.config.environment.value}"
 
     def _create_outputs(self) -> None:
+        if self.metadata_cluster.secret is None:
+            raise RuntimeError(AURORA_CREDENTIALS_MISSING)
         outputs = {
             "EncryptionKeyArn": self.encryption_key.key_arn,
             "RawBucketName": self.raw_bucket.bucket_name,
             "ParsedBucketName": self.parsed_bucket.bucket_name,
             "ErrorBucketName": self.error_bucket.bucket_name,
-            "ParseQueueUrl": self.parse_queue.queue_url,
-            "IndexQueueUrl": self.index_queue.queue_url,
-            "ParserFunctionName": self.parser_function.function_name,
-            "IndexerFunctionName": self.indexer_function.function_name,
+            "Hl7QueueUrl": self.hl7_queue.queue_url,
+            "CcdaQueueUrl": self.ccda_queue.queue_url,
+            "Hl7FunctionName": self.hl7_function.function_name,
+            "CcdaFunctionName": self.ccda_function.function_name,
             "OpenSearchEndpoint": self.search_collection.attr_collection_endpoint,
             "OpenSearchCollectionArn": self.search_collection.attr_arn,
             "OpenSearchCollectionName": self.search_collection.name,
             "OpenSearchHl7Index": "hl7-messages-v1",
             "OpenSearchCcdaIndex": "ccda-documents-v1",
+            "AuroraClusterArn": self.metadata_cluster.cluster_arn,
+            "AuroraClusterIdentifier": self.metadata_cluster.cluster_identifier,
+            "AuroraSecretArn": self.metadata_cluster.secret.secret_arn,
+            "MetadataDatabaseName": METADATA_DATABASE_NAME,
+            "MetadataTableName": METADATA_TABLE_NAME,
         }
         for output_id, value in outputs.items():
             CfnOutput(self, output_id, value=value)
