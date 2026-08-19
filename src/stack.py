@@ -1,3 +1,5 @@
+"""Define the private, format-specific AWS ingestion platform with CDK."""
+
 from importlib import metadata
 from pathlib import Path
 from shutil import copy2, copytree, ignore_patterns
@@ -50,6 +52,7 @@ class _LambdaBundler:
     _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
     def try_bundle(self, output_dir: str, _options: BundlingOptions) -> bool:
+        # Local bundling is valid only when installed packages exactly match runtime pins.
         distributions: dict[str, metadata.Distribution] = {}
         try:
             for name, (version, _) in self._DEPENDENCIES.items():
@@ -65,7 +68,7 @@ class _LambdaBundler:
             self._PROJECT_ROOT / "src",
             destination / "src",
             dirs_exist_ok=True,
-            ignore=ignore_patterns("__pycache__", "*.pyc"),
+            ignore=ignore_patterns("__pycache__", "*.pyc", "stack.py", "config.py"),
         )
         for name, (_, package_name) in self._DEPENDENCIES.items():
             distribution = distributions[name]
@@ -108,6 +111,7 @@ class DataQualityStack(Stack):
             termination_protection=config.termination_protection,
         )
 
+        # Build foundational storage/network resources before consumers that reference them.
         self._add_standard_tags()
         self.encryption_key = self._create_encryption_key()
         self.access_logs_bucket = self._create_access_logs_bucket()
@@ -356,6 +360,7 @@ class DataQualityStack(Stack):
 
     def _create_ingestion_vpc(self) -> ec2.Vpc:
         availability_zones = 3 if self.config.environment is DeploymentEnvironment.PROD else 2
+        # Isolated subnets and zero NAT gateways force service traffic through endpoints.
         vpc = ec2.Vpc(
             self,
             "IngestionVpc",
@@ -486,6 +491,7 @@ class DataQualityStack(Stack):
                 }
             ),
         )
+        # The collection API always stays private; only the development Dashboard may opt out.
         private_network_resources: list[dict[str, Any]] = [
             {
                 "ResourceType": "collection",
@@ -586,6 +592,7 @@ class DataQualityStack(Stack):
                 "ENABLED" if self.config.environment is DeploymentEnvironment.PROD else "DISABLED"
             ),
         )
+        # Retain the collection through stack deletion and CloudFormation replacement.
         collection.cfn_options.deletion_policy = CfnDeletionPolicy.RETAIN
         collection.cfn_options.update_replace_policy = CfnDeletionPolicy.RETAIN
         collection.add_resource_dependency(encryption_policy)
@@ -660,6 +667,7 @@ class DataQualityStack(Stack):
         return cluster
 
     def _create_data_api_endpoint(self) -> ec2.InterfaceVpcEndpoint:
+        # Lambdas use HTTPS Data API calls; no PostgreSQL socket path or port 5432 rule exists.
         endpoint = self.vpc.add_interface_endpoint(
             "RdsDataEndpoint",
             service=ec2.InterfaceVpcEndpointAwsService.RDS_DATA,
@@ -758,12 +766,14 @@ class DataQualityStack(Stack):
                             "-r /asset-input/lambda-requirements.txt "
                             "--target /asset-output",
                             "cp -a /asset-input/src /asset-output/src",
+                            "rm -f /asset-output/src/stack.py /asset-output/src/config.py",
                             "find /asset-output -type d -name __pycache__ -prune -exec rm -rf {} +",
                         ]
                     ),
                 ],
                 platform="linux/arm64",
             ),
+            # Development files and infrastructure modules never enter the runtime artifact.
             exclude=[
                 ".git/**",
                 ".mypy_cache/**",
@@ -773,6 +783,8 @@ class DataQualityStack(Stack):
                 "cdk.out/**",
                 "tests/**",
                 "tools/**",
+                "src/stack.py",
+                "src/config.py",
                 ".coverage",
             ],
         )
@@ -788,6 +800,7 @@ class DataQualityStack(Stack):
         )
 
     def _connect_event_sources(self) -> None:
+        # Batch size one makes each acknowledgement correspond to one source S3 object.
         for function, queue, concurrency in (
             (self.hl7_function, self.hl7_queue, 10),
             (self.ccda_function, self.ccda_queue, 5),

@@ -70,6 +70,8 @@ def test_stack_contains_only_the_two_combined_ingestion_lanes() -> None:
         assert (asset_root / "src" / module).is_file()
     assert (asset_root / "hl7-0.4.5.dist-info").is_dir()
     assert (asset_root / "defusedxml-0.7.1.dist-info").is_dir()
+    assert not (asset_root / "src" / "stack.py").exists()
+    assert not (asset_root / "src" / "config.py").exists()
     assert not (asset_root / "tests").exists()
     assert not (asset_root / "tools").exists()
 
@@ -198,7 +200,7 @@ def test_aurora_is_one_private_serverless_v2_writer_with_data_api_and_retention(
     properties = cluster["Properties"]
 
     assert properties["Engine"] == "aurora-postgresql"
-    assert properties["EngineVersion"] == "16.6"
+    assert properties["EngineVersion"] == "16.8"
     assert properties["EnableHttpEndpoint"] is True
     assert properties["EnableIAMDatabaseAuthentication"] is True
     assert properties["DatabaseName"] == "manifest_medex"
