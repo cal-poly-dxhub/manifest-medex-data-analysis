@@ -1,3 +1,5 @@
+"""Create deterministic OpenSearch indexes and write parsed clinical documents."""
+
 from __future__ import annotations
 
 import hashlib
@@ -37,6 +39,7 @@ _ALLOWED_BACKEND_ERROR_TYPES = frozenset(
     }
 )
 
+# HL7 values are exact codes/identifiers, so dynamic strings remain keywords.
 HL7_INDEX_MAPPING: dict[str, Any] = {
     "mappings": {
         "dynamic_templates": [
@@ -63,6 +66,7 @@ HL7_INDEX_MAPPING: dict[str, Any] = {
     },
 }
 
+# CCDA supports free-text search while retaining keyword subfields for exact dashboard rules.
 CCDA_INDEX_MAPPING: dict[str, Any] = {
     "mappings": {
         "dynamic_templates": [
@@ -106,6 +110,8 @@ class IndexingError(RuntimeError):
 
 
 class SearchTransport(Protocol):
+    """HTTP transport contract used by index management and bulk writes."""
+
     def request(
         self,
         method: str,
@@ -124,6 +130,7 @@ def index_documents(documents: list[dict[str, Any]], transport: SearchTransport)
     """Convergently index one source object's documents using deterministic IDs."""
     if not documents:
         raise IndexingError(BULK_COUNT_MISMATCH)
+    # A source batch is homogeneous; validate every document against the first format.
     index_name, mapping = _index_configuration(documents[0])
     indexed = [_indexed_document(document, documents[0]["sourceFormat"]) for document in documents]
     _ensure_index(transport, index_name, mapping)
@@ -173,6 +180,7 @@ def _ensure_index(
             json.dumps(mapping, separators=(",", ":")).encode(),
         )
         error_type = _response_error_type(create_response)
+        # Concurrent cold starts may both observe 404; the losing create is still successful.
         if create_status not in {200, 201} and error_type != "resource_already_exists_exception":
             raise IndexingError(
                 INDEX_CREATE_FAILED,
@@ -196,6 +204,7 @@ def _bulk_chunks(
     current: list[_IndexedDocument] = []
     current_bytes = 0
     for document in documents:
+        # Measure serialized NDJSON, not source JSON, because action lines count toward limits.
         document_bytes = len(_bulk_body(index_name, [document]))
         if current and current_bytes + document_bytes > max_bytes:
             chunks.append(current)
@@ -251,6 +260,7 @@ def _safe_backend_error_type(value: object) -> str | None:
     normalized = value.strip().lower()
     if not normalized:
         return None
+    # Unknown backend values may contain sensitive content; collapse them to a fixed category.
     return normalized if normalized in _ALLOWED_BACKEND_ERROR_TYPES else "other"
 
 
@@ -279,6 +289,7 @@ class SignedOpenSearchTransport:
         from botocore.session import Session  # type: ignore[import-not-found]
 
         url = f"{self.endpoint}{path}"
+        # SigV4 requires the digest of the exact bytes sent on the wire.
         headers = {
             "Content-Type": "application/x-ndjson" if path == "/_bulk" else "application/json",
             "x-amz-content-sha256": hashlib.sha256(body or b"").hexdigest(),

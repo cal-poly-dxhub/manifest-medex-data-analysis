@@ -1,9 +1,12 @@
+"""Persist retry-safe document location metadata through the Aurora Data API."""
+
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+# Clinical content stays in S3/OpenSearch; Aurora stores only durable document locations.
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS document_metadata (
     document_id        TEXT PRIMARY KEY,
@@ -67,6 +70,8 @@ class _DataApiClient(Protocol):
 
 @dataclass(frozen=True)
 class MetadataRecord:
+    """One normalized metadata row shared by HL7 and CCDA documents."""
+
     document_id: str
     source_format: str
     document_time: str | None
@@ -89,6 +94,7 @@ class DataApiMetadataStore:
         database: str,
         table_name: str,
     ) -> None:
+        # SQL identifiers cannot be bound parameters, so validate before interpolation.
         if not _IDENTIFIER.fullmatch(database) or not _IDENTIFIER.fullmatch(table_name):
             raise ValueError(INVALID_IDENTIFIER)
         self._client = client
@@ -99,9 +105,11 @@ class DataApiMetadataStore:
         }
         self._create_sql = CREATE_TABLE_SQL.replace("document_metadata", table_name)
         self._upsert_sql = UPSERT_SQL.replace("document_metadata", table_name)
+        # Cache initialization per warm Lambda environment; CREATE TABLE remains idempotent.
         self._schema_ready = False
 
     def upsert(self, records: list[MetadataRecord]) -> None:
+        """Initialize the schema when needed and idempotently upsert a source batch."""
         if not records:
             return
         self._ensure_schema()

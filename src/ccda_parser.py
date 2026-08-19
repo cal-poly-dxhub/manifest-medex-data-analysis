@@ -1,3 +1,5 @@
+"""Safely project structured CCDA XML into the customer dashboard document shape."""
+
 from __future__ import annotations
 
 import hashlib
@@ -19,6 +21,7 @@ XML_TOO_COMPLEX = "XML document exceeds the configured structural complexity lim
 MAX_MARKUP_TOKENS = 2_000_000
 MAX_XML_DEPTH = 128
 
+# Standard LOINC section codes map to the legacy keys used by customer queries.
 _SECTION_NAMES = {
     "10160-0": "medications-section",
     "11369-6": "immunizations-section",
@@ -37,6 +40,7 @@ def parse_ccda_document(
     ingested_at: str | None = None,
 ) -> dict[str, Any]:
     """Parse one CCDA document into the supplied dashboard compatibility shape."""
+    # Bound obvious markup amplification before allocating the XML tree.
     if payload.count(b"<") > MAX_MARKUP_TOKENS:
         raise ParseError(XML_TOO_COMPLEX)
     try:
@@ -53,6 +57,7 @@ def parse_ccda_document(
     _require_safe_depth(root)
 
     checksum = hashlib.sha256(payload).hexdigest()
+    # Prefer immutable S3 identity, with content hash as a deterministic fallback.
     source_identity = source.version_id or source.etag or checksum
     document_id = hashlib.sha256(
         f"{source.bucket}\0{source.key}\0{source_identity}\0ccda".encode()
@@ -60,6 +65,7 @@ def parse_ccda_document(
     participant = _participant_from_key(source.key)
     document_time_raw = _attribute(_child(root, "effectiveTime"), "value")
 
+    # Project structured entries only; narrative section text is intentionally excluded.
     projection: dict[str, Any] = {
         "recordTarget": _record_target(_child(root, "recordTarget")),
         "custodian": _custodian(_child(root, "custodian")),
@@ -156,6 +162,7 @@ def _body(root: Element) -> dict[str, Any]:
         code = _attribute(_child(section, "code"), "code")
         section_name = _SECTION_NAMES.get(code or "")
         if section_name is None:
+            # Unknown sections still count, but do not enter the compatibility projection.
             continue
         projected = _section(section, section_name)
         existing = body.get(section_name)
@@ -466,6 +473,7 @@ def _texts(element: Element, child_name: str) -> Any:
 
 
 def _collapse(values: list[Any]) -> Any:
+    # Preserve the legacy scalar-for-one/list-for-many shape expected by saved queries.
     cleaned = [value for value in values if value is not None and value != ""]
     if not cleaned:
         return None
@@ -497,6 +505,7 @@ def _section_counts(root: Element) -> dict[str, int]:
 
 
 def _require_safe_depth(root: Element) -> None:
+    # Use an explicit stack so the safety check itself cannot overflow Python recursion.
     stack = [(root, 1)]
     while stack:
         element, depth = stack.pop()
@@ -517,6 +526,7 @@ def _normalize_cda_timestamp(value: str | None) -> str | None:
     digits = match.group("date")
     if len(digits) not in {4, 6, 8, 10, 12, 14}:
         return None
+    # CDA permits reduced precision; fill omitted components with the earliest valid instant.
     padded = digits + "0101000000"[len(digits) - 4 :]
     try:
         parsed = datetime.strptime(padded, "%Y%m%d%H%M%S").replace(tzinfo=UTC)

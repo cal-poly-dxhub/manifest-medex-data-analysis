@@ -1,3 +1,5 @@
+"""AWS Lambda entry point for the dedicated CCDA ingestion lane."""
+
 from __future__ import annotations
 
 from typing import Any

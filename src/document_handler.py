@@ -1,3 +1,5 @@
+"""Coordinate read, parse, durable writes, and retry reporting for one SQS lane."""
+
 from __future__ import annotations
 
 import hashlib
@@ -28,6 +30,7 @@ FORMAT_CONFIGURATION_MISMATCH = "Lambda source format configuration does not mat
 LOCATION_COUNT_MISMATCH = "Parsed document location count mismatch"
 
 LOGGER = logging.getLogger(__name__)
+# Reuse SDK clients and transports across warm Lambda invocations.
 _RUNTIME_PROCESSORS: dict[str, DocumentProcessor] = {}
 
 
@@ -36,17 +39,23 @@ class _ReadableBody(Protocol):
 
 
 class S3Client(Protocol):
+    """Minimal S3 operations required by the ingestion workflow."""
+
     def get_object(self, **kwargs: Any) -> dict[str, Any]: ...
 
     def put_object(self, **kwargs: Any) -> dict[str, Any]: ...
 
 
 class MetadataStore(Protocol):
+    """Destination contract for idempotent metadata persistence."""
+
     def upsert(self, records: list[MetadataRecord]) -> None: ...
 
 
 @dataclass(frozen=True)
 class ParsedLocation:
+    """Versioned parsed-S3 location paired with one parsed document."""
+
     key: str
     version_id: str | None
 
@@ -61,6 +70,7 @@ class DocumentProcessor:
     metadata_store: MetadataStore
 
     def process_batch(self, event: dict[str, Any]) -> dict[str, list[dict[str, str]]]:
+        """Process each SQS record and return the partial-batch failure contract."""
         failures: list[dict[str, str]] = []
         for record in event.get("Records", []):
             message_id = str(record.get("messageId", "unknown"))
@@ -76,6 +86,7 @@ class DocumentProcessor:
                     self.expected_format,
                     self.s3_client,
                 )
+                # Destination order is intentional: deterministic writes make every retry converge.
                 stage = "parsed_storage"
                 locations = _write_parsed_documents(
                     documents,
@@ -116,6 +127,7 @@ def runtime_handler(
     configured_format = os.environ["SOURCE_FORMAT"]
     if configured_format != expected_format:
         raise RuntimeError(FORMAT_CONFIGURATION_MISMATCH)
+    # Cache by format so separate handlers cannot accidentally share lane configuration.
     processor = _RUNTIME_PROCESSORS.get(expected_format)
     if processor is None:
         processor = DocumentProcessor(
@@ -188,8 +200,10 @@ def _parse_source(
     request: dict[str, Any] = {"Bucket": source.bucket, "Key": source.key}
     if source.version_id:
         request["VersionId"] = source.version_id
+    # A versioned read binds parsing to the exact object referenced by EventBridge.
     response = s3_client.get_object(**request)
     max_bytes = int(os.getenv("MAX_OBJECT_BYTES", str(MAX_OBJECT_BYTES_DEFAULT)))
+    # Check both metadata and actual bytes because ContentLength is an external response value.
     if int(response.get("ContentLength", 0)) > max_bytes:
         raise ParseError(OBJECT_TOO_LARGE)
     payload = _read_body(response["Body"])
@@ -223,6 +237,7 @@ def _write_parsed_documents(
     locations: list[ParsedLocation] = []
     for document in documents:
         document_id = str(document["documentId"])
+        # Stable keys overwrite the logical document while bucket versioning preserves history.
         key = f"{prefix}/{document_id}.json"
         response = s3_client.put_object(
             Bucket=parsed_bucket,
@@ -276,6 +291,7 @@ def _record_failure(
     stage: str,
     error: Exception,
 ) -> None:
+    # Emit only bounded operational categories; source identities and exception text stay out.
     event: dict[str, Any] = {
         "errorType": type(error).__name__,
         "event": "record_processing_failed",
@@ -342,6 +358,7 @@ def _failure_category(error: Exception) -> str:
 
 
 def _error_id(source: SourceReference | None, message_id: str) -> str:
+    # Hashing permits correlation and deterministic overwrites without exposing the source key.
     identity = (
         f"{source.bucket}\0{source.key}\0{source.version_id or source.etag or ''}"
         if source is not None

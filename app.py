@@ -1,3 +1,5 @@
+"""CDK application entry point for the Manifest MedEx ingestion platform."""
+
 from typing import cast
 
 from aws_cdk import App, Aspects, Environment, IAspect
@@ -10,6 +12,7 @@ def build_app() -> App:
     """Build the CDK application without performing any AWS API calls."""
     app = App()
     config = AppConfig.from_context(app.node)
+    # An unset environment keeps local synthesis credential-independent; deployment supplies both.
     environment = (
         Environment(account=config.account, region=config.region)
         if config.account is not None and config.region is not None
@@ -23,6 +26,7 @@ def build_app() -> App:
         env=environment,
     )
 
+    # Attach checks after constructing the stack so cdk-nag evaluates the complete tree.
     if config.enable_cdk_nag:
         Aspects.of(app).add(cast(IAspect, AwsSolutionsChecks(verbose=True)))
 

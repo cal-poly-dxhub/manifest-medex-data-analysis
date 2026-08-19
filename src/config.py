@@ -1,3 +1,5 @@
+"""Validate deployment context and enforce environment-specific safety constraints."""
+
 import os
 from enum import StrEnum
 from typing import Self
@@ -33,6 +35,7 @@ class DeploymentEnvironment(StrEnum):
 class AppConfig(BaseModel):
     """Validated configuration supplied through CDK context or environment variables."""
 
+    # Strict, immutable configuration prevents silent coercion or post-validation drift.
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     project_name: str = Field(pattern=r"^[a-z][a-z0-9-]{2,62}$")
@@ -53,9 +56,11 @@ class AppConfig(BaseModel):
         if self.environment is DeploymentEnvironment.PROD and not self.termination_protection:
             msg = "Production configuration requires termination protection"
             raise ValueError(msg)
+        # Account and region form one CDK environment and must be supplied atomically.
         if (self.account is None) != (self.region is None):
             msg = "CDK account and region must be provided together"
             raise ValueError(msg)
+        # Public browser access is a development-only exception for one explicit role.
         if self.enable_public_dashboard:
             if self.environment is not DeploymentEnvironment.DEV:
                 msg = "Public Dashboard access is allowed only in development"
@@ -84,6 +89,7 @@ class AppConfig(BaseModel):
             default=environment is DeploymentEnvironment.PROD,
         )
 
+        # Environment fallback supports CDK CLI deployment while keeping local synth optional.
         context_account = node.try_get_context("account")
         context_region = node.try_get_context("region")
         if context_account is None and context_region is None:
