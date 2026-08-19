@@ -87,7 +87,7 @@ def test_library_parsing_handles_custom_delimiters_and_unknown_segments() -> Non
 
     document = parse_hl7_file(payload.encode(), SourceReference(bucket="raw", key="custom.hl7"))[0]
 
-    assert document["parserVersion"] == "0.2.0"
+    assert document["parserVersion"] == "0.3.0"
     assert document["sourceFacilityId"] == "FACILITY"
     assert document["messageType"] == "ORU"
     assert document["triggerEvent"] == "R01"
@@ -102,6 +102,35 @@ def test_library_parsing_preserves_spaces_in_the_final_projected_field() -> None
     document = parse_hl7_file(payload.encode(), SourceReference(bucket="raw", key="spaces.hl7"))[0]
 
     assert document["ROOT"]["OBX"]["OBX_11_Observation_Result_Status"] == "F  "
+
+
+def test_report_query_fields_absent_from_the_dashboard_queries_are_projected() -> None:
+    """PV1-2 and NK1-3 appear only in the supplied report query rows, not the dashboards."""
+    payload = (
+        "MSH|^~\\&|SYNTH|FACILITY_A|RECEIVER|DEST|20260810123045||ADT^A08|MSG-1|P|2.5\r"
+        "PID|1||PATIENT-1^^^FACILITY_A^MR||Example^Synthetic||20000101|F\r"
+        "NK1|1|Contact^First|SPO^Spouse^HL70063|1 TEST ST^^TOWN^CA^90001|555-0001\r"
+        "PV1|1|I|3W^301^A||||1234567890^Doctor^One\r"
+    )
+
+    document = parse_hl7_file(payload.encode(), SourceReference(bucket="raw", key="a08.hl7"))[0]
+
+    assert document["ROOT"]["PV1"]["PV1_2_Patient_Class"] == "I"
+    assert document["ROOT"]["NK1"]["NK1_3_Relationship"] == {
+        "CWE_1": "SPO",
+        "CWE_2": "Spouse",
+    }
+
+
+def test_dynamic_segment_projection_is_not_emitted() -> None:
+    """v1 indexes only the curated ROOT projection; no second projection is stored."""
+    document = parse_hl7_file(
+        SYNTHETIC_BATCH.encode(),
+        SourceReference(bucket="raw", key="synthetic.hl7"),
+    )[0]
+
+    assert "SEGMENTS" not in document
+    assert set(document["ROOT"]) <= {"MSH", "PID", "PV1", "PV2", "OBR", "OBX", "NK1"}
 
 
 def test_library_parse_failures_are_sanitized() -> None:

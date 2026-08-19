@@ -1,3 +1,5 @@
+"""Parse HL7 v2 batches and project fields required by customer dashboard queries."""
+
 from __future__ import annotations
 
 import hashlib
@@ -12,7 +14,7 @@ import hl7
 from hl7.containers import Message, Segment
 from hl7.exceptions import HL7Exception
 
-PARSER_VERSION = "0.2.0"
+PARSER_VERSION = "0.3.0"
 INVALID_UTF8 = "Raw object is not valid UTF-8"
 CONTENT_BEFORE_MSH = "Content appeared before the first MSH segment"
 MISSING_MSH = "No HL7 MSH segment was found"
@@ -80,6 +82,7 @@ def parse_hl7_file(
         raise ParseError(INVALID_UTF8) from error
 
     messages = split_hl7_messages(text)
+    # One object checksum plus message ordinal yields stable identities for batch files.
     checksum = hashlib.sha256(payload).hexdigest()
     return [
         _parse_message(
@@ -95,6 +98,7 @@ def parse_hl7_file(
 
 def split_hl7_messages(text: str) -> list[str]:
     """Split a batch file on MSH segments while tolerating common line endings and MLLP."""
+    # Remove MLLP framing and normalize common line endings before locating MSH boundaries.
     normalized = text.replace("\x0b", "").replace("\x1c", "")
     normalized = normalized.replace("\r\n", "\r").replace("\n", "\r")
     segments = [segment for segment in normalized.split("\r") if segment]
@@ -130,6 +134,7 @@ def _parse_message(
         raise ParseError(INVALID_MSH)
 
     parsed = _parse_with_library(message)
+    # python-hl7 exposes separators in library order; _SegmentView assigns semantic names.
     separators = parsed.separators
     if len(separators) != 5:
         raise ParseError(INVALID_MSH)
@@ -153,6 +158,7 @@ def _parse_message(
             subcomponent_separator=separators[4],
         )
         parsed_segments.append(segment)
+        # Only query-backed fields enter ROOT; segmentCounts records every segment type.
         mapped = _legacy_projection(segment)
         if mapped is not None:
             existing = root.get(name)
@@ -169,6 +175,7 @@ def _parse_message(
     message_time_raw = header.field(7)
     message_time = _normalize_hl7_timestamp(message_time_raw)
     participant = _participant_from_key(source.key) or facility or None
+    # Version/ETag distinguishes source revisions; ordinal distinguishes messages in a batch.
     source_identity = source.version_id or source.etag or checksum
     document_id = hashlib.sha256(
         f"{source.bucket}\0{source.key}\0{source_identity}\0{ordinal}".encode()
@@ -238,7 +245,15 @@ def _legacy_projection(segment: _SegmentView) -> dict[str, Any] | None:
             "PID_7_Date-Time_of_Birth": segment.field(7),
             "PID_8_Administrative_Sex": segment.field(8),
         },
+        "NK1": lambda: {
+            # Referenced by the supplied ADT report query rows (next-of-kin relationship).
+            "NK1_3_Relationship": {
+                "CWE_1": segment.component(3, 1),
+                "CWE_2": segment.component(3, 2),
+            }
+        },
         "PV1": lambda: {
+            "PV1_2_Patient_Class": segment.field(2),
             "PV1_7_Attending_Doctor": {"XCN_1": segment.component(7, 1)},
             "PV1_8_Referring_Doctor": {"XCN_1": segment.component(8, 1)},
             "PV1_9_Consulting_Doctor": {"XCN_1": segment.component(9, 1)},
@@ -275,6 +290,7 @@ def _legacy_projection(segment: _SegmentView) -> dict[str, Any] | None:
     if factory is None:
         return None
     mapped = factory()
+    # Object fields are not searchable for existence, so each projected segment gets a marker.
     mapped["_present"] = True
     return _without_empty_values(mapped)
 
@@ -292,6 +308,7 @@ def _without_empty_values(value: dict[str, Any]) -> dict[str, Any]:
 
 
 def _merge_objects(existing: Any, incoming: Any) -> Any:
+    # Repeated segments/components become arrays while first occurrences retain scalar objects.
     if isinstance(existing, dict) and isinstance(incoming, dict):
         merged = dict(existing)
         for key, value in incoming.items():
@@ -303,6 +320,7 @@ def _merge_objects(existing: Any, incoming: Any) -> Any:
 
 
 def _decode_escapes(value: str, segment: _SegmentView) -> str:
+    # Decode only standard delimiter escapes; leave application-specific escape content untouched.
     replacements = {
         "F": segment.field_separator,
         "S": segment.component_separator,
@@ -326,6 +344,7 @@ def _normalize_hl7_timestamp(value: str) -> str | None:
     digits = match.group("date")
     if len(digits) not in {4, 6, 8, 10, 12, 14}:
         return None
+    # HL7 permits reduced precision; fill omitted components with the earliest valid instant.
     padded = digits + "0101000000"[len(digits) - 4 :]
     try:
         parsed = datetime.strptime(padded, "%Y%m%d%H%M%S").replace(tzinfo=UTC)

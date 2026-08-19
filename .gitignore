@@ -42,3 +42,7 @@ run.py
 run_ccda_parser.py
 run_hl7_parser.py
 docs/
+tools/
+
+# Generated development artifacts
+tools/hl7_dictionary.json
