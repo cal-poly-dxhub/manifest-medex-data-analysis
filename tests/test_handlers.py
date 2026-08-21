@@ -209,6 +209,29 @@ def test_hl7_combined_processor_completes_all_stages_in_order(
     assert bulk_body.count(b'"_id"') == 2
 
 
+def test_hl7_duplicate_content_reaches_each_destination_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PARSED_BUCKET", "parsed-bucket")
+    monkeypatch.setenv("ERROR_BUCKET", "error-bucket")
+    operations: list[str] = []
+    s3 = FakeS3(SYNTHETIC_HL7 + SYNTHETIC_HL7, operations)
+    transport = _successful_transport(1, operations)
+    metadata = FakeMetadataStore(operations)
+
+    result = _processor("hl7-v2", s3, transport, metadata).process_batch(
+        _event("incoming/hl7/duplicates.hl7")
+    )
+
+    assert result == {"batchItemFailures": []}
+    assert operations.count("s3:parsed") == 1
+    assert len(metadata.calls) == 1
+    assert len(metadata.calls[0]) == 1
+    bulk_body = transport.calls[-1][2]
+    assert bulk_body is not None
+    assert bulk_body.count(b'"_id"') == 1
+
+
 def test_ccda_combined_processor_persists_one_document(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PARSED_BUCKET", "parsed-bucket")
     monkeypatch.setenv("ERROR_BUCKET", "error-bucket")

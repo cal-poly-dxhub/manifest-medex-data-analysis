@@ -14,7 +14,7 @@ from defusedxml import ElementTree
 from defusedxml.common import DefusedXmlException
 from src.parser import ParseError, SourceReference
 
-PARSER_VERSION = "0.1.0"
+PARSER_VERSION = "0.2.0"
 INVALID_XML = "Raw object is not a safe, well-formed XML document"
 INVALID_DOCUMENT = "XML root is not an HL7 ClinicalDocument"
 XML_TOO_COMPLEX = "XML document exceeds the configured structural complexity limit"
@@ -57,11 +57,8 @@ def parse_ccda_document(
     _require_safe_depth(root)
 
     checksum = hashlib.sha256(payload).hexdigest()
-    # Prefer immutable S3 identity, with content hash as a deterministic fallback.
-    source_identity = source.version_id or source.etag or checksum
-    document_id = hashlib.sha256(
-        f"{source.bucket}\0{source.key}\0{source_identity}\0ccda".encode()
-    ).hexdigest()
+    # The same raw XML bytes under one S3 key always resolve to one logical document.
+    document_id = hashlib.sha256(f"{source.bucket}\0{source.key}\0{checksum}".encode()).hexdigest()
     participant = _participant_from_key(source.key)
     document_time_raw = _attribute(_child(root, "effectiveTime"), "value")
 

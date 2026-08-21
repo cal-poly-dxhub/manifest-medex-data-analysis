@@ -18,7 +18,7 @@ A private, serverless AWS ingestion platform for parsing, indexing, and tracking
 
 # Overview
 
-Manifest MedEx Data Quality Platform is an AWS CDK application that creates separate HL7 v2 and CCDA ingestion lanes. New objects in a private, versioned Amazon S3 raw-data bucket are routed through Amazon EventBridge and format-specific Amazon SQS queues to two AWS Lambda functions. Each function parses its input, writes deterministic JSON to parsed S3, indexes a query-oriented projection in Amazon OpenSearch Serverless, and upserts document-location metadata through the Amazon Aurora PostgreSQL Data API.
+Manifest MedEx Data Quality Platform is an AWS CDK application that creates separate HL7 v2 and CCDA ingestion lanes plus an authenticated, same-origin clinical-message explorer. New objects in a private, versioned Amazon S3 raw-data bucket are routed through Amazon EventBridge and format-specific Amazon SQS queues to two ingestion AWS Lambda functions. Each function parses its input, writes deterministic JSON to parsed S3, indexes a query-oriented projection in Amazon OpenSearch Serverless, and upserts document-location metadata through the Amazon Aurora PostgreSQL Data API. A third isolated Lambda serves Cognito-authorized metadata and bounded body reads to a React frontend hosted in private S3 behind CloudFront Origin Access Control.
 
 The design keeps the raw object as the complete source of truth while exposing a deliberately bounded search projection for supplied dashboard requirements. It emphasizes private networking, encryption, least-privilege access, deterministic retries, retained storage, and diagnostics that do not reveal clinical content or identifiers.
 
@@ -38,7 +38,9 @@ This repository is an implementation prototype. It does not establish HL7 profil
 | Object storage | [Amazon S3](https://aws.amazon.com/s3/) | Versioned raw, parsed, error, and access-log storage |
 | Routing | [Amazon EventBridge](https://aws.amazon.com/eventbridge/) | Routes new objects by format prefix |
 | Buffering | [Amazon SQS](https://aws.amazon.com/sqs/) | Isolated processing queues and dead-letter queues |
-| Compute | [AWS Lambda](https://aws.amazon.com/lambda/) | Python 3.14 ARM64 HL7 and CCDA processing |
+| Compute | [AWS Lambda](https://aws.amazon.com/lambda/) | Python 3.14 ARM64 ingestion and authenticated explorer API |
+| Web and API | React, Vite, TypeScript, CloudFront, HTTP API | Same-origin clinical-message explorer and API proxy |
+| Identity | Amazon Cognito | Hosted UI Authorization Code with PKCE and JWT route authorization |
 | Search | [Amazon OpenSearch Serverless](https://aws.amazon.com/opensearch-service/features/serverless/) | Query-oriented HL7 and CCDA indexes |
 | Metadata | [Amazon Aurora PostgreSQL](https://aws.amazon.com/rds/aurora/) 16.8 | Document-location metadata through the Data API |
 | Security | AWS KMS, IAM, VPC endpoints | Encryption, least privilege, and private service access |
@@ -65,8 +67,14 @@ Runtime dependencies are hash-pinned in `lambda-requirements.txt`. CDK dependenc
 │   ├── document_handler.py        # Shared S3, parse, search, and metadata workflow
 │   ├── hl7_handler.py             # HL7 Lambda entry point
 │   ├── ccda_handler.py            # CCDA Lambda entry point
+│   ├── explorer_handler.py        # Authenticated list, detail, and bounded body API
 │   ├── search_store.py            # OpenSearch mappings, bulk writes, and SigV4 transport
-│   └── metadata_store.py          # Aurora schema and retry-safe Data API upserts
+│   └── metadata_store.py          # Aurora schema, indexes, and Data API upserts
+├── web/                           # React/Vite/TypeScript authenticated explorer
+│   ├── src/                       # OIDC, API client, query, and UI source
+│   ├── public/config.json         # Non-secret local runtime-config placeholder
+│   ├── package.json               # Exact frontend dependency pins
+│   └── package-lock.json          # Reproducible npm dependency graph
 ├── tests/                         # Unit, integration-style, CDK, and cdk-nag tests
 └── tools/
     ├── generate_hl7_dictionary.py # Development-only HL7 v2.6 label generator
@@ -75,7 +83,7 @@ Runtime dependencies are hash-pinned in `lambda-requirements.txt`. CDK dependenc
                                       # Delivered query-path parity check
 ```
 
-The Lambda artifact contains the runtime `src` modules and exact runtime dependencies. Tests, tools, caches, `src/stack.py`, and `src/config.py` are excluded from both local and Docker fallback bundles.
+The Lambda artifact contains the runtime `src` modules and exact runtime dependencies. Tests, tools, caches, all of `web/`, `src/stack.py`, and `src/config.py` are excluded from both local and Docker fallback bundles.
 
 ## HL7 v2 processing
 
@@ -88,13 +96,13 @@ The HL7 parser supports:
 - Standard safe escape decoding.
 - Message-type metadata extraction, including ADT, MDM, ORU, RDE, and VXU.
 - Unknown and locally defined segments.
-- Deterministic source checksums, message ordinals, and document IDs.
+- Whole-object provenance checksums and deterministic per-message content IDs.
 - HL7 timestamp normalization; timestamps without offsets are interpreted as UTC.
 - A 50 MiB raw-object limit.
 
 The indexed `ROOT` projection currently exposes 26 query-oriented MSH, PID, PV1, PV2, OBR, OBX, and NK1 field paths. This is an initial compatibility projection, not a complete HL7 representation. Fields outside it are not retained in parsed JSON or OpenSearch. `segmentCounts` records occurrence counts but not omitted values, so extending the projection requires reprocessing from raw S3.
 
-Parser output identifies the implementation as version `0.3.0`.
+Parser output identifies the implementation as version `0.4.0`. HL7 document IDs are `SHA-256(bucket + key + SHA-256(normalized message))`; exact duplicate messages under one S3 key collapse to the first occurrence and retain its `messageOrdinal`. S3 version IDs and ETags remain provenance metadata but do not affect HL7 identity.
 
 ## CCDA processing
 
@@ -109,6 +117,8 @@ The indexed `CD` projection covers structured fields used by supplied dashboard 
 - Social history
 
 Sections are selected by standard LOINC section codes. Narrative section bodies are intentionally excluded from the projection.
+
+CCDA parser output identifies the implementation as version `0.2.0`. CCDA document IDs are `SHA-256(bucket + key + SHA-256(exact raw XML bytes))`. Identical XML bytes under one S3 key resolve to the same logical document across source versions; byte-level formatting changes create a new ID. S3 version IDs and ETags remain provenance metadata but do not affect CCDA identity.
 
 ## Metadata contract
 
@@ -130,15 +140,31 @@ CREATE TABLE IF NOT EXISTS document_metadata (
 
 `document_time` comes from HL7 MSH-7 or CCDA `effectiveTime`; `ingested_time` comes from the S3 EventBridge event. Stored locations are `s3://bucket/key` references rather than expiring presigned URLs.
 
+Newest-first explorer reads use keyset pagination over `(ingested_time, document_id)` with no `OFFSET`. Each list request also runs an exact `COUNT(*)` over the active ingestion-time/source-format filters so the UI can display the total result count and total pages. Exact counts can add latency on very large ranges even with the indexes below. `_ensure_schema()` creates these idempotent indexes for a new or empty table:
+
+```sql
+CREATE INDEX IF NOT EXISTS document_metadata_ingested_document_idx
+ON document_metadata (ingested_time DESC, document_id DESC);
+
+CREATE INDEX IF NOT EXISTS document_metadata_format_ingested_document_idx
+ON document_metadata (source_format, ingested_time DESC, document_id DESC);
+```
+
+For an existing production table, normal `CREATE INDEX` can block writes. Run the equivalent `CREATE INDEX CONCURRENTLY IF NOT EXISTS` statements as a separately reviewed, one-off maintenance operation instead. `CONCURRENTLY` is intentionally absent from Lambda initialization because PostgreSQL does not permit it inside the Data API's implicit transaction.
+
 ## Infrastructure and security
 
 The stack creates:
 
 - One rotating customer-managed KMS key.
 - Private, versioned raw, parsed, and error S3 buckets with KMS encryption and retained deletion policies.
+- A private, versioned frontend S3 bucket served only through CloudFront Origin Access Control.
 - A separate access-log bucket.
 - Separate KMS-encrypted HL7 and CCDA queues, each with a 14-day DLQ and a maximum receive count of five.
-- Two Python 3.14 ARM64 Lambda functions with 2 GiB memory, 10-minute timeouts, encrypted 30-day logs, and bounded concurrency.
+- Two Python 3.14 ARM64 ingestion Lambda functions with 2 GiB memory, 10-minute timeouts, encrypted 30-day logs, and bounded concurrency.
+- One Python 3.14 ARM64 explorer Lambda in isolated subnets with read-only object access, Data API `ExecuteStatement`, and 4 MiB response caps.
+- Cognito Hosted UI, one public PKCE app client, and a Cognito-authorized HTTP API with no default stage.
+- One CloudFront distribution using private S3 OAC for static assets and an uncached `/api/*` behavior for HTTP API.
 - An isolated, no-NAT VPC with rejected-traffic flow logs.
 - An S3 gateway endpoint plus private OpenSearch Serverless and RDS Data API interface endpoints.
 - One private Aurora PostgreSQL 16.8 Serverless v2 writer with 0.5–2 ACU, Data API, IAM database authentication, KMS encryption, and retained storage.
@@ -148,6 +174,35 @@ The stack creates:
 There is no public Aurora instance, RDS Proxy, reader instance, NAT gateway, direct Lambda PostgreSQL connection, or port 5432 ingress rule.
 
 Production enables stack termination protection, Aurora deletion protection, 35-day Aurora backups, and OpenSearch standby replicas. Non-production uses seven-day Aurora backups. Stored data and the OpenSearch collection remain retained when the stack is deleted; plan an explicitly approved retention or disposal process.
+
+## Authenticated message explorer
+
+The stack also provides a same-origin, authenticated browser explorer:
+
+```text
+CloudFront
+├── default behavior → private frontend S3 bucket through Origin Access Control
+└── /api/*           → HTTP API api stage → explorer Lambda in isolated subnets
+                                             ├── RDS Data API endpoint
+                                             └── S3 gateway endpoint
+```
+
+The React/Vite/TypeScript source is under `web/`. Dependencies use exact versions in `package.json` and a committed npm lockfile. CDK deploys `web/dist` to a private S3 bucket and writes a non-secret runtime `config.json`. CloudFront disables API caching, forwards the bearer token and query values while replacing the origin `Host`, and applies HSTS, `nosniff`, and frame-deny headers. CloudFront request logging and API stage access logging are intentionally disabled because the required routes contain document IDs; the body-read Lambda emits the narrower audit event described below.
+
+Cognito Hosted UI authentication is mandatory. Self-signup is disabled, the password minimum is 14 characters with complexity requirements, software TOTP MFA is available, and the public app client uses Authorization Code with PKCE. Every route uses the same Cognito JWT authorizer; there is no unauthenticated demo route or API default stage. The frontend keeps tokens in memory and stores only transient OIDC state and the PKCE verifier in tab-scoped `sessionStorage` so the Hosted UI redirect can complete.
+
+The API contract is:
+
+- `GET /api/messages?from&to&source_format&limit&cursor` — newest-first metadata with exact `totalCount`; `from` is an inclusive `ingested_time` lower bound and `to` is an exclusive `ingested_time` upper bound, matching Entity Explorer's `createdTime >=` / `<` range behavior; default 50, maximum 200, opaque forward cursor. The UI derives result ranges and total pages from the exact count and exposes numbered controls for sequentially discovered keyset pages without using `OFFSET`.
+- `GET /api/messages/{documentId}` — one metadata record and its durable storage references.
+- `POST /api/messages/{documentId}/body` with `{ "variant": "raw" | "parsed" }` — direct content with the appropriate text, XML, or JSON content type.
+- `POST /api/query` with `{ "sql": "..." }` — execute one unrestricted SQL statement and return generic columns, rows, and the affected-record count. SQL text is limited to 100,000 characters and the serialized result to 4 MiB.
+
+The UI provides Messages and SQL query views. SQL queries can be named, saved, loaded, and deleted using browser `localStorage`; they are not synchronized between browsers or users. A visible loading spinner is shown while SQL executes. Do not save query text containing clinical values or identifiers on shared or unmanaged devices.
+
+Body content is fetched server-side from the exact stored S3 version and is never exposed through a presigned URL. Synchronous bodies are capped at 4 MiB and read through a bounded stream to remain below Lambda/API response limits. A successful body read writes a structured audit event containing the authenticated JWT `sub`, document ID, variant, and timestamp, but never the body, clinical fields, S3 key, SQL, or raw backend response. Successful SQL execution emits the caller `sub`, timestamp, row count, and affected-record count without logging the SQL text or returned values.
+
+This prototype provides authentication but not row-, facility-, or tenant-level authorization: every authenticated user in the pool can read every metadata row and body. The SQL console is deliberately unrestricted and uses the generated Aurora administrative credential, so any authenticated user can execute modifying or destructive SQL against the database, including changing or dropping metadata objects. IAM grants only `rds-data:ExecuteStatement`, but that action does not make SQL read-only. Before production, federate the user pool to the customer identity provider through approved SAML or OIDC configuration, add an authorization policy/data model, and replace the administrative credential with a database role whose grants match the intended console permissions.
 
 # Deployment
 
@@ -172,7 +227,7 @@ nvm use
 make install
 ```
 
-`make install` runs `uv sync --all-groups --frozen`, so installation fails rather than silently changing the lockfile.
+`make install` runs frozen Python synchronization and `npm ci --prefix web`, so installation fails rather than silently changing either lockfile. To intentionally refresh frontend dependencies, update exact versions in `web/package.json`, run `npm install` under `web/`, review `package-lock.json`, and rerun validation.
 
 ## Configuration reference
 
@@ -202,7 +257,7 @@ uv lock --check
 make validate
 ```
 
-`make validate` performs Ruff formatting and lint checks, strict mypy, pytest with branch coverage, cdk-nag, and CDK synthesis.
+`make validate` performs Ruff formatting and lint checks, strict mypy, pytest with branch coverage, frontend TypeScript checking and production build, cdk-nag, and CDK synthesis. `web/dist` must exist for synthesis because it is the exact asset uploaded by `BucketDeployment`; the `synth` target builds it automatically.
 
 Synthesis alone does not require AWS credentials:
 
@@ -252,6 +307,7 @@ This stack is not a free-tier architecture. Major recurring cost drivers include
 - Two interface VPC endpoints across the configured Availability Zones.
 - Lambda duration and concurrency.
 - SQS, EventBridge, S3 storage/versioning, KMS requests, and CloudWatch logs.
+- CloudFront requests/data transfer, HTTP API requests, frontend S3 storage/deployment, and Cognito managed-login/Plus feature usage.
 
 Production enables OpenSearch standby replicas and longer Aurora backup retention, increasing cost. Use the [AWS Pricing Calculator](https://calculator.aws/) with the target region, traffic, retention, and data-volume assumptions before deployment.
 
@@ -263,7 +319,7 @@ Only objects created after deployment under these prefixes are routed:
 
 | Format | S3 key pattern | One input produces |
 | --- | --- | --- |
-| HL7 v2 | `incoming/hl7/*.hl7` or `incoming/hl7/*.txt` | One parsed document and metadata row per message in the file |
+| HL7 v2 | `incoming/hl7/*.hl7` or `incoming/hl7/*.txt` | One parsed document and metadata row per unique normalized message under that key |
 | CCDA | `incoming/ccda/*.xml` | One parsed document and metadata row |
 
 Use non-identifying object keys. Do not put patient names, medical record numbers, or other identifiers in S3 keys.
@@ -285,11 +341,24 @@ aws s3 cp ./synthetic-document.xml \
 After uploading safe synthetic inputs:
 
 1. Confirm both processing queues drain and both DLQs remain empty.
-2. Confirm parsed S3 contains `hl7/<document-id>.json` for each HL7 message and `ccda/<document-id>.json` for each CCDA document.
+2. Confirm parsed S3 contains `hl7/<document-id>.json` for each unique normalized HL7 message and `ccda/<document-id>.json` for each CCDA document.
 3. Confirm deterministic documents appear in `hl7-messages-v1` and `ccda-documents-v1` after the OpenSearch refresh interval.
 4. Through an approved Data API client, confirm one metadata row per logical document, including raw and parsed S3 version IDs.
 5. Confirm both Lambda `Errors` metrics remain zero.
-6. Confirm logs and error objects contain no raw messages, XML bodies, S3 keys, document IDs, patient identifiers, clinical values, SQL parameters, or raw backend responses.
+6. Confirm ingestion logs and error objects contain no raw messages, XML bodies, S3 keys, document IDs, patient identifiers, clinical values, SQL parameters, or raw backend responses.
+
+## Open the authenticated explorer
+
+After an approved deployment:
+
+1. Read the `FrontendDistributionDomainName`, `UserPoolId`, `UserPoolClientId`, and `UserPoolHostedUiDomain` stack outputs.
+2. Create users through an approved administrative workflow or configure customer-IdP federation; self-signup is intentionally unavailable.
+3. Open `https://<FrontendDistributionDomainName>/`. The app redirects unauthenticated users to Cognito Hosted UI and returns to the distribution after Authorization Code + PKCE completes.
+4. Apply ingestion-time/source-format filters, page using the opaque keyset cursor, select one document, and open only the required raw or parsed body tab.
+5. If SQL access is required, open **SQL query**, enter one statement, and use **Run query**. The loading circle remains visible until execution finishes. Saved queries stay only in that browser's local storage.
+6. Confirm successful body access creates exactly one structured `message_body_fetched` audit event with caller `sub`, document ID, variant, and timestamp, and no body or clinical fields. Confirm successful SQL execution logs metadata only, not SQL text or result values.
+
+Do not share distribution URLs, tokens, audit records, or screenshots containing identifiers outside approved clinical-data handling channels.
 
 # Development tools
 
@@ -406,12 +475,14 @@ Correct the context values rather than bypassing validation.
 - Existing raw objects are not backfilled automatically.
 - Alarm notification actions are not configured.
 - Aurora credential rotation requires an explicitly approved maintenance process.
-- Capacity and cost have not been validated against production traffic.
+- Explorer authentication does not segment records by tenant or facility; all user-pool members can read all documents.
+- The SQL console intentionally uses the generated Aurora administrative secret; authenticated SQL can modify or destroy database objects and data.
+- Production identity federation, WAF policy, capacity, and cost have not been validated against production requirements or traffic.
 
 # Data and security rules
 
 - Do not commit customer files, clinical data, identifiers, credentials, certificates, or full local synthetic corpora.
-- Do not log raw HL7, XML, clinical values, S3 keys, document IDs, patient identifiers, SQL parameters, or raw backend responses.
+- Do not log raw HL7, XML, clinical values, S3 keys, patient identifiers, SQL parameters, or raw backend responses. Document IDs may appear only in the required, access-controlled explorer body-read audit event alongside JWT `sub`, variant, and timestamp; do not add them to general request, error, or access logs.
 - Do not place PHI in S3 keys, SQS attributes, tags, metrics, alarms, or diagnostics.
 - Use synthetic, non-PHI data for development, tests, parity demonstrations, and smoke checks.
 - Use least-privilege AWS credentials and approved profiles.

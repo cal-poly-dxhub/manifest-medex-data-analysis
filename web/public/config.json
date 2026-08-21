@@ -1,0 +1,7 @@
+{
+  "authority": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_EXAMPLE",
+  "clientId": "EXAMPLE_PUBLIC_CLIENT_ID",
+  "redirectUri": "http://localhost:5173/",
+  "postLogoutRedirectUri": "http://localhost:5173/",
+  "apiBasePath": "/api"
+}

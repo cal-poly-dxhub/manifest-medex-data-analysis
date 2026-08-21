@@ -19,7 +19,13 @@ from aws_cdk import (
     Stack,
     Tags,
 )
+from aws_cdk import aws_apigatewayv2 as apigwv2
+from aws_cdk import aws_apigatewayv2_authorizers as apigwv2_authorizers
+from aws_cdk import aws_apigatewayv2_integrations as apigwv2_integrations
+from aws_cdk import aws_cloudfront as cloudfront
+from aws_cdk import aws_cloudfront_origins as cloudfront_origins
 from aws_cdk import aws_cloudwatch as cloudwatch
+from aws_cdk import aws_cognito as cognito
 from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_events as events
 from aws_cdk import aws_events_targets as events_targets
@@ -31,6 +37,7 @@ from aws_cdk import aws_logs as logs
 from aws_cdk import aws_opensearchserverless as opensearchserverless
 from aws_cdk import aws_rds as rds
 from aws_cdk import aws_s3 as s3
+from aws_cdk import aws_s3_deployment as s3_deployment
 from aws_cdk import aws_sqs as sqs
 from cdk_nag import NagSuppressions
 from constructs import Construct
@@ -39,6 +46,10 @@ from src.config import AppConfig, DeploymentEnvironment
 METADATA_DATABASE_NAME = "manifest_medex"
 METADATA_TABLE_NAME = "document_metadata"
 AURORA_CREDENTIALS_MISSING = "Aurora generated credentials did not produce a secret"
+MAX_EXPLORER_BODY_BYTES = 4 * 1024 * 1024
+FRONTEND_DIST_MISSING = (
+    "Frontend build output was not found at web/dist; run 'make web-build' before synthesis"
+)
 
 
 @jsii.implements(ILocalBundling)
@@ -189,6 +200,20 @@ class DataQualityStack(Stack):
         )
         self._connect_event_sources()
         self._create_operational_alarms()
+
+        # Authenticated read-only explorer API and CloudFront/S3 single-page frontend.
+        self.explorer_security_group = self._create_explorer_security_group()
+        self.explorer_role = self._create_explorer_role()
+        self._authorize_explorer_data_api()
+        self.explorer_function = self._create_explorer_function()
+        self.http_api = self._create_http_api()
+        self.frontend_bucket = self._create_frontend_bucket()
+        self.distribution = self._create_distribution()
+        self.user_pool, self.user_pool_client, self.user_pool_domain = self._create_user_pool()
+        self._configure_explorer_routes()
+        self.http_stage = self._create_http_stage()
+        self._deploy_frontend()
+
         self._create_outputs()
 
     def _add_standard_tags(self) -> None:
@@ -217,6 +242,7 @@ class DataQualityStack(Stack):
                 f"/aws/vpc/{self.stack_prefix}",
                 f"/aws/lambda/{self.stack_prefix}-hl7",
                 f"/aws/lambda/{self.stack_prefix}-ccda",
+                f"/aws/lambda/{self.stack_prefix}-explorer",
             )
         ]
         key.add_to_resource_policy(
@@ -783,6 +809,7 @@ class DataQualityStack(Stack):
                 "cdk.out/**",
                 "tests/**",
                 "tools/**",
+                "web/**",
                 "src/stack.py",
                 "src/config.py",
                 ".coverage",
@@ -875,6 +902,418 @@ class DataQualityStack(Stack):
     def _search_collection_name(self) -> str:
         return f"manifest-medex-{self.config.environment.value}"
 
+    def _create_explorer_security_group(self) -> ec2.SecurityGroup:
+        return ec2.SecurityGroup(
+            self,
+            "ExplorerSecurityGroup",
+            vpc=self.vpc,
+            allow_all_outbound=True,
+            description="Network access for the authenticated clinical-message explorer Lambda",
+        )
+
+    def _create_explorer_role(self) -> iam.Role:
+        role = iam.Role(
+            self,
+            "ExplorerRole",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            description="Execution role for the authenticated message explorer and SQL console",
+        )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "ec2:AssignPrivateIpAddresses",
+                    "ec2:CreateNetworkInterface",
+                    "ec2:DeleteNetworkInterface",
+                    "ec2:DescribeNetworkInterfaces",
+                    "ec2:UnassignPrivateIpAddresses",
+                ],
+                resources=["*"],
+            )
+        )
+        # Read-only, version-aware access to stored clinical bodies in both data buckets only.
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["s3:GetObject", "s3:GetObjectVersion"],
+                resources=[
+                    self.raw_bucket.arn_for_objects("*"),
+                    self.parsed_bucket.arn_for_objects("*"),
+                ],
+            )
+        )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["rds-data:ExecuteStatement"],
+                resources=[self.metadata_cluster.cluster_arn],
+            )
+        )
+        if self.metadata_cluster.secret is None:
+            raise RuntimeError(AURORA_CREDENTIALS_MISSING)
+        self.metadata_cluster.secret.grant_read(role)
+        self.encryption_key.grant_decrypt(role)
+        NagSuppressions.add_resource_suppressions(
+            role,
+            [
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": (
+                        "Lambda VPC APIs require wildcard resources; read-only S3 object "
+                        "permissions are scoped to the two data buckets; KMS decrypt targets the "
+                        "single stack key."
+                    ),
+                }
+            ],
+            apply_to_children=True,
+        )
+        return role
+
+    def _authorize_explorer_data_api(self) -> None:
+        # The explorer reaches Aurora only over the private Data API interface endpoint.
+        self.data_api_endpoint_security_group.add_ingress_rule(
+            self.explorer_security_group,
+            ec2.Port.tcp(443),
+            "HTTPS from the explorer Lambda to the RDS Data API",
+        )
+        self.data_api_endpoint.add_to_policy(
+            iam.PolicyStatement(
+                principals=[self.explorer_role],
+                actions=["rds-data:ExecuteStatement"],
+                resources=[self.metadata_cluster.cluster_arn],
+            )
+        )
+
+    def _create_explorer_function(self) -> lambda_.Function:
+        function_name = f"{self.stack_prefix}-explorer"
+        log_group = self._create_log_group(
+            "ExplorerLogGroup",
+            f"/aws/lambda/{function_name}",
+        )
+        log_group.grant_write(self.explorer_role)
+        if self.metadata_cluster.secret is None:
+            raise RuntimeError(AURORA_CREDENTIALS_MISSING)
+        return lambda_.Function(
+            self,
+            "ExplorerFunction",
+            function_name=function_name,
+            runtime=lambda_.Runtime.PYTHON_3_14,
+            architecture=lambda_.Architecture.ARM_64,
+            code=self._lambda_code(),
+            handler="src.explorer_handler.handler",
+            role=self.explorer_role,
+            description="Serves authenticated message exploration and SQL execution",
+            environment={
+                "MAX_BODY_BYTES": str(MAX_EXPLORER_BODY_BYTES),
+                "METADATA_CLUSTER_ARN": self.metadata_cluster.cluster_arn,
+                "METADATA_DATABASE": METADATA_DATABASE_NAME,
+                "METADATA_SECRET_ARN": self.metadata_cluster.secret.secret_arn,
+                "METADATA_TABLE": METADATA_TABLE_NAME,
+                "PARSED_BUCKET": self.parsed_bucket.bucket_name,
+                "RAW_BUCKET": self.raw_bucket.bucket_name,
+            },
+            environment_encryption=self.encryption_key,
+            memory_size=1024,
+            reserved_concurrent_executions=10,
+            security_groups=[self.explorer_security_group],
+            timeout=Duration.seconds(30),
+            tracing=lambda_.Tracing.ACTIVE,
+            vpc=self.vpc,
+            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_ISOLATED),
+        )
+
+    def _create_http_api(self) -> apigwv2.HttpApi:
+        # Routes and their Cognito authorizer bind to the api after the frontend origin exists;
+        # the named auto-deploy stage supplies the "/api" URL prefix consumed by CloudFront.
+        return apigwv2.HttpApi(
+            self,
+            "ExplorerHttpApi",
+            api_name=f"{self.stack_prefix}-explorer",
+            description="Authenticated clinical-message explorer and SQL execution API",
+            create_default_stage=False,
+        )
+
+    def _create_frontend_bucket(self) -> s3.Bucket:
+        return s3.Bucket(
+            self,
+            "FrontendBucket",
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            encryption=s3.BucketEncryption.S3_MANAGED,
+            enforce_ssl=True,
+            minimum_tls_version=1.2,
+            object_ownership=s3.ObjectOwnership.BUCKET_OWNER_ENFORCED,
+            removal_policy=RemovalPolicy.RETAIN,
+            server_access_logs_bucket=self.access_logs_bucket,
+            server_access_logs_prefix="frontend/",
+            versioned=True,
+        )
+
+    def _create_distribution(self) -> cloudfront.Distribution:
+        api_host = f"{self.http_api.api_id}.execute-api.{self.region}.{self.url_suffix}"
+        security_headers = cloudfront.ResponseHeadersPolicy(
+            self,
+            "FrontendSecurityHeaders",
+            comment="HSTS, nosniff, and frame-deny headers for the explorer frontend",
+            security_headers_behavior=cloudfront.ResponseSecurityHeadersBehavior(
+                content_type_options=cloudfront.ResponseHeadersContentTypeOptions(override=True),
+                frame_options=cloudfront.ResponseHeadersFrameOptions(
+                    frame_option=cloudfront.HeadersFrameOption.DENY,
+                    override=True,
+                ),
+                strict_transport_security=cloudfront.ResponseHeadersStrictTransportSecurity(
+                    access_control_max_age=Duration.days(365),
+                    include_subdomains=True,
+                    preload=True,
+                    override=True,
+                ),
+            ),
+        )
+        # The API behavior forwards every header except Host so execute-api can resolve the
+        # stage, disables caching for authenticated responses, and never persists request URIs.
+        api_behavior = cloudfront.BehaviorOptions(
+            origin=cloudfront_origins.HttpOrigin(
+                api_host,
+                protocol_policy=cloudfront.OriginProtocolPolicy.HTTPS_ONLY,
+            ),
+            allowed_methods=cloudfront.AllowedMethods.ALLOW_ALL,
+            cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
+            origin_request_policy=cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER,
+            response_headers_policy=security_headers,
+            viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+        )
+        distribution = cloudfront.Distribution(
+            self,
+            "FrontendDistribution",
+            comment=f"{self.stack_prefix} clinical-message explorer frontend",
+            default_root_object="index.html",
+            minimum_protocol_version=cloudfront.SecurityPolicyProtocol.TLS_V1_2_2021,
+            default_behavior=cloudfront.BehaviorOptions(
+                origin=cloudfront_origins.S3BucketOrigin.with_origin_access_control(
+                    self.frontend_bucket
+                ),
+                allowed_methods=cloudfront.AllowedMethods.ALLOW_GET_HEAD,
+                cache_policy=cloudfront.CachePolicy.CACHING_OPTIMIZED,
+                response_headers_policy=security_headers,
+                viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+            ),
+            additional_behaviors={"/api/*": api_behavior},
+        )
+        NagSuppressions.add_resource_suppressions(
+            distribution,
+            [
+                {
+                    "id": "AwsSolutions-CFR1",
+                    "reason": (
+                        "The explorer is a private, authenticated tool; access is controlled by "
+                        "the Cognito user-pool authorizer rather than CloudFront geo filtering."
+                    ),
+                },
+                {
+                    "id": "AwsSolutions-CFR2",
+                    "reason": (
+                        "No AWS WAF web ACL is attached to this demo distribution; every API "
+                        "route requires a valid Cognito user-pool token and the S3 origin is "
+                        "reachable only through Origin Access Control."
+                    ),
+                },
+                {
+                    "id": "AwsSolutions-CFR3",
+                    "reason": (
+                        "CloudFront access logging is intentionally disabled to avoid persisting "
+                        "request URIs that embed clinical document identifiers; S3 server access "
+                        "logs and VPC flow logs provide the retained audit trail."
+                    ),
+                },
+                {
+                    "id": "AwsSolutions-CFR4",
+                    "reason": (
+                        "The distribution serves the default CloudFront domain and certificate, "
+                        "whose minimum viewer TLS version cannot be raised without a custom "
+                        "certificate; TLS 1.2 is enforced wherever configurable."
+                    ),
+                },
+            ],
+        )
+        return distribution
+
+    def _create_user_pool(
+        self,
+    ) -> tuple[cognito.UserPool, cognito.UserPoolClient, cognito.UserPoolDomain]:
+        user_pool = cognito.UserPool(
+            self,
+            "ExplorerUserPool",
+            user_pool_name=f"{self.stack_prefix}-explorer",
+            self_sign_up_enabled=False,
+            sign_in_aliases=cognito.SignInAliases(email=True),
+            sign_in_case_sensitive=False,
+            standard_attributes=cognito.StandardAttributes(
+                email=cognito.StandardAttribute(required=True, mutable=True)
+            ),
+            auto_verify=cognito.AutoVerifiedAttrs(email=True),
+            mfa=cognito.Mfa.OPTIONAL,
+            mfa_second_factor=cognito.MfaSecondFactor(otp=True, sms=False),
+            password_policy=cognito.PasswordPolicy(
+                min_length=14,
+                require_lowercase=True,
+                require_uppercase=True,
+                require_digits=True,
+                require_symbols=True,
+            ),
+            feature_plan=cognito.FeaturePlan.PLUS,
+            standard_threat_protection_mode=cognito.StandardThreatProtectionMode.FULL_FUNCTION,
+            account_recovery=cognito.AccountRecovery.EMAIL_ONLY,
+            removal_policy=RemovalPolicy.RETAIN,
+        )
+        NagSuppressions.add_resource_suppressions(
+            user_pool,
+            [
+                {
+                    "id": "AwsSolutions-COG2",
+                    "reason": (
+                        "Multi-factor authentication is offered as optional software TOTP by "
+                        "design so operators can enroll authenticator apps; SMS MFA is disabled "
+                        "and advanced security protection is enforced."
+                    ),
+                }
+            ],
+        )
+        domain = user_pool.add_domain(
+            "ExplorerUserPoolDomain",
+            cognito_domain=cognito.CognitoDomainOptions(domain_prefix=self.stack_prefix),
+        )
+        callback_url = f"https://{self.distribution.distribution_domain_name}/"
+        client = user_pool.add_client(
+            "ExplorerUserPoolClient",
+            user_pool_client_name=f"{self.stack_prefix}-explorer-web",
+            generate_secret=False,
+            auth_flows=cognito.AuthFlow(user_srp=True),
+            prevent_user_existence_errors=True,
+            o_auth=cognito.OAuthSettings(
+                flows=cognito.OAuthFlows(authorization_code_grant=True),
+                scopes=[
+                    cognito.OAuthScope.OPENID,
+                    cognito.OAuthScope.EMAIL,
+                    cognito.OAuthScope.PROFILE,
+                ],
+                callback_urls=[callback_url],
+                logout_urls=[callback_url],
+            ),
+            supported_identity_providers=[cognito.UserPoolClientIdentityProvider.COGNITO],
+        )
+        return user_pool, client, domain
+
+    def _configure_explorer_routes(self) -> None:
+        authorizer = apigwv2_authorizers.HttpUserPoolAuthorizer(
+            "ExplorerUserPoolAuthorizer",
+            self.user_pool,
+            user_pool_clients=[self.user_pool_client],
+            identity_source=["$request.header.Authorization"],
+        )
+        integration = apigwv2_integrations.HttpLambdaIntegration(
+            "ExplorerIntegration",
+            self.explorer_function,
+        )
+        routes: tuple[tuple[str, apigwv2.HttpMethod], ...] = (
+            ("/messages", apigwv2.HttpMethod.GET),
+            ("/messages/{documentId}", apigwv2.HttpMethod.GET),
+            ("/messages/{documentId}/body", apigwv2.HttpMethod.POST),
+            ("/query", apigwv2.HttpMethod.POST),
+        )
+        for path, method in routes:
+            self.http_api.add_routes(
+                path=path,
+                methods=[method],
+                integration=integration,
+                authorizer=authorizer,
+            )
+
+    def _create_http_stage(self) -> apigwv2.HttpStage:
+        # An explicit auto-deploy stage named "api" supplies the URL path prefix while access
+        # logging stays disabled so clinical document identifiers never reach request logs.
+        stage = apigwv2.HttpStage(
+            self,
+            "ExplorerApiStage",
+            http_api=self.http_api,
+            stage_name="api",
+            auto_deploy=True,
+        )
+        NagSuppressions.add_resource_suppressions(
+            stage,
+            [
+                {
+                    "id": "AwsSolutions-APIG1",
+                    "reason": (
+                        "Stage access logging is intentionally disabled: both message routes "
+                        "embed the clinical document identifier in the request path, and "
+                        "$context.path would persist it. PHI-access auditing is emitted from the "
+                        "explorer Lambda without request URIs, and the private origin is only "
+                        "reachable behind the Cognito user-pool authorizer."
+                    ),
+                }
+            ],
+        )
+        return stage
+
+    def _deploy_frontend(self) -> None:
+        dist_path = _LambdaBundler._PROJECT_ROOT / "web" / "dist"
+        if not dist_path.is_dir():
+            raise RuntimeError(FRONTEND_DIST_MISSING)
+        authority = (
+            f"https://cognito-idp.{self.region}.{self.url_suffix}/{self.user_pool.user_pool_id}"
+        )
+        origin_url = f"https://{self.distribution.distribution_domain_name}/"
+        runtime_config = {
+            "apiBasePath": "/api",
+            "authority": authority,
+            "clientId": self.user_pool_client.user_pool_client_id,
+            "postLogoutRedirectUri": origin_url,
+            "redirectUri": origin_url,
+        }
+        s3_deployment.BucketDeployment(
+            self,
+            "FrontendDeployment",
+            sources=[
+                s3_deployment.Source.asset(str(dist_path)),
+                s3_deployment.Source.json_data("config.json", runtime_config),
+            ],
+            destination_bucket=self.frontend_bucket,
+            distribution=self.distribution,
+            distribution_paths=["/*"],
+            prune=True,
+            retain_on_delete=False,
+        )
+        self._suppress_bucket_deployment()
+
+    def _suppress_bucket_deployment(self) -> None:
+        # The CDK-managed BucketDeployment handler is a shared construct outside our control.
+        suppressions = [
+            {
+                "id": "AwsSolutions-IAM4",
+                "reason": (
+                    "The CDK-managed BucketDeployment handler attaches the AWS-managed basic "
+                    "Lambda execution policy; this construct is not authored by this stack."
+                ),
+            },
+            {
+                "id": "AwsSolutions-IAM5",
+                "reason": (
+                    "The CDK-managed BucketDeployment handler requires wildcard read access to "
+                    "the asset bucket and write access to the destination bucket it provisions."
+                ),
+            },
+            {
+                "id": "AwsSolutions-L1",
+                "reason": (
+                    "The BucketDeployment handler runtime is pinned by the CDK library version "
+                    "and cannot be selected by this stack."
+                ),
+            },
+        ]
+        for child in self.node.children:
+            if child.node.id.startswith("Custom::CDKBucketDeployment"):
+                NagSuppressions.add_resource_suppressions(
+                    child,
+                    suppressions,
+                    apply_to_children=True,
+                )
+
     def _create_outputs(self) -> None:
         if self.metadata_cluster.secret is None:
             raise RuntimeError(AURORA_CREDENTIALS_MISSING)
@@ -897,6 +1336,15 @@ class DataQualityStack(Stack):
             "AuroraSecretArn": self.metadata_cluster.secret.secret_arn,
             "MetadataDatabaseName": METADATA_DATABASE_NAME,
             "MetadataTableName": METADATA_TABLE_NAME,
+            "ExplorerFunctionName": self.explorer_function.function_name,
+            "ExplorerApiEndpoint": self.http_api.api_endpoint,
+            "ExplorerApiStageName": self.http_stage.stage_name,
+            "UserPoolId": self.user_pool.user_pool_id,
+            "UserPoolClientId": self.user_pool_client.user_pool_client_id,
+            "UserPoolHostedUiDomain": self.user_pool_domain.domain_name,
+            "FrontendBucketName": self.frontend_bucket.bucket_name,
+            "FrontendDistributionId": self.distribution.distribution_id,
+            "FrontendDistributionDomainName": self.distribution.distribution_domain_name,
         }
         for output_id, value in outputs.items():
             CfnOutput(self, output_id, value=value)

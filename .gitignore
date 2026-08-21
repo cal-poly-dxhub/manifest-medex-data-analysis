@@ -46,3 +46,7 @@ tools/
 
 # Generated development artifacts
 tools/hl7_dictionary.json
+
+# Frontend dependencies and build output
+web/node_modules/
+web/dist/

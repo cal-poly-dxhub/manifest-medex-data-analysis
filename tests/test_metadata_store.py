@@ -2,6 +2,7 @@ from typing import Any
 
 import pytest
 from src.metadata_store import (
+    CREATE_INDEX_SQLS,
     CREATE_TABLE_SQL,
     UPSERT_SQL,
     DataApiMetadataStore,
@@ -74,6 +75,18 @@ def test_schema_matches_the_agreed_metadata_columns_only() -> None:
     assert "last_updated_at" not in normalized
 
 
+def test_schema_indexes_support_default_and_format_filtered_keyset_order() -> None:
+    normalized = [" ".join(statement.split()) for statement in CREATE_INDEX_SQLS]
+
+    assert normalized == [
+        "CREATE INDEX IF NOT EXISTS document_metadata_ingested_document_idx "
+        "ON document_metadata (ingested_time DESC, document_id DESC)",
+        "CREATE INDEX IF NOT EXISTS document_metadata_format_ingested_document_idx "
+        "ON document_metadata (source_format, ingested_time DESC, document_id DESC)",
+    ]
+    assert all("CONCURRENTLY" not in statement for statement in normalized)
+
+
 def test_batch_upsert_is_retry_safe_and_schema_is_initialized_once() -> None:
     client = FakeDataApi()
     store = _store(client)
@@ -85,10 +98,12 @@ def test_batch_upsert_is_retry_safe_and_schema_is_initialized_once() -> None:
     store.upsert(records)
     store.upsert(records)
 
-    assert len(client.execute_calls) == 1
-    create_call = client.execute_calls[0]
-    assert create_call["sql"] == CREATE_TABLE_SQL
-    assert create_call["continueAfterTimeout"] is True
+    assert len(client.execute_calls) == 3
+    assert [call["sql"] for call in client.execute_calls] == [
+        CREATE_TABLE_SQL,
+        *CREATE_INDEX_SQLS,
+    ]
+    assert all(call["continueAfterTimeout"] is True for call in client.execute_calls)
     assert len(client.batch_calls) == 2
     batch_call = client.batch_calls[0]
     assert batch_call["sql"] == UPSERT_SQL
@@ -146,7 +161,7 @@ def test_custom_safe_table_name_is_applied_to_both_statements() -> None:
 
     store.upsert([_record()])
 
-    assert "clinical_document_metadata" in client.execute_calls[0]["sql"]
+    assert all("clinical_document_metadata" in call["sql"] for call in client.execute_calls)
     assert "clinical_document_metadata" in client.batch_calls[0]["sql"]
     assert "INSERT INTO document_metadata" not in client.batch_calls[0]["sql"]
 

@@ -14,7 +14,7 @@ import hl7
 from hl7.containers import Message, Segment
 from hl7.exceptions import HL7Exception
 
-PARSER_VERSION = "0.3.0"
+PARSER_VERSION = "0.4.0"
 INVALID_UTF8 = "Raw object is not valid UTF-8"
 CONTENT_BEFORE_MSH = "Content appeared before the first MSH segment"
 MISSING_MSH = "No HL7 MSH segment was found"
@@ -75,25 +75,33 @@ def parse_hl7_file(
     *,
     ingested_at: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Split and parse every HL7 message in one raw object."""
+    """Split, deduplicate, and parse HL7 messages from one raw object."""
     try:
         text = payload.decode("utf-8-sig")
     except UnicodeDecodeError as error:
         raise ParseError(INVALID_UTF8) from error
 
     messages = split_hl7_messages(text)
-    # One object checksum plus message ordinal yields stable identities for batch files.
-    checksum = hashlib.sha256(payload).hexdigest()
-    return [
-        _parse_message(
-            message,
-            source,
-            checksum=checksum,
-            ordinal=ordinal,
-            ingested_at=ingested_at,
+    raw_checksum = hashlib.sha256(payload).hexdigest()
+    documents: list[dict[str, Any]] = []
+    seen_messages: set[str] = set()
+    for ordinal, message in enumerate(messages):
+        # Identity is based on normalized message content; retain only its first occurrence.
+        if message in seen_messages:
+            continue
+        seen_messages.add(message)
+        message_checksum = hashlib.sha256(message.encode()).hexdigest()
+        documents.append(
+            _parse_message(
+                message,
+                source,
+                raw_checksum=raw_checksum,
+                message_checksum=message_checksum,
+                ordinal=ordinal,
+                ingested_at=ingested_at,
+            )
         )
-        for ordinal, message in enumerate(messages)
-    ]
+    return documents
 
 
 def split_hl7_messages(text: str) -> list[str]:
@@ -125,7 +133,8 @@ def _parse_message(
     message: str,
     source: SourceReference,
     *,
-    checksum: str,
+    raw_checksum: str,
+    message_checksum: str,
     ordinal: int,
     ingested_at: str | None,
 ) -> dict[str, Any]:
@@ -175,10 +184,9 @@ def _parse_message(
     message_time_raw = header.field(7)
     message_time = _normalize_hl7_timestamp(message_time_raw)
     participant = _participant_from_key(source.key) or facility or None
-    # Version/ETag distinguishes source revisions; ordinal distinguishes messages in a batch.
-    source_identity = source.version_id or source.etag or checksum
+    # The same normalized message under one S3 key always resolves to one logical document.
     document_id = hashlib.sha256(
-        f"{source.bucket}\0{source.key}\0{source_identity}\0{ordinal}".encode()
+        f"{source.bucket}\0{source.key}\0{message_checksum}".encode()
     ).hexdigest()
 
     document: dict[str, Any] = {
@@ -200,7 +208,7 @@ def _parse_message(
             "key": source.key,
             "versionId": source.version_id,
             "etag": source.etag,
-            "sha256": checksum,
+            "sha256": raw_checksum,
         },
     }
     if ingested_at is not None:

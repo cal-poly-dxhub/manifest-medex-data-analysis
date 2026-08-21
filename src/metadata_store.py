@@ -21,6 +21,17 @@ CREATE TABLE IF NOT EXISTS document_metadata (
 )
 """.strip()
 
+CREATE_INDEX_SQLS = (
+    """
+CREATE INDEX IF NOT EXISTS document_metadata_ingested_document_idx
+ON document_metadata (ingested_time DESC, document_id DESC)
+""".strip(),
+    """
+CREATE INDEX IF NOT EXISTS document_metadata_format_ingested_document_idx
+ON document_metadata (source_format, ingested_time DESC, document_id DESC)
+""".strip(),
+)
+
 UPSERT_SQL = """
 INSERT INTO document_metadata (
     document_id,
@@ -52,7 +63,7 @@ DO UPDATE SET
     parsed_version_id = EXCLUDED.parsed_version_id
 """.strip()
 
-_IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
+SQL_IDENTIFIER_PATTERN = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 INVALID_IDENTIFIER = "Aurora database and table names must be safe SQL identifiers"
 SCHEMA_INITIALIZATION_FAILED = "Aurora metadata schema initialization failed"
 UPSERT_FAILED = "Aurora metadata upsert failed"
@@ -95,7 +106,9 @@ class DataApiMetadataStore:
         table_name: str,
     ) -> None:
         # SQL identifiers cannot be bound parameters, so validate before interpolation.
-        if not _IDENTIFIER.fullmatch(database) or not _IDENTIFIER.fullmatch(table_name):
+        if not SQL_IDENTIFIER_PATTERN.fullmatch(database) or not SQL_IDENTIFIER_PATTERN.fullmatch(
+            table_name
+        ):
             raise ValueError(INVALID_IDENTIFIER)
         self._client = client
         self._request = {
@@ -104,6 +117,9 @@ class DataApiMetadataStore:
             "database": database,
         }
         self._create_sql = CREATE_TABLE_SQL.replace("document_metadata", table_name)
+        self._index_sqls = tuple(
+            statement.replace("document_metadata", table_name) for statement in CREATE_INDEX_SQLS
+        )
         self._upsert_sql = UPSERT_SQL.replace("document_metadata", table_name)
         # Cache initialization per warm Lambda environment; CREATE TABLE remains idempotent.
         self._schema_ready = False
@@ -126,11 +142,12 @@ class DataApiMetadataStore:
         if self._schema_ready:
             return
         try:
-            self._client.execute_statement(
-                **self._request,
-                sql=self._create_sql,
-                continueAfterTimeout=True,
-            )
+            for statement in (self._create_sql, *self._index_sqls):
+                self._client.execute_statement(
+                    **self._request,
+                    sql=statement,
+                    continueAfterTimeout=True,
+                )
         except Exception:
             raise MetadataStoreError(SCHEMA_INITIALIZATION_FAILED) from None
         self._schema_ready = True

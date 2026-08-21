@@ -1,5 +1,6 @@
 # ruff: noqa: E501
 
+import hashlib
 import json
 
 import pytest
@@ -91,14 +92,45 @@ def test_ccda_parser_projects_supplied_dashboard_paths_without_narrative() -> No
     assert "EXCLUDED-NARRATIVE" not in json.dumps(document)
 
 
-def test_ccda_document_id_is_deterministic() -> None:
-    source = SourceReference(bucket="raw", key="document.xml", etag="etag")
+def test_ccda_document_id_uses_bucket_key_and_raw_xml_content() -> None:
+    first = parse_ccda_document(
+        SYNTHETIC_CCDA,
+        SourceReference(bucket="raw", key="document.xml", version_id="v1", etag="etag-1"),
+    )
+    second = parse_ccda_document(
+        SYNTHETIC_CCDA,
+        SourceReference(bucket="raw", key="document.xml", version_id="v2", etag="etag-2"),
+    )
+    checksum = hashlib.sha256(SYNTHETIC_CCDA).hexdigest()
+    expected = hashlib.sha256(f"raw\0document.xml\0{checksum}".encode()).hexdigest()
 
-    first = parse_ccda_document(SYNTHETIC_CCDA, source)
-    second = parse_ccda_document(SYNTHETIC_CCDA, source)
+    assert first["parserVersion"] == "0.2.0"
+    assert first["documentId"] == expected
+    assert second["documentId"] == expected
+    assert first["rawObject"]["sha256"] == checksum
 
-    assert first["documentId"] == second["documentId"]
-    assert first["rawObject"]["sha256"] == second["rawObject"]["sha256"]
+
+def test_ccda_document_id_changes_for_a_different_source_key() -> None:
+    first = parse_ccda_document(
+        SYNTHETIC_CCDA,
+        SourceReference(bucket="raw", key="document.xml"),
+    )
+    second = parse_ccda_document(
+        SYNTHETIC_CCDA,
+        SourceReference(bucket="raw", key="copy.xml"),
+    )
+
+    assert first["documentId"] != second["documentId"]
+
+
+def test_ccda_document_id_changes_when_raw_xml_bytes_change() -> None:
+    source = SourceReference(bucket="raw", key="document.xml")
+    original = parse_ccda_document(SYNTHETIC_CCDA, source)
+    formatting_only_change = parse_ccda_document(SYNTHETIC_CCDA + b"\n", source)
+
+    assert original["CD"] == formatting_only_change["CD"]
+    assert original["documentId"] != formatting_only_change["documentId"]
+    assert original["rawObject"]["sha256"] != formatting_only_change["rawObject"]["sha256"]
 
 
 def test_ccda_parser_rejects_dtd_entities_and_wrong_root() -> None:

@@ -1,0 +1,488 @@
+:root {
+  --color-bg: #ffffff;
+  --color-surface: #f7f8fa;
+  --color-border: #d7dbe0;
+  --color-text: #1b1f24;
+  --color-muted: #5a6470;
+  --color-primary: #1f5eff;
+  --color-primary-contrast: #ffffff;
+  --color-error-bg: #fdecec;
+  --color-error-text: #8a1f1f;
+  --color-selected: #e8f0ff;
+  --radius: 6px;
+  --gap: 16px;
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial,
+    sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono",
+    monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  color: var(--color-text);
+  background: var(--color-bg);
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+/* ---- App shell ---- */
+.app {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+}
+
+.app--centered {
+  align-items: center;
+  justify-content: center;
+  padding: var(--gap);
+}
+
+.app__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--gap);
+  padding: 12px var(--gap);
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-surface);
+}
+
+.app__title {
+  font-size: 1.1rem;
+  margin: 0;
+}
+
+.app__body {
+  flex: 1 1 auto;
+  padding: var(--gap);
+  min-height: 0;
+}
+
+/* ---- Explorer layout ---- */
+.explorer {
+  display: grid;
+  grid-template-columns: minmax(0, 1.6fr) minmax(320px, 1fr);
+  gap: var(--gap);
+  align-items: start;
+}
+
+@media (max-width: 900px) {
+  .explorer {
+    grid-template-columns: 1fr;
+  }
+}
+
+.explorer__main {
+  min-width: 0;
+}
+
+/* ---- Filters ---- */
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--gap);
+  align-items: flex-end;
+  padding: 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+  margin-bottom: var(--gap);
+}
+
+.filters__field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.filters__field label {
+  font-size: 0.8rem;
+  color: var(--color-muted);
+}
+
+.filters__actions {
+  display: flex;
+  gap: 8px;
+}
+
+.filters__error {
+  flex-basis: 100%;
+  color: var(--color-error-text);
+  margin: 0;
+}
+
+input,
+select {
+  font: inherit;
+  padding: 6px 8px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-bg);
+  color: var(--color-text);
+}
+
+/* ---- Buttons ---- */
+.button {
+  font: inherit;
+  padding: 7px 14px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-bg);
+  color: var(--color-text);
+  cursor: pointer;
+}
+
+.button:hover:not(:disabled) {
+  background: var(--color-surface);
+}
+
+.button--primary {
+  background: var(--color-primary);
+  border-color: var(--color-primary);
+  color: var(--color-primary-contrast);
+}
+
+.button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
+/* ---- Table ---- */
+.table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 640px;
+}
+
+.table th,
+.table td {
+  text-align: left;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--color-border);
+  white-space: nowrap;
+}
+
+.table th {
+  background: var(--color-surface);
+  position: sticky;
+  top: 0;
+  font-weight: 600;
+}
+
+.row {
+  cursor: pointer;
+}
+
+.row:hover {
+  background: var(--color-surface);
+}
+
+.row--selected {
+  background: var(--color-selected);
+}
+
+.cell-mono {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  word-break: break-all;
+  white-space: normal;
+}
+
+/* ---- Pagination ---- */
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--gap);
+  margin-top: var(--gap);
+}
+
+.pagination__status {
+  color: var(--color-muted);
+}
+
+.pagination__controls,
+.pagination__pages,
+.pagination__page-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.pagination__page {
+  min-width: 36px;
+  padding-inline: 10px;
+}
+
+.pagination__page--current {
+  border-color: var(--color-primary);
+  background: var(--color-primary);
+  color: var(--color-primary-contrast);
+  font-weight: 600;
+}
+
+.pagination__ellipsis {
+  padding-inline: 4px;
+  color: var(--color-muted);
+}
+
+/* ---- Detail pane ---- */
+.detail {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: var(--gap);
+  background: var(--color-bg);
+  position: sticky;
+  top: var(--gap);
+}
+
+.detail__title {
+  margin-top: 0;
+  font-size: 1rem;
+}
+
+.detail__meta {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 12px;
+  margin: 0 0 var(--gap);
+}
+
+.detail__meta dt {
+  color: var(--color-muted);
+  font-size: 0.8rem;
+}
+
+.detail__meta dd {
+  margin: 0;
+}
+
+/* ---- Body tabs ---- */
+.tablist {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--color-border);
+  margin-bottom: 8px;
+}
+
+.tab {
+  font: inherit;
+  padding: 6px 12px;
+  border: none;
+  background: none;
+  color: var(--color-muted);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+}
+
+.tab--active {
+  color: var(--color-text);
+  border-bottom-color: var(--color-primary);
+  font-weight: 600;
+}
+
+.tabpanel {
+  max-height: 60vh;
+  overflow: auto;
+}
+
+.json-view {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+}
+
+.raw-body {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+  padding: 8px;
+  background: var(--color-surface);
+  border-radius: var(--radius);
+}
+
+/* ---- States ---- */
+.state {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 16px;
+  border-radius: var(--radius);
+}
+
+.state--error {
+  flex-direction: column;
+  align-items: flex-start;
+  background: var(--color-error-bg);
+  color: var(--color-error-text);
+}
+
+.state--empty,
+.state--loading {
+  color: var(--color-muted);
+}
+
+.spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--color-border);
+  border-top-color: var(--color-primary);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation: none;
+  }
+}
+
+
+/* ---- View switcher and SQL console ---- */
+.app__header-actions,
+.view-switcher,
+.saved-query-controls,
+.sql-console__actions,
+.sql-console__running {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.view-switcher {
+  border-bottom: 1px solid var(--color-border);
+}
+
+.sql-console {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+}
+
+.sql-console__warning {
+  padding: 12px;
+  border: 1px solid #d8a600;
+  border-radius: var(--radius);
+  background: #fff8d6;
+}
+
+.saved-query-controls {
+  flex-wrap: wrap;
+  padding: 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+}
+
+.saved-query-controls label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--color-muted);
+}
+
+.sql-console form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sql-console__editor-label {
+  font-weight: 600;
+}
+
+.sql-console__editor {
+  width: 100%;
+  min-height: 240px;
+  resize: vertical;
+  padding: 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: #111827;
+  color: #f3f4f6;
+  font: 0.9rem/1.5 var(--font-mono);
+  tab-size: 2;
+}
+
+.sql-console__actions {
+  flex-wrap: wrap;
+}
+
+.sql-console__actions .button--primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.spinner--button {
+  width: 14px;
+  height: 14px;
+  border-color: rgb(255 255 255 / 45%);
+  border-top-color: var(--color-primary-contrast);
+}
+
+.sql-console__error {
+  margin: 0;
+  padding: 12px;
+  border-radius: var(--radius);
+  background: var(--color-error-bg);
+  color: var(--color-error-text);
+}
+
+.sql-results__summary {
+  color: var(--color-muted);
+}
+
+.sql-results__table {
+  min-width: max-content;
+}
+
+.sql-results__cell {
+  max-width: 480px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+}
+
+@media (max-width: 700px) {
+  .app__header {
+    align-items: flex-start;
+  }
+
+  .app__header-actions {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+}

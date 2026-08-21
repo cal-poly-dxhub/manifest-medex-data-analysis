@@ -1,3 +1,5 @@
+import hashlib
+
 import pytest
 from src.parser import ParseError, SourceReference, parse_hl7_file, split_hl7_messages
 
@@ -50,13 +52,59 @@ def test_split_and_parse_batch_with_legacy_query_paths() -> None:
     assert adt["documentId"] != oru["documentId"]
 
 
-def test_document_id_is_stable_for_the_same_object_version() -> None:
-    source = SourceReference(bucket="raw", key="synthetic.hl7", version_id="v1")
+def test_document_id_uses_bucket_key_and_normalized_message_content() -> None:
+    first_source = SourceReference(bucket="raw", key="synthetic.hl7", version_id="v1")
+    second_source = SourceReference(bucket="raw", key="synthetic.hl7", version_id="v2")
 
-    first = parse_hl7_file(SYNTHETIC_BATCH.encode(), source)
-    second = parse_hl7_file(SYNTHETIC_BATCH.encode(), source)
+    first = parse_hl7_file(SYNTHETIC_BATCH.encode(), first_source)
+    second = parse_hl7_file(SYNTHETIC_BATCH.encode(), second_source)
+    message = split_hl7_messages(SYNTHETIC_BATCH)[0]
+    message_checksum = hashlib.sha256(message.encode()).hexdigest()
+    expected = hashlib.sha256(f"raw\0synthetic.hl7\0{message_checksum}".encode()).hexdigest()
 
+    assert first[0]["documentId"] == expected
     assert [item["documentId"] for item in first] == [item["documentId"] for item in second]
+    different_key = parse_hl7_file(
+        SYNTHETIC_BATCH.encode(),
+        SourceReference(bucket="raw", key="copy.hl7", version_id="v2"),
+    )
+    assert first[0]["documentId"] != different_key[0]["documentId"]
+
+
+def test_identical_messages_under_one_key_collapse_to_the_first_occurrence() -> None:
+    message = split_hl7_messages(SYNTHETIC_BATCH)[0]
+    documents = parse_hl7_file(
+        f"{message}\r{message}".encode(),
+        SourceReference(bucket="raw", key="duplicates.hl7", version_id="v1"),
+    )
+
+    assert len(documents) == 1
+    assert documents[0]["messageOrdinal"] == 0
+
+
+def test_reordering_distinct_messages_does_not_change_their_document_ids() -> None:
+    messages = split_hl7_messages(SYNTHETIC_BATCH)
+    source = SourceReference(bucket="raw", key="reordered.hl7", version_id="v1")
+
+    original = parse_hl7_file("\r".join(messages).encode(), source)
+    reordered = parse_hl7_file("\r".join(reversed(messages)).encode(), source)
+
+    original_ids = {item["messageControlId"]: item["documentId"] for item in original}
+    reordered_ids = {item["messageControlId"]: item["documentId"] for item in reordered}
+    assert original_ids == reordered_ids
+
+
+def test_changing_one_message_changes_only_that_messages_document_id() -> None:
+    source = SourceReference(bucket="raw", key="changed.hl7", version_id="v1")
+    original = parse_hl7_file(SYNTHETIC_BATCH.encode(), source)
+    changed = parse_hl7_file(
+        SYNTHETIC_BATCH.replace("PATIENT-2", "PATIENT-CHANGED").encode(), source
+    )
+
+    original_ids = {item["messageControlId"]: item["documentId"] for item in original}
+    changed_ids = {item["messageControlId"]: item["documentId"] for item in changed}
+    assert original_ids["MSG-1"] == changed_ids["MSG-1"]
+    assert original_ids["MSG-2"] != changed_ids["MSG-2"]
 
 
 def test_split_tolerates_mllp_and_newline_delimiters() -> None:
@@ -87,7 +135,7 @@ def test_library_parsing_handles_custom_delimiters_and_unknown_segments() -> Non
 
     document = parse_hl7_file(payload.encode(), SourceReference(bucket="raw", key="custom.hl7"))[0]
 
-    assert document["parserVersion"] == "0.3.0"
+    assert document["parserVersion"] == "0.4.0"
     assert document["sourceFacilityId"] == "FACILITY"
     assert document["messageType"] == "ORU"
     assert document["triggerEvent"] == "R01"
