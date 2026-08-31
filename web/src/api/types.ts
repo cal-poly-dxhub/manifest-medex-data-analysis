@@ -15,6 +15,14 @@ export interface MessageSummary {
   readonly ingestedTime: string;
 }
 
+
+/** Full metadata response used before loading raw or parsed message content. */
+export interface MessageDetailRecord extends MessageSummary {
+  readonly rawS3Uri: string;
+  readonly rawVersionId: string | null;
+  readonly parsedS3Uri: string;
+  readonly parsedVersionId: string | null;
+}
 /** Cursor-paginated list response. Cursors are opaque, backend-defined tokens. */
 export interface MessageListResponse {
   readonly items: readonly MessageSummary[];

@@ -390,13 +390,6 @@ select {
   gap: var(--gap);
 }
 
-.sql-console__warning {
-  padding: 12px;
-  border: 1px solid #d8a600;
-  border-radius: var(--radius);
-  background: #fff8d6;
-}
-
 .saved-query-controls {
   flex-wrap: wrap;
   padding: 12px;
@@ -484,5 +477,31 @@ select {
   .app__header-actions {
     flex-wrap: wrap;
     justify-content: flex-end;
+  }
+}
+
+
+.sql-results__hint {
+  color: var(--color-muted);
+}
+
+.sql-results__workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1.6fr) minmax(320px, 1fr);
+  gap: var(--gap);
+  align-items: start;
+}
+
+.sql-results__workspace--single {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.sql-results__table-pane {
+  min-width: 0;
+}
+
+@media (max-width: 900px) {
+  .sql-results__workspace {
+    grid-template-columns: minmax(0, 1fr);
   }
 }

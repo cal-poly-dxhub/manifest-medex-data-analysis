@@ -2,6 +2,7 @@ import type {
   BodyVariant,
   MessageBody,
   MessageFilters,
+  MessageDetailRecord,
   MessageListResponse,
   SqlQueryResult,
 } from './types';
@@ -107,6 +108,20 @@ export class ApiClient {
       false,
     );
     return (await response.json()) as MessageListResponse;
+  }
+
+  /** Fetch full metadata for one selected document. */
+  async getMessage(id: string, signal?: AbortSignal): Promise<MessageDetailRecord> {
+    const init: RequestInit = { method: 'GET' };
+    if (signal) {
+      init.signal = signal;
+    }
+    const response = await this.fetchResponse(
+      `/messages/${encodeURIComponent(id)}`,
+      init,
+      false,
+    );
+    return (await response.json()) as MessageDetailRecord;
   }
 
   /** Fetch a body lazily. The direct response is JSON for parsed or text for raw. */

@@ -198,7 +198,7 @@ The API contract is:
 - `POST /api/messages/{documentId}/body` with `{ "variant": "raw" | "parsed" }` — direct content with the appropriate text, XML, or JSON content type.
 - `POST /api/query` with `{ "sql": "..." }` — execute one unrestricted SQL statement and return generic columns, rows, and the affected-record count. SQL text is limited to 100,000 characters and the serialized result to 4 MiB.
 
-The UI provides Messages and SQL query views. SQL queries can be named, saved, loaded, and deleted using browser `localStorage`; they are not synchronized between browsers or users. A visible loading spinner is shown while SQL executes. Do not save query text containing clinical values or identifiers on shared or unmanaged devices.
+The UI provides Messages and SQL query views. SQL queries can be named, saved, loaded, and deleted using browser `localStorage`; they are not synchronized between browsers or users. A visible loading spinner is shown while SQL executes. SQL result rows containing a valid `document_id`, `documentId`, or `_id` open the same authenticated detail pane and audited Raw/Parsed body endpoints as the Messages view.
 
 Body content is fetched server-side from the exact stored S3 version and is never exposed through a presigned URL. Synchronous bodies are capped at 4 MiB and read through a bounded stream to remain below Lambda/API response limits. A successful body read writes a structured audit event containing the authenticated JWT `sub`, document ID, variant, and timestamp, but never the body, clinical fields, S3 key, SQL, or raw backend response. Successful SQL execution emits the caller `sub`, timestamp, row count, and affected-record count without logging the SQL text or returned values.
 

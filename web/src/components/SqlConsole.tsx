@@ -1,6 +1,8 @@
 import { useMemo, useState, type FormEvent, type ReactNode } from 'react';
 import { ApiError } from '../api/client';
-import { useSqlQuery } from '../api/queries';
+import { useMessageDetail, useSqlQuery } from '../api/queries';
+import { MessageDetail } from './MessageDetail';
+import { ErrorState, LoadingState } from './StateViews';
 
 interface SavedQuery {
   readonly id: string;
@@ -10,6 +12,8 @@ interface SavedQuery {
 
 const STORAGE_KEY = 'phi-explorer.saved-sql.v1';
 const MAX_SAVED_QUERIES = 50;
+const DOCUMENT_ID_PATTERN = /^[0-9a-f]{64}$/;
+const DOCUMENT_ID_COLUMNS = new Set(['document_id', 'documentid', '_id']);
 const DEFAULT_SQL = `SELECT
   document_id,
   source_format,
@@ -61,6 +65,22 @@ function formatCell(value: unknown): string {
   }
 }
 
+function findDocumentIdColumn(columns: readonly string[]): number {
+  return columns.findIndex((column) =>
+    DOCUMENT_ID_COLUMNS.has(column.trim().toLowerCase()),
+  );
+}
+
+function documentIdFromRow(
+  row: readonly unknown[],
+  documentIdColumn: number,
+): string | undefined {
+  const value = row[documentIdColumn];
+  return typeof value === 'string' && DOCUMENT_ID_PATTERN.test(value)
+    ? value
+    : undefined;
+}
+
 function queryErrorMessage(error: unknown): string {
   if (error instanceof ApiError) {
     if (error.status === 401 || error.status === 403) {
@@ -73,17 +93,65 @@ function queryErrorMessage(error: unknown): string {
   return 'The SQL query failed. Check the statement and try again.';
 }
 
+function detailErrorMessage(error: unknown): string {
+  if (error instanceof ApiError) {
+    if (error.status === 401 || error.status === 403) {
+      return 'You are not authorized to view this message.';
+    }
+    if (error.status === 404) {
+      return 'This message no longer exists.';
+    }
+  }
+  return 'Unable to load the selected message.';
+}
+
+function SqlMessageDetail({
+  documentId,
+}: {
+  readonly documentId: string | undefined;
+}): ReactNode {
+  const detail = useMessageDetail(documentId);
+  if (!documentId) {
+    return <MessageDetail message={undefined} />;
+  }
+  if (detail.isLoading) {
+    return (
+      <aside className="detail" aria-label="Message detail">
+        <LoadingState label="Loading message details…" />
+      </aside>
+    );
+  }
+  if (detail.isError) {
+    return (
+      <aside className="detail" aria-label="Message detail">
+        <ErrorState
+          message={detailErrorMessage(detail.error)}
+          onRetry={() => void detail.refetch()}
+        />
+      </aside>
+    );
+  }
+  return <MessageDetail message={detail.data} />;
+}
+
 export function SqlConsole(): ReactNode {
   const [sql, setSql] = useState(DEFAULT_SQL);
   const [queryName, setQueryName] = useState('');
   const [savedQueries, setSavedQueries] = useState<SavedQuery[]>(readSavedQueries);
-  const [selectedId, setSelectedId] = useState('');
+  const [selectedSavedQueryId, setSelectedSavedQueryId] = useState('');
+  const [selectedDocumentId, setSelectedDocumentId] = useState<string | undefined>(
+    undefined,
+  );
   const [storageError, setStorageError] = useState<string | undefined>(undefined);
   const query = useSqlQuery();
 
-  const selected = useMemo(
-    () => savedQueries.find((item) => item.id === selectedId),
-    [savedQueries, selectedId],
+  const selectedSavedQuery = useMemo(
+    () => savedQueries.find((item) => item.id === selectedSavedQueryId),
+    [savedQueries, selectedSavedQueryId],
+  );
+  const documentIdColumn = useMemo(
+    () => (query.data ? findDocumentIdColumn(query.data.columns) : -1),
+    [query.data],
   );
 
   const persist = (next: SavedQuery[]): boolean => {
@@ -103,6 +171,7 @@ export function SqlConsole(): ReactNode {
     if (!sql.trim() || query.isPending) {
       return;
     }
+    setSelectedDocumentId(undefined);
     query.mutate(sql);
   };
 
@@ -122,39 +191,38 @@ export function SqlConsole(): ReactNode {
       ...savedQueries.filter((item) => item.name.toLowerCase() !== name.toLowerCase()),
     ].slice(0, MAX_SAVED_QUERIES);
     if (persist(next)) {
-      setSelectedId(saved.id);
+      setSelectedSavedQueryId(saved.id);
       setQueryName('');
     }
   };
 
   const handleLoad = (): void => {
-    if (selected) {
-      setSql(selected.sql);
-      setQueryName(selected.name);
+    if (selectedSavedQuery) {
+      setSql(selectedSavedQuery.sql);
+      setQueryName(selectedSavedQuery.name);
+      setSelectedDocumentId(undefined);
       query.reset();
     }
   };
 
   const handleDelete = (): void => {
-    if (!selected) {
+    if (!selectedSavedQuery) {
       return;
     }
-    if (persist(savedQueries.filter((item) => item.id !== selected.id))) {
-      setSelectedId('');
+    if (persist(savedQueries.filter((item) => item.id !== selectedSavedQuery.id))) {
+      setSelectedSavedQueryId('');
     }
   };
 
   return (
     <section className="sql-console" aria-label="SQL query console">
-      <div className="sql-console__warning" role="note">
-        SQL runs with the explorer database credential and is unrestricted. Saved queries are
-        stored only in this browser; do not save clinical values or identifiers on shared devices.
-      </div>
-
       <div className="saved-query-controls">
         <label>
           Saved query
-          <select value={selectedId} onChange={(event) => setSelectedId(event.target.value)}>
+          <select
+            value={selectedSavedQueryId}
+            onChange={(event) => setSelectedSavedQueryId(event.target.value)}
+          >
             <option value="">Select a saved query</option>
             {savedQueries.map((item) => (
               <option key={item.id} value={item.id}>
@@ -163,10 +231,20 @@ export function SqlConsole(): ReactNode {
             ))}
           </select>
         </label>
-        <button type="button" className="button" disabled={!selected} onClick={handleLoad}>
+        <button
+          type="button"
+          className="button"
+          disabled={!selectedSavedQuery}
+          onClick={handleLoad}
+        >
           Load
         </button>
-        <button type="button" className="button" disabled={!selected} onClick={handleDelete}>
+        <button
+          type="button"
+          className="button"
+          disabled={!selectedSavedQuery}
+          onClick={handleDelete}
+        >
           Delete
         </button>
       </div>
@@ -232,30 +310,88 @@ export function SqlConsole(): ReactNode {
             {query.data.rows.length} row(s); {query.data.numberOfRecordsUpdated} record(s)
             updated
           </p>
+          {documentIdColumn >= 0 ? (
+            <p className="sql-results__hint">
+              Select a row to open the authenticated Raw/Parsed message viewer.
+            </p>
+          ) : (
+            <p className="sql-results__hint">
+              Include <code>document_id</code> (or alias it as <code>documentId</code>) to make
+              result rows open the Raw/Parsed viewer.
+            </p>
+          )}
           {query.data.columns.length > 0 ? (
-            <div className="table-wrap" role="region" aria-label="SQL query results" tabIndex={0}>
-              <table className="table sql-results__table">
-                <thead>
-                  <tr>
-                    {query.data.columns.map((column, index) => (
-                      <th key={`${column}-${index}`} scope="col">
-                        {column}
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {query.data.rows.map((row, rowIndex) => (
-                    <tr key={rowIndex}>
-                      {row.map((value, columnIndex) => (
-                        <td key={columnIndex} className="sql-results__cell">
-                          {formatCell(value)}
-                        </td>
+            <div
+              className={
+                documentIdColumn >= 0
+                  ? 'sql-results__workspace'
+                  : 'sql-results__workspace sql-results__workspace--single'
+              }
+            >
+              <div
+                className="table-wrap sql-results__table-pane"
+                role="region"
+                aria-label="SQL query results"
+                tabIndex={0}
+              >
+                <table className="table sql-results__table">
+                  <thead>
+                    <tr>
+                      {query.data.columns.map((column, index) => (
+                        <th key={`${column}-${index}`} scope="col">
+                          {column}
+                        </th>
                       ))}
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {query.data.rows.map((row, rowIndex) => {
+                      const rowDocumentId =
+                        documentIdColumn >= 0
+                          ? documentIdFromRow(row, documentIdColumn)
+                          : undefined;
+                      const isSelected = rowDocumentId === selectedDocumentId;
+                      return (
+                        <tr
+                          key={rowIndex}
+                          className={
+                            rowDocumentId
+                              ? isSelected
+                                ? 'row row--selected'
+                                : 'row'
+                              : undefined
+                          }
+                          aria-selected={rowDocumentId ? isSelected : undefined}
+                          tabIndex={rowDocumentId ? 0 : undefined}
+                          onClick={() => {
+                            if (rowDocumentId) {
+                              setSelectedDocumentId(rowDocumentId);
+                            }
+                          }}
+                          onKeyDown={(event) => {
+                            if (
+                              rowDocumentId &&
+                              (event.key === 'Enter' || event.key === ' ')
+                            ) {
+                              event.preventDefault();
+                              setSelectedDocumentId(rowDocumentId);
+                            }
+                          }}
+                        >
+                          {row.map((value, columnIndex) => (
+                            <td key={columnIndex} className="sql-results__cell">
+                              {formatCell(value)}
+                            </td>
+                          ))}
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+              {documentIdColumn >= 0 ? (
+                <SqlMessageDetail documentId={selectedDocumentId} />
+              ) : null}
             </div>
           ) : null}
         </div>

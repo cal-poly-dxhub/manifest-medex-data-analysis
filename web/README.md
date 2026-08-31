@@ -47,6 +47,6 @@ The backend returns an exact filtered total on every page. The UI shows the curr
 - `POST /messages/{documentId}/body` with `{ "variant": "parsed" | "raw" }` returns content directly: JSON for `parsed`, text/XML for `raw`.
 - `POST /query` with `{ "sql": "..." }` executes one unrestricted SQL statement and returns `{ columns, rows, numberOfRecordsUpdated }`.
 
-The SQL query view displays a loading spinner during execution. Named queries can be saved, loaded, and deleted in browser `localStorage`; they are not synchronized and remain on the device until deleted. Do not save identifiers or clinical values on shared devices.
+The SQL query view displays a loading spinner during execution. Named queries can be saved, loaded, and deleted in browser `localStorage`; they are not synchronized and remain on the device until deleted. When results include a valid `document_id`, `documentId`, or `_id`, the row opens the same authenticated message detail and Raw/Parsed viewer used by the Messages view. Queries without one of those columns remain non-clickable result tables.
 
 The backend cursor is newest-first and forward-only. The UI keeps prior cursors in memory to provide Previous navigation. Aurora cursor timestamps are normalized to UTC so Next works with offsetless Data API timestamp text.

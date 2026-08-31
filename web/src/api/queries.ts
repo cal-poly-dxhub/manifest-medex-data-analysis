@@ -8,6 +8,7 @@ import { useApiClient } from './ApiClientContext';
 import type {
   BodyVariant,
   MessageBody,
+  MessageDetailRecord,
   MessageFilters,
   MessageListResponse,
   SqlQueryResult,
@@ -18,6 +19,7 @@ export const MESSAGE_PAGE_SIZE = 50;
 const queryKeys = {
   messages: (filters: MessageFilters, cursor: string | undefined) =>
     ['messages', filters, cursor ?? null] as const,
+  detail: (id: string) => ['message-detail', id] as const,
   body: (id: string, variant: BodyVariant) =>
     ['message-body', id, variant] as const,
 };
@@ -34,6 +36,18 @@ export function useMessageList(
         { ...filters, ...(cursor ? { cursor } : {}), limit: MESSAGE_PAGE_SIZE },
         signal,
       ),
+    staleTime: 30_000,
+  });
+}
+
+export function useMessageDetail(
+  id: string | undefined,
+): UseQueryResult<MessageDetailRecord> {
+  const client = useApiClient();
+  return useQuery({
+    queryKey: queryKeys.detail(id ?? ''),
+    queryFn: ({ signal }) => client.getMessage(id as string, signal),
+    enabled: typeof id === 'string' && id.length > 0,
     staleTime: 30_000,
   });
 }
