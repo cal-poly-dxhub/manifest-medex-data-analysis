@@ -1,12 +1,16 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import { useAuth } from 'react-oidc-context';
 import { MessageExplorer } from './components/MessageExplorer';
+import { SearchExplorer } from './components/SearchExplorer';
 import { SqlConsole } from './components/SqlConsole';
+import { ReportsExplorer } from './components/ReportsExplorer';
 import { ErrorState, LoadingState } from './components/StateViews';
 
 export function App(): ReactNode {
   const auth = useAuth();
-  const [activeView, setActiveView] = useState<'messages' | 'sql'>('messages');
+  const [activeView, setActiveView] = useState<'messages' | 'search' | 'sql' | 'reports'>(
+    'messages',
+  );
 
   // Initiate the hosted-UI Authorization Code + PKCE flow automatically when
   // the user is not authenticated. No self-signup UI is presented.
@@ -66,11 +70,29 @@ export function App(): ReactNode {
             <button
               type="button"
               role="tab"
+              aria-selected={activeView === 'search'}
+              className={activeView === 'search' ? 'tab tab--active' : 'tab'}
+              onClick={() => setActiveView('search')}
+            >
+              Search
+            </button>
+            <button
+              type="button"
+              role="tab"
               aria-selected={activeView === 'sql'}
               className={activeView === 'sql' ? 'tab tab--active' : 'tab'}
               onClick={() => setActiveView('sql')}
             >
               SQL query
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeView === 'reports'}
+              className={activeView === 'reports' ? 'tab tab--active' : 'tab'}
+              onClick={() => setActiveView('reports')}
+            >
+              Reports
             </button>
           </div>
           <button
@@ -88,7 +110,15 @@ export function App(): ReactNode {
         </div>
       </header>
       <main className="app__body">
-        {activeView === 'messages' ? <MessageExplorer /> : <SqlConsole />}
+        {activeView === 'messages' ? (
+          <MessageExplorer />
+        ) : activeView === 'search' ? (
+          <SearchExplorer />
+        ) : activeView === 'sql' ? (
+          <SqlConsole />
+        ) : (
+          <ReportsExplorer />
+        )}
       </main>
     </div>
   );

@@ -12,7 +12,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol, cast
 
+from src.message_search import SearchError, SearchRequestError, SearchService
 from src.metadata_store import SQL_IDENTIFIER_PATTERN
+from src.reingest_jobs import ReingestJobs, ReingestRequestError
+from src.report_catalog import DEFAULT_HISTORY_LIMIT, CatalogRequestError, ReportCatalog
+from src.report_facilities import FacilityDirectory
+from src.report_query import QueryTester, QueryTestRequestError
+from src.report_runs import ReportRuns, RunRequestError
+from src.search_store import SignedOpenSearchTransport
 
 LOGGER = logging.getLogger(__name__)
 LOGGER.setLevel(logging.INFO)
@@ -336,25 +343,49 @@ def handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
     route_key = str(event.get("routeKey", ""))
     try:
         return _route_request(event, route_key)
-    except RequestError as error:
+    except SearchRequestError as error:
+        # SearchRequestError carries its own safe status/code (note: ``status`` not
+        # ``status_code``) and is a SearchError subclass, so it must be handled before the
+        # generic sanitized 500 that collapses every other SearchError.
+        return _json_response(error.status, {"error": error.code})
+    except (
+        RequestError,
+        CatalogRequestError,
+        RunRequestError,
+        QueryTestRequestError,
+        ReingestRequestError,
+    ) as error:
         return _json_response(error.status_code, {"error": error.code})
     except Exception as error:
+        diagnostics: dict[str, Any] = {
+            "errorType": type(error).__name__,
+            "event": "explorer_request_failed",
+            "route": route_key,
+        }
+        if isinstance(error, SearchError):
+            # Non-clinical telemetry only: backend HTTP status and transport-vs-status
+            # kind, mirroring the IndexingError pattern. Never response bodies.
+            if error.http_status is not None:
+                diagnostics["httpStatus"] = error.http_status
+            if error.failure_kind is not None:
+                diagnostics["failureKind"] = error.failure_kind
         LOGGER.error(  # noqa: TRY400 - tracebacks could contain SDK request details
-            json.dumps(
-                {
-                    "errorType": type(error).__name__,
-                    "event": "explorer_request_failed",
-                    "route": route_key,
-                },
-                separators=(",", ":"),
-                sort_keys=True,
-            )
+            json.dumps(diagnostics, separators=(",", ":"), sort_keys=True)
         )
         return _json_response(500, {"error": "explorer_request_failed"})
 
 
 def _route_request(event: dict[str, Any], route_key: str) -> dict[str, Any]:
     caller_sub = _caller_sub(event)
+    report_response = _route_report_request(event, route_key, caller_sub)
+    if report_response is not None:
+        return report_response
+    search_response = _route_search_request(event, route_key, caller_sub)
+    if search_response is not None:
+        return search_response
+    reingest_response = _route_reingest_request(event, route_key, caller_sub)
+    if reingest_response is not None:
+        return reingest_response
     explorer = _runtime_explorer()
     if route_key == "GET /messages":
         query = event.get("queryStringParameters") or {}
@@ -393,6 +424,285 @@ def _route_request(event: dict[str, Any], route_key: str) -> dict[str, Any]:
 _RUNTIME_EXPLORER: MessageExplorer | None = None
 
 
+def _route_search_request(
+    event: dict[str, Any],
+    route_key: str,
+    caller_sub: str,
+) -> dict[str, Any] | None:
+    """Handle the additive metadata attribute-search routes, returning None otherwise.
+
+    The message-search service owns all request validation: it rejects an unknown index,
+    caller, filter, field, operator, value, facility, time window, limit, or cursor with a
+    typed :class:`SearchRequestError` that carries its own safe status and short code, and
+    collapses every backend or malformed-response failure into a sanitized
+    :class:`SearchError` the top-level handler turns into a generic 500. The request body,
+    filter values, facility, and time bounds are never logged here; the service emits a
+    single audit line recording only the caller, index, and the distinct field names.
+    """
+    if route_key == "POST /search":
+        body = _request_json(event)
+        result = _runtime_message_search().search(
+            index=body.get("index"),
+            caller_sub=caller_sub,
+            filters=body.get("filters"),
+            facility=body.get("facility"),
+            from_time=body.get("from"),
+            to_time=body.get("to"),
+            limit=body.get("limit"),
+            cursor=body.get("cursor"),
+        )
+        return _json_response(200, result)
+    if route_key == "GET /search/fields":
+        query = event.get("queryStringParameters") or {}
+        if not isinstance(query, dict):
+            raise RequestError(400, "invalid_query")
+        index = query.get("index")
+        # The index query-string parameter is required; the service enforces that it names
+        # one of the two searchable indexes and raises a typed invalid_index otherwise.
+        if not isinstance(index, str):
+            raise RequestError(400, "invalid_index")
+        catalog = _runtime_message_search().field_catalog(index)
+        return _json_response(200, {"fields": catalog.sorted_fields})
+    return None
+
+
+def _route_reingest_request(
+    event: dict[str, Any],
+    route_key: str,
+    caller_sub: str,
+) -> dict[str, Any] | None:
+    """Handle the additive parsed-zone reingestion routes, returning None otherwise.
+
+    The reingest jobs service owns every request check: it enforces its own strict
+    SELECT-only SQL guard, the exactly-one-of ``sql``/``documentIds`` selection rule, the
+    document-id and job-id formats, and the list limit, raising a typed
+    :class:`ReingestRequestError` that carries its own safe status and short code. Any other
+    failure is a sanitized internal error the top-level handler collapses into a generic
+    500. The request body, the SQL, the document-id list, and the list results are never
+    logged here; the service emits a single audit line that records only the caller subject,
+    the job mode, the selected document count, and the SQL SHA-256 (never the SQL text).
+    """
+    if route_key == "POST /reingest/preview":
+        body = _request_json(event)
+        return _json_response(200, _runtime_reingest().preview(body.get("sql"), caller_sub))
+    if route_key == "POST /reingest/jobs":
+        body = _request_json(event)
+        # The service enforces that exactly one of sql or documentIds is supplied and
+        # validates each, so the handler forwards both verbatim without pre-checking.
+        result = _runtime_reingest().create_job(
+            caller_sub,
+            sql=body.get("sql"),
+            document_ids=body.get("documentIds"),
+        )
+        return _json_response(202, result)
+    if route_key == "GET /reingest/jobs":
+        return _json_response(200, _runtime_reingest().list_jobs(_reingest_limit(event)))
+    if route_key == "GET /reingest/jobs/{jobId}":
+        return _json_response(200, _runtime_reingest().get_job(_path_job_id(event)))
+    return None
+
+
+def _route_report_request(
+    event: dict[str, Any],
+    route_key: str,
+    caller_sub: str,
+) -> dict[str, Any] | None:
+    """Handle the additive Reports routes, returning None for non-report routes.
+
+    Typed request errors from the catalog, runs, and query-test services carry their own
+    safe status code and short code and are surfaced by the top-level handler. Every other
+    failure from these services is a sanitized internal error that the handler collapses
+    into a generic ``explorer_request_failed`` response without any backend detail.
+    Definition bodies, row queries, facility identifiers, query-test results, and report
+    output are never logged here.
+    """
+    catalog_response = _route_report_catalog(event, route_key, caller_sub)
+    if catalog_response is not None:
+        return catalog_response
+    if route_key == "POST /reports/{id}/runs":
+        report_id = _path_report_id(event)
+        body = _request_json(event)
+        from_time = body.get("from")
+        to_time = body.get("to")
+        partitions = body.get("partitions")
+        if (
+            not isinstance(from_time, str)
+            or not isinstance(to_time, str)
+            or not isinstance(partitions, list)
+        ):
+            raise RequestError(400, "invalid_run_request")
+        result = _runtime_runs().start_run(
+            report_id,
+            from_time,
+            to_time,
+            cast(list[str], partitions),
+            caller_sub,
+        )
+        return _json_response(202, result)
+    if route_key == "GET /reports/{id}/runs":
+        report_id = _path_report_id(event)
+        return _json_response(200, {"items": _runtime_runs().list_runs_for_report(report_id)})
+    if route_key == "GET /runs/{runId}":
+        return _json_response(200, _runtime_runs().get_run_status(_path_run_id(event)))
+    if route_key == "GET /runs/{runId}/download":
+        run_id = _path_run_id(event)
+        download = _runtime_runs().download_output(run_id, caller_sub)
+        return {
+            "statusCode": 200,
+            "headers": {
+                "cache-control": "no-store",
+                "content-disposition": f'attachment; filename="{run_id}.zip"',
+                "content-type": download.content_type,
+                "x-content-type-options": "nosniff",
+            },
+            "body": base64.b64encode(download.content).decode("ascii"),
+            "isBase64Encoded": True,
+        }
+    if route_key == "GET /facilities":
+        return _json_response(200, {"facilities": _runtime_facilities().list_facilities()})
+    if route_key == "POST /query-test":
+        body = _request_json(event)
+        result = _runtime_query_tester().count(
+            index=body.get("index"),
+            query=body.get("query"),
+            facility=body.get("facility"),
+            from_time=body.get("from"),
+            to_time=body.get("to"),
+        )
+        return _json_response(200, result)
+    return None
+
+
+def _route_report_catalog(
+    event: dict[str, Any],
+    route_key: str,
+    caller_sub: str,
+) -> dict[str, Any] | None:
+    """Handle the catalog routes: list, read, import, export, whole-report edits, and rows.
+
+    A definition enters the catalog through an atomic import and can be swapped wholesale by
+    ``PUT /reports/{id}`` (the catalog owns whole-definition validation and the optimistic
+    ``updated_at`` lock, and the handler only forwards the canonical definition JSON after
+    confirming the path id matches the definition's own ``report_id``) or removed by an
+    idempotent ``DELETE /reports/{id}``. Every finer change is a row- or section-granular edit
+    guarded by the storage sequence addresses and optimistic ``updated_at`` locks the catalog
+    owns.
+    """
+    if route_key == "GET /reports":
+        return _json_response(200, {"items": _runtime_catalog().list_reports()})
+    if route_key == "POST /reports/import":
+        body = _request_json(event)
+        result = _runtime_catalog().import_report(
+            json.dumps(body, separators=(",", ":"), sort_keys=True),
+            updated_by=caller_sub,
+            source="api",
+        )
+        return _json_response(201, result)
+    if route_key == "GET /reports/{id}":
+        return _json_response(200, _runtime_catalog().get_report(_path_report_id(event)))
+    if route_key == "GET /reports/{id}/export":
+        return _json_response(200, _runtime_catalog().export_report(_path_report_id(event)))
+    if route_key == "PUT /reports/{id}":
+        report_id = _path_report_id(event)
+        body = _request_json(event)
+        definition = body.get("definition")
+        updated_at = body.get("updated_at")
+        if not isinstance(definition, dict) or not isinstance(updated_at, str):
+            raise RequestError(400, "invalid_report_update")
+        # The path id is authoritative: it must match the definition's own report_id so a
+        # replace can never retarget a different report. The catalog owns every other
+        # whole-definition check, so the handler forwards the definition verbatim as the
+        # same canonical JSON the import path uses and lets the catalog validate the body
+        # and enforce the optimistic updated_at lock (a losing race surfaces as a 409).
+        if definition.get("report_id") != report_id:
+            raise RequestError(400, "report_id_mismatch")
+        result = _runtime_catalog().replace_report(
+            json.dumps(definition, separators=(",", ":"), sort_keys=True),
+            expected_updated_at=updated_at,
+            updated_by=caller_sub,
+        )
+        return _json_response(200, result)
+    if route_key == "DELETE /reports/{id}":
+        # Whole-report deletion is idempotent in the catalog, so a repeat DELETE still
+        # returns 204 with no body regardless of whether a live report was removed.
+        _runtime_catalog().delete_report(_path_report_id(event), updated_by=caller_sub)
+        return {
+            "statusCode": 204,
+            "headers": {"cache-control": "no-store", "x-content-type-options": "nosniff"},
+            "body": "",
+        }
+    if route_key == "GET /reports/{id}/history":
+        report_id = _path_report_id(event)
+        limit = _history_limit(event)
+        return _json_response(200, {"items": _runtime_catalog().history(report_id, limit)})
+    if route_key == "PUT /reports/{id}/sections/{sseq}/rows/{rseq}":
+        report_id = _path_report_id(event)
+        section_seq = _path_storage_seq(event, "sseq")
+        row_seq = _path_storage_seq(event, "rseq")
+        body = _request_json(event)
+        row = body.get("row")
+        updated_at = body.get("updated_at")
+        if not isinstance(row, dict) or not isinstance(updated_at, str):
+            raise RequestError(400, "invalid_row_edit")
+        result = _runtime_catalog().update_row(
+            report_id,
+            section_seq,
+            row_seq,
+            cast(dict[str, Any], row),
+            expected_updated_at=updated_at,
+            updated_by=caller_sub,
+        )
+        return _json_response(200, result)
+    if route_key == "POST /reports/{id}/sections/{sseq}/rows":
+        report_id = _path_report_id(event)
+        section_seq = _path_storage_seq(event, "sseq")
+        body = _request_json(event)
+        row = body.get("row")
+        if not isinstance(row, dict):
+            raise RequestError(400, "invalid_row_add")
+        result = _runtime_catalog().add_row(
+            report_id,
+            section_seq,
+            cast(dict[str, Any], row),
+            after_storage_seq=_optional_storage_seq(body.get("after_seq")),
+            updated_by=caller_sub,
+        )
+        return _json_response(201, result)
+    if route_key == "DELETE /reports/{id}/sections/{sseq}/rows/{rseq}":
+        report_id = _path_report_id(event)
+        section_seq = _path_storage_seq(event, "sseq")
+        row_seq = _path_storage_seq(event, "rseq")
+        body = _request_json(event)
+        updated_at = body.get("updated_at")
+        if not isinstance(updated_at, str):
+            raise RequestError(400, "invalid_row_delete")
+        _runtime_catalog().delete_row(
+            report_id,
+            section_seq,
+            row_seq,
+            expected_updated_at=updated_at,
+            updated_by=caller_sub,
+        )
+        return {
+            "statusCode": 204,
+            "headers": {"cache-control": "no-store", "x-content-type-options": "nosniff"},
+            "body": "",
+        }
+    if route_key == "POST /reports/{id}/sections":
+        report_id = _path_report_id(event)
+        body = _request_json(event)
+        # The catalog owns section-shape validation (name and seq), so the handler forwards
+        # the fields verbatim and only parses the optional storage-sequence position.
+        result = _runtime_catalog().add_section(
+            report_id,
+            {"name": body.get("name"), "seq": body.get("seq")},
+            after_storage_seq=_optional_storage_seq(body.get("after_seq")),
+            updated_by=caller_sub,
+        )
+        return _json_response(201, result)
+    return None
+
+
 def _runtime_explorer() -> MessageExplorer:
     global _RUNTIME_EXPLORER
     if _RUNTIME_EXPLORER is None:
@@ -408,6 +718,107 @@ def _runtime_explorer() -> MessageExplorer:
             max_body_bytes=int(os.getenv("MAX_BODY_BYTES", str(DEFAULT_MAX_BODY_BYTES))),
         )
     return _RUNTIME_EXPLORER
+
+
+_RUNTIME_CATALOG: ReportCatalog | None = None
+_RUNTIME_RUNS: ReportRuns | None = None
+_RUNTIME_FACILITIES: FacilityDirectory | None = None
+_RUNTIME_QUERY_TESTER: QueryTester | None = None
+_RUNTIME_MESSAGE_SEARCH: SearchService | None = None
+_RUNTIME_REINGEST: ReingestJobs | None = None
+
+
+def _runtime_reingest() -> ReingestJobs:
+    global _RUNTIME_REINGEST
+    if _RUNTIME_REINGEST is None:
+        # Reingestion reaches Aurora through the same private Data API configuration the
+        # explorer uses, records job rows in a low-level DynamoDB table, and dispatches the
+        # planner Lambda; the SQL guard, DynamoDB, and Lambda detail never leave the service.
+        _RUNTIME_REINGEST = ReingestJobs(
+            _aws_client("rds-data"),
+            _aws_client("dynamodb"),
+            _aws_client("lambda"),
+            cluster_arn=os.environ["METADATA_CLUSTER_ARN"],
+            secret_arn=os.environ["METADATA_SECRET_ARN"],
+            database=os.environ["METADATA_DATABASE"],
+            table_name=os.environ["METADATA_TABLE"],
+            jobs_table=os.environ["REINGEST_JOBS_TABLE"],
+            planner_function_name=os.environ["REINGEST_PLANNER_FUNCTION"],
+        )
+    return _RUNTIME_REINGEST
+
+
+def _runtime_message_search() -> SearchService:
+    global _RUNTIME_MESSAGE_SEARCH
+    if _RUNTIME_MESSAGE_SEARCH is None:
+        # The metadata search signs each request with the same transport style as the
+        # facility lookup and query-test dry run, reusing the collection endpoint and the
+        # existing OPENSEARCH environment configuration.
+        transport = SignedOpenSearchTransport(
+            endpoint=os.environ["OPENSEARCH_ENDPOINT"],
+            region=os.environ["AWS_REGION"],
+            service=os.getenv("OPENSEARCH_SERVICE", "aoss"),
+        )
+        _RUNTIME_MESSAGE_SEARCH = SearchService(transport)
+    return _RUNTIME_MESSAGE_SEARCH
+
+
+def _runtime_catalog() -> ReportCatalog:
+    global _RUNTIME_CATALOG
+    if _RUNTIME_CATALOG is None:
+        # The row-granular catalog stores every definition as items in one DynamoDB table
+        # and no longer keeps a whole-report object in S3, so it takes only the table.
+        _RUNTIME_CATALOG = ReportCatalog(
+            _aws_client("dynamodb"),
+            table_name=os.environ["REPORT_CATALOG_TABLE"],
+        )
+    return _RUNTIME_CATALOG
+
+
+def _runtime_runs() -> ReportRuns:
+    global _RUNTIME_RUNS
+    if _RUNTIME_RUNS is None:
+        report_index = os.getenv("REPORT_RUNS_INDEX") or None
+        _RUNTIME_RUNS = ReportRuns(
+            _aws_client("dynamodb"),
+            _aws_client("lambda"),
+            _aws_client("s3"),
+            table_name=os.environ["REPORT_RUNS_TABLE"],
+            worker_function_name=os.environ["REPORT_RUNNER_FUNCTION"],
+            output_bucket=os.environ["REPORT_BUCKET"],
+            report_index_name=report_index,
+        )
+    return _RUNTIME_RUNS
+
+
+def _runtime_facilities() -> FacilityDirectory:
+    global _RUNTIME_FACILITIES
+    if _RUNTIME_FACILITIES is None:
+        transport = SignedOpenSearchTransport(
+            endpoint=os.environ["OPENSEARCH_ENDPOINT"],
+            region=os.environ["AWS_REGION"],
+            service=os.getenv("OPENSEARCH_SERVICE", "aoss"),
+        )
+        _RUNTIME_FACILITIES = FacilityDirectory(
+            transport,
+            hl7_index=os.getenv("OPENSEARCH_HL7_INDEX", "hl7-messages-v1"),
+            ccda_index=os.getenv("OPENSEARCH_CCDA_INDEX", "ccda-documents-v1"),
+        )
+    return _RUNTIME_FACILITIES
+
+
+def _runtime_query_tester() -> QueryTester:
+    global _RUNTIME_QUERY_TESTER
+    if _RUNTIME_QUERY_TESTER is None:
+        # A dry run signs a single POST index/_search with the same transport style as the
+        # facility lookup, and reuses the facility directory to reject unknown partitions.
+        transport = SignedOpenSearchTransport(
+            endpoint=os.environ["OPENSEARCH_ENDPOINT"],
+            region=os.environ["AWS_REGION"],
+            service=os.getenv("OPENSEARCH_SERVICE", "aoss"),
+        )
+        _RUNTIME_QUERY_TESTER = QueryTester(transport, _runtime_facilities())
+    return _RUNTIME_QUERY_TESTER
 
 
 def _caller_sub(event: dict[str, Any]) -> str:
@@ -434,6 +845,115 @@ def _path_document_id(event: dict[str, Any]) -> str:
 def _validate_document_id(document_id: str) -> None:
     if not DOCUMENT_ID_PATTERN.fullmatch(document_id):
         raise RequestError(400, "invalid_document_id")
+
+
+def _path_report_id(event: dict[str, Any]) -> str:
+    parameters = event.get("pathParameters")
+    if not isinstance(parameters, dict):
+        raise RequestError(400, "invalid_report_id")
+    report_id = parameters.get("id")
+    # The catalog and runs services own report-id format validation, so the handler only
+    # confirms a string is present and defers the pattern check to a single source.
+    if not isinstance(report_id, str):
+        raise RequestError(400, "invalid_report_id")
+    return report_id
+
+
+def _path_run_id(event: dict[str, Any]) -> str:
+    parameters = event.get("pathParameters")
+    if not isinstance(parameters, dict):
+        raise RequestError(400, "invalid_run_id")
+    run_id = parameters.get("runId")
+    if not isinstance(run_id, str):
+        raise RequestError(400, "invalid_run_id")
+    return run_id
+
+
+def _path_job_id(event: dict[str, Any]) -> str:
+    parameters = event.get("pathParameters")
+    if not isinstance(parameters, dict):
+        raise RequestError(400, "invalid_job_id")
+    job_id = parameters.get("jobId")
+    # The reingest jobs service owns the job-id format check, so the handler only confirms a
+    # string is present and defers the strict hex pattern to a single source of truth.
+    if not isinstance(job_id, str):
+        raise RequestError(400, "invalid_job_id")
+    return job_id
+
+
+def _path_storage_seq(event: dict[str, Any], name: str) -> int:
+    """Parse a section/row storage-sequence path parameter as a positive integer.
+
+    The catalog addresses items by their allocated storage sequence, so the handler
+    rejects anything that is not a canonical positive integer (no leading zeros, sign, or
+    non-digit text) before it reaches a DynamoDB key.
+    """
+    parameters = event.get("pathParameters")
+    if not isinstance(parameters, dict):
+        raise RequestError(400, "invalid_storage_seq")
+    raw = parameters.get(name)
+    if not isinstance(raw, str):
+        raise RequestError(400, "invalid_storage_seq")
+    try:
+        value = int(raw)
+    except ValueError:
+        raise RequestError(400, "invalid_storage_seq") from None
+    if str(value) != raw or value < 1:
+        raise RequestError(400, "invalid_storage_seq")
+    return value
+
+
+def _optional_storage_seq(value: Any) -> int | None:
+    """Validate an optional ``after_seq`` positioning hint as a positive storage sequence."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise RequestError(400, "invalid_storage_seq")
+    return value
+
+
+def _history_limit(event: dict[str, Any]) -> int:
+    """Parse the optional ``limit`` query-string scalar, deferring bounds to the catalog.
+
+    API Gateway delivers query-string values as scalars, so the handler only converts a
+    present ``limit`` to an integer and lets ``ReportCatalog.history`` enforce the allowed
+    1..200 range with its own sanitized ``invalid_limit`` error. An absent ``limit`` uses
+    the catalog default so a caller and the service agree on the same page size.
+    """
+    query = event.get("queryStringParameters") or {}
+    if not isinstance(query, dict):
+        raise RequestError(400, "invalid_query")
+    raw = query.get("limit")
+    if raw is None:
+        return DEFAULT_HISTORY_LIMIT
+    if not isinstance(raw, str):
+        raise RequestError(400, "invalid_limit")
+    try:
+        return int(raw)
+    except ValueError:
+        raise RequestError(400, "invalid_limit") from None
+
+
+def _reingest_limit(event: dict[str, Any]) -> int | None:
+    """Parse the optional ``limit`` query-string scalar, deferring bounds to the service.
+
+    API Gateway delivers query-string values as scalars, so the handler converts a present
+    ``limit`` to an integer and lets :meth:`ReingestJobs.list_jobs` enforce the allowed
+    range with its own sanitized ``invalid_limit`` error. An absent ``limit`` passes through
+    as ``None`` so the service applies its own default page size.
+    """
+    query = event.get("queryStringParameters") or {}
+    if not isinstance(query, dict):
+        raise RequestError(400, "invalid_query")
+    raw = query.get("limit")
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise RequestError(400, "invalid_limit")
+    try:
+        return int(raw)
+    except ValueError:
+        raise RequestError(400, "invalid_limit") from None
 
 
 def _request_json(event: dict[str, Any]) -> dict[str, Any]:

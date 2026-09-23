@@ -1,10 +1,11 @@
-import { useCallback, useMemo, useState, type ReactNode } from 'react';
+import { useCallback, useMemo, useRef, useState, type ReactNode } from 'react';
 import { MESSAGE_PAGE_SIZE, useMessageList } from '../api/queries';
 import type { MessageFilters, MessageSummary } from '../api/types';
 import { ApiError } from '../api/client';
 import { MessageFiltersForm } from './MessageFiltersForm';
 import { MessageTable } from './MessageTable';
 import { MessageDetail } from './MessageDetail';
+import { DetailDrawer } from './DetailDrawer';
 import { EmptyState, ErrorState, LoadingState } from './StateViews';
 
 function listErrorMessage(error: unknown): string {
@@ -36,6 +37,7 @@ export function MessageExplorer(): ReactNode {
   ]);
   const [pageIndex, setPageIndex] = useState(0);
   const [selected, setSelected] = useState<MessageSummary | undefined>(undefined);
+  const selectedRowRef = useRef<HTMLTableRowElement | null>(null);
   const cursor = pageCursors[pageIndex];
   const query = useMessageList(filters, cursor);
 
@@ -45,6 +47,29 @@ export function MessageExplorer(): ReactNode {
     setPageIndex(0);
     setSelected(undefined);
   }, []);
+
+  // Move the selection to the adjacent row on the current page. Navigation stops at the
+  // first and last rows and never crosses a page boundary (no pagination side effects).
+  const navigateSelection = useCallback(
+    (delta: -1 | 1): void => {
+      const items = query.data?.items;
+      if (!items || !selected) {
+        return;
+      }
+      const currentIndex = items.findIndex(
+        (item) => item.documentId === selected.documentId,
+      );
+      if (currentIndex < 0) {
+        return;
+      }
+      const nextIndex = currentIndex + delta;
+      if (nextIndex < 0 || nextIndex >= items.length) {
+        return;
+      }
+      setSelected(items[nextIndex]);
+    },
+    [query.data?.items, selected],
+  );
 
   const data = query.data;
   const nextCursor = data?.nextCursor ?? null;
@@ -163,6 +188,7 @@ export function MessageExplorer(): ReactNode {
           rows={data.items}
           selectedId={selected?.documentId}
           onSelect={setSelected}
+          selectedRowRef={selectedRowRef}
         />
         {renderPagination()}
       </>
@@ -175,7 +201,16 @@ export function MessageExplorer(): ReactNode {
         <MessageFiltersForm value={filters} onChange={handleFiltersChange} />
         {renderResults()}
       </section>
-      <MessageDetail message={selected} />
+      {selected ? (
+        <DetailDrawer
+          title="Message detail"
+          onClose={() => setSelected(undefined)}
+          returnFocusRef={selectedRowRef}
+          onNavigate={navigateSelection}
+        >
+          <MessageDetail message={selected} />
+        </DetailDrawer>
+      ) : null}
     </div>
   );
 }

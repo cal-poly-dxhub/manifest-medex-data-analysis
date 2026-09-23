@@ -26,6 +26,7 @@ from aws_cdk import aws_cloudfront as cloudfront
 from aws_cdk import aws_cloudfront_origins as cloudfront_origins
 from aws_cdk import aws_cloudwatch as cloudwatch
 from aws_cdk import aws_cognito as cognito
+from aws_cdk import aws_dynamodb as dynamodb
 from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_events as events
 from aws_cdk import aws_events_targets as events_targets
@@ -41,10 +42,16 @@ from aws_cdk import aws_s3_deployment as s3_deployment
 from aws_cdk import aws_sqs as sqs
 from cdk_nag import NagSuppressions
 from constructs import Construct
+from src.ccda_parser import PARSER_VERSION as CCDA_PARSER_VERSION
 from src.config import AppConfig, DeploymentEnvironment
+from src.parser import PARSER_VERSION as HL7_PARSER_VERSION
 
 METADATA_DATABASE_NAME = "manifest_medex"
 METADATA_TABLE_NAME = "document_metadata"
+REPORT_RUNS_INDEX_NAME = "reportId-startedAt-index"
+REPORT_OUTPUT_PREFIX = "outputs/"
+HL7_INDEX_NAME = "hl7-messages-v1"
+CCDA_INDEX_NAME = "ccda-documents-v1"
 AURORA_CREDENTIALS_MISSING = "Aurora generated credentials did not produce a secret"
 MAX_EXPLORER_BODY_BYTES = 4 * 1024 * 1024
 FRONTEND_DIST_MISSING = (
@@ -80,6 +87,14 @@ class _LambdaBundler:
             destination / "src",
             dirs_exist_ok=True,
             ignore=ignore_patterns("__pycache__", "*.pyc", "stack.py", "config.py"),
+        )
+        # report_definition loads its JSON Schema from the project-root schema/ directory
+        # (outside src/), so the runtime asset must carry that directory verbatim.
+        copytree(
+            self._PROJECT_ROOT / "schema",
+            destination / "schema",
+            dirs_exist_ok=True,
+            ignore=ignore_patterns("__pycache__", "*.pyc"),
         )
         for name, (_, package_name) in self._DEPENDENCIES.items():
             distribution = distributions[name]
@@ -154,6 +169,27 @@ class DataQualityStack(Stack):
         self.hl7_role = self._create_ingestion_role("Hl7", "incoming/hl7/*", "hl7/*")
         self.ccda_role = self._create_ingestion_role("Ccda", "incoming/ccda/*", "ccda/*")
 
+        # Reports storage and metadata are provisioned before their consumer roles.
+        self.reports_bucket = self._create_data_bucket("ReportsBucket", "reports/")
+        self.reports_catalog_table = self._create_reports_catalog_table()
+        self.report_runs_table = self._create_report_runs_table()
+
+        # Reingestion queue, jobs table, and networking are provisioned before the roles and
+        # search collection that reference them, so the reindexer can join the data policy.
+        self.reindex_queue, self.reindex_dead_letter_queue = self._create_queue_pair("Reindex")
+        self.reingest_jobs_table = self._create_reingest_jobs_table()
+
+        # The report runner and explorer roles exist before the search collection so the
+        # data access policy can grant both read-only index access in one document.
+        self.report_runner_security_group = self._create_report_runner_security_group()
+        self.explorer_security_group = self._create_explorer_security_group()
+        self.reingest_planner_security_group = self._create_reingest_planner_security_group()
+        self.reindexer_security_group = self._create_reindexer_security_group()
+        self.report_runner_role = self._create_report_runner_role()
+        self.explorer_role = self._create_explorer_role()
+        self.reingest_planner_role = self._create_reingest_planner_role()
+        self.reindexer_role = self._create_reindexer_role()
+
         self.serverless_vpc_endpoint = self._create_serverless_vpc_endpoint()
         self.search_collection = self._create_search_collection()
         self._grant_collection_access()
@@ -202,9 +238,17 @@ class DataQualityStack(Stack):
         self._create_operational_alarms()
 
         # Authenticated read-only explorer API and CloudFront/S3 single-page frontend.
-        self.explorer_security_group = self._create_explorer_security_group()
-        self.explorer_role = self._create_explorer_role()
+        self.report_runner_function = self._create_report_runner_function()
         self._authorize_explorer_data_api()
+        self._authorize_report_network()
+        # Reingestion planner and parsed-zone reindexer are wired before the explorer, which
+        # dispatches the planner and reads the jobs table through injected environment.
+        self._authorize_reingest_planner_data_api()
+        self._authorize_reindexer_network()
+        self.reingest_planner_function = self._create_reingest_planner_function()
+        self.reindexer_function = self._create_reindexer_function()
+        self._connect_reindex_event_source()
+        self._authorize_explorer_reingest()
         self.explorer_function = self._create_explorer_function()
         self.http_api = self._create_http_api()
         self.frontend_bucket = self._create_frontend_bucket()
@@ -243,6 +287,9 @@ class DataQualityStack(Stack):
                 f"/aws/lambda/{self.stack_prefix}-hl7",
                 f"/aws/lambda/{self.stack_prefix}-ccda",
                 f"/aws/lambda/{self.stack_prefix}-explorer",
+                f"/aws/lambda/{self.stack_prefix}-report-runner",
+                f"/aws/lambda/{self.stack_prefix}-reingest-planner",
+                f"/aws/lambda/{self.stack_prefix}-reindexer",
             )
         ]
         key.add_to_resource_policy(
@@ -314,6 +361,67 @@ class DataQualityStack(Stack):
             server_access_logs_bucket=self.access_logs_bucket,
             server_access_logs_prefix=log_prefix,
             versioned=True,
+        )
+
+    def _create_reports_catalog_table(self) -> dynamodb.Table:
+        # Row-granular Reports store every report as items under one partition key (PK) with a
+        # per-item sort key (SK) for the META header, section headers, and definition rows.
+        # Each mutation pairs the change with an append-only audit item in one
+        # TransactWriteItems, so no table stream or audit consumer is required.
+        return dynamodb.Table(
+            self,
+            "ReportsCatalogTable",
+            table_name=f"{self.stack_prefix}-reports-catalog",
+            partition_key=dynamodb.Attribute(name="PK", type=dynamodb.AttributeType.STRING),
+            sort_key=dynamodb.Attribute(name="SK", type=dynamodb.AttributeType.STRING),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            encryption=dynamodb.TableEncryption.CUSTOMER_MANAGED,
+            encryption_key=self.encryption_key,
+            point_in_time_recovery_specification=dynamodb.PointInTimeRecoverySpecification(
+                point_in_time_recovery_enabled=True
+            ),
+            removal_policy=RemovalPolicy.RETAIN,
+        )
+
+    def _create_report_runs_table(self) -> dynamodb.Table:
+        table = dynamodb.Table(
+            self,
+            "ReportRunsTable",
+            table_name=f"{self.stack_prefix}-report-runs",
+            partition_key=dynamodb.Attribute(name="runId", type=dynamodb.AttributeType.STRING),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            encryption=dynamodb.TableEncryption.CUSTOMER_MANAGED,
+            encryption_key=self.encryption_key,
+            point_in_time_recovery_specification=dynamodb.PointInTimeRecoverySpecification(
+                point_in_time_recovery_enabled=True
+            ),
+            removal_policy=RemovalPolicy.RETAIN,
+        )
+        # Runs are listed newest-first per report through a report-id/started-at index.
+        table.add_global_secondary_index(
+            index_name=REPORT_RUNS_INDEX_NAME,
+            partition_key=dynamodb.Attribute(name="reportId", type=dynamodb.AttributeType.STRING),
+            sort_key=dynamodb.Attribute(name="startedAt", type=dynamodb.AttributeType.STRING),
+            projection_type=dynamodb.ProjectionType.ALL,
+        )
+        return table
+
+    def _create_reingest_jobs_table(self) -> dynamodb.Table:
+        # One row per reingestion job keyed solely by jobId. The planner and the parsed-zone
+        # reindexer advance atomic counters and the lifecycle status in place; the row never
+        # stores the ID list or a stream, so no secondary index or consumer is required.
+        return dynamodb.Table(
+            self,
+            "ReingestJobsTable",
+            table_name=f"{self.stack_prefix}-reingest-jobs",
+            partition_key=dynamodb.Attribute(name="jobId", type=dynamodb.AttributeType.STRING),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            encryption=dynamodb.TableEncryption.CUSTOMER_MANAGED,
+            encryption_key=self.encryption_key,
+            point_in_time_recovery_specification=dynamodb.PointInTimeRecoverySpecification(
+                point_in_time_recovery_enabled=True
+            ),
+            removal_policy=RemovalPolicy.RETAIN,
         )
 
     def _enable_raw_bucket_event_bridge(self) -> None:
@@ -402,6 +510,9 @@ class DataQualityStack(Stack):
             ],
         )
         vpc.add_gateway_endpoint("S3Endpoint", service=ec2.GatewayVpcEndpointAwsService.S3)
+        vpc.add_gateway_endpoint(
+            "DynamoDbEndpoint", service=ec2.GatewayVpcEndpointAwsService.DYNAMODB
+        )
         flow_log_group = self._create_log_group(
             "VpcFlowLogGroup",
             f"/aws/vpc/{self.stack_prefix}",
@@ -584,6 +695,40 @@ class DataQualityStack(Stack):
                 "Principal": [self.hl7_role.role_arn, self.ccda_role.role_arn],
             }
         ]
+        # Report generation and the explorer facility lookup read both indexes only.
+        access_rules.append(
+            {
+                "Description": "Report runner and explorer read-only index access",
+                "Rules": [
+                    {
+                        "ResourceType": "index",
+                        "Resource": index_resources,
+                        "Permission": ["aoss:DescribeIndex", "aoss:ReadDocument"],
+                    }
+                ],
+                "Principal": [
+                    self.report_runner_role.role_arn,
+                    self.explorer_role.role_arn,
+                ],
+            }
+        )
+        # The parsed-zone reindexer writes already-parsed documents back into both indexes.
+        # It resolves an existing index (DescribeIndex) and bulk-writes documents
+        # (WriteDocument); the bulk response never requires ReadDocument, so this rule stays
+        # strictly narrower than the read-only rule above.
+        access_rules.append(
+            {
+                "Description": "Reindexer parsed-zone document write access",
+                "Rules": [
+                    {
+                        "ResourceType": "index",
+                        "Resource": index_resources,
+                        "Permission": ["aoss:DescribeIndex", "aoss:WriteDocument"],
+                    }
+                ],
+                "Principal": [self.reindexer_role.role_arn],
+            }
+        )
         if self.config.enable_public_dashboard:
             access_rules.append(
                 {
@@ -627,7 +772,13 @@ class DataQualityStack(Stack):
         return collection
 
     def _grant_collection_access(self) -> None:
-        for role in (self.hl7_role, self.ccda_role):
+        for role in (
+            self.hl7_role,
+            self.ccda_role,
+            self.report_runner_role,
+            self.explorer_role,
+            self.reindexer_role,
+        ):
             role.add_to_policy(
                 iam.PolicyStatement(
                     actions=["aoss:APIAccessAll"],
@@ -792,6 +943,7 @@ class DataQualityStack(Stack):
                             "-r /asset-input/lambda-requirements.txt "
                             "--target /asset-output",
                             "cp -a /asset-input/src /asset-output/src",
+                            "cp -a /asset-input/schema /asset-output/schema",
                             "rm -f /asset-output/src/stack.py /asset-output/src/config.py",
                             "find /asset-output -type d -name __pycache__ -prune -exec rm -rf {} +",
                         ]
@@ -844,6 +996,7 @@ class DataQualityStack(Stack):
     def _create_operational_alarms(self) -> None:
         self._create_queue_alarms("Hl7", self.hl7_queue, self.hl7_dead_letter_queue)
         self._create_queue_alarms("Ccda", self.ccda_queue, self.ccda_dead_letter_queue)
+        self._create_queue_alarms("Reindex", self.reindex_queue, self.reindex_dead_letter_queue)
         for construct_id, function in (
             ("Hl7", self.hl7_function),
             ("Ccda", self.ccda_function),
@@ -940,25 +1093,61 @@ class DataQualityStack(Stack):
                 ],
             )
         )
+        # Reports definitions now live in the catalog table; only generated outputs are read
+        # from the reports bucket for authenticated download.
         role.add_to_policy(
             iam.PolicyStatement(
-                actions=["rds-data:ExecuteStatement"],
-                resources=[self.metadata_cluster.cluster_arn],
+                actions=["s3:GetObject", "s3:GetObjectVersion"],
+                resources=[self.reports_bucket.arn_for_objects(f"{REPORT_OUTPUT_PREFIX}*")],
             )
         )
-        if self.metadata_cluster.secret is None:
-            raise RuntimeError(AURORA_CREDENTIALS_MISSING)
-        self.metadata_cluster.secret.grant_read(role)
-        self.encryption_key.grant_decrypt(role)
+        # The Reports API owns row-granular catalog CRUD on the single catalog table. Each
+        # mutation pairs its change with an append-only audit item in one TransactWriteItems,
+        # and GetItem backs single-row and history reads.
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "dynamodb:GetItem",
+                    "dynamodb:Query",
+                    "dynamodb:Scan",
+                    "dynamodb:PutItem",
+                    "dynamodb:UpdateItem",
+                    "dynamodb:DeleteItem",
+                    "dynamodb:BatchWriteItem",
+                    "dynamodb:TransactWriteItems",
+                ],
+                resources=[self.reports_catalog_table.table_arn],
+            )
+        )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "dynamodb:GetItem",
+                    "dynamodb:PutItem",
+                    "dynamodb:UpdateItem",
+                    "dynamodb:Query",
+                    "dynamodb:Scan",
+                ],
+                resources=[
+                    self.report_runs_table.table_arn,
+                    f"{self.report_runs_table.table_arn}/index/{REPORT_RUNS_INDEX_NAME}",
+                ],
+            )
+        )
+        # Reports S3 and DynamoDB CMK usage requires encrypt as well as decrypt.
+        self.encryption_key.grant_encrypt_decrypt(role)
         NagSuppressions.add_resource_suppressions(
             role,
             [
                 {
                     "id": "AwsSolutions-IAM5",
                     "reason": (
-                        "Lambda VPC APIs require wildcard resources; read-only S3 object "
-                        "permissions are scoped to the two data buckets; KMS decrypt targets the "
-                        "single stack key."
+                        "Lambda VPC APIs require wildcard resources; S3 object permissions use "
+                        "suffix wildcards within the raw and parsed data buckets and the reports "
+                        "bucket outputs/ prefix; DynamoDB access targets the named catalog and "
+                        "runs tables and the one named runs index; the runner invoke grant and "
+                        "KMS APIs use service-defined wildcards on the single stack function and "
+                        "key."
                     ),
                 }
             ],
@@ -968,6 +1157,15 @@ class DataQualityStack(Stack):
 
     def _authorize_explorer_data_api(self) -> None:
         # The explorer reaches Aurora only over the private Data API interface endpoint.
+        self.explorer_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["rds-data:ExecuteStatement"],
+                resources=[self.metadata_cluster.cluster_arn],
+            )
+        )
+        if self.metadata_cluster.secret is None:
+            raise RuntimeError(AURORA_CREDENTIALS_MISSING)
+        self.metadata_cluster.secret.grant_read(self.explorer_role)
         self.data_api_endpoint_security_group.add_ingress_rule(
             self.explorer_security_group,
             ec2.Port.tcp(443),
@@ -980,6 +1178,406 @@ class DataQualityStack(Stack):
                 resources=[self.metadata_cluster.cluster_arn],
             )
         )
+
+    def _create_report_runner_security_group(self) -> ec2.SecurityGroup:
+        return ec2.SecurityGroup(
+            self,
+            "ReportRunnerSecurityGroup",
+            vpc=self.vpc,
+            allow_all_outbound=True,
+            description="Network access for the asynchronous report runner Lambda",
+        )
+
+    def _create_report_runner_role(self) -> iam.Role:
+        role = iam.Role(
+            self,
+            "ReportRunnerRole",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            description="Least-privilege execution role for the asynchronous report runner",
+        )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "ec2:AssignPrivateIpAddresses",
+                    "ec2:CreateNetworkInterface",
+                    "ec2:DeleteNetworkInterface",
+                    "ec2:DescribeNetworkInterfaces",
+                    "ec2:UnassignPrivateIpAddresses",
+                ],
+                resources=["*"],
+            )
+        )
+        # Definitions are read from the catalog table with a single partition Query; the
+        # partitioned archive is written under the reports bucket outputs/ prefix.
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["dynamodb:Query"],
+                resources=[self.reports_catalog_table.table_arn],
+            )
+        )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["s3:PutObject"],
+                resources=[self.reports_bucket.arn_for_objects(f"{REPORT_OUTPUT_PREFIX}*")],
+            )
+        )
+        # Run progress bookkeeping only updates and reads the runs table.
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["dynamodb:UpdateItem", "dynamodb:GetItem"],
+                resources=[self.report_runs_table.table_arn],
+            )
+        )
+        self.encryption_key.grant_encrypt_decrypt(role)
+        NagSuppressions.add_resource_suppressions(
+            role,
+            [
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": (
+                        "Lambda VPC APIs require wildcard resources; the S3 object permission "
+                        "uses a suffix wildcard within the reports bucket outputs/ prefix; "
+                        "DynamoDB access targets the named catalog and runs tables; KMS APIs use "
+                        "service-defined wildcards on the single stack key."
+                    ),
+                }
+            ],
+            apply_to_children=True,
+        )
+        return role
+
+    def _create_report_runner_function(self) -> lambda_.Function:
+        function_name = f"{self.stack_prefix}-report-runner"
+        log_group = self._create_log_group(
+            "ReportRunnerLogGroup",
+            f"/aws/lambda/{function_name}",
+        )
+        log_group.grant_write(self.report_runner_role)
+        return lambda_.Function(
+            self,
+            "ReportRunnerFunction",
+            function_name=function_name,
+            runtime=lambda_.Runtime.PYTHON_3_14,
+            architecture=lambda_.Architecture.ARM_64,
+            code=self._lambda_code(),
+            handler="src.report_runner.handler",
+            role=self.report_runner_role,
+            description="Runs one report definition and writes a partitioned CSV archive",
+            environment={
+                "REPORT_BUCKET": self.reports_bucket.bucket_name,
+                "REPORT_CATALOG_TABLE": self.reports_catalog_table.table_name,
+                "RUNS_TABLE": self.report_runs_table.table_name,
+                "OPENSEARCH_ENDPOINT": self.search_collection.attr_collection_endpoint,
+                "OPENSEARCH_SERVICE": "aoss",
+                "OPENSEARCH_HL7_INDEX": HL7_INDEX_NAME,
+                "OPENSEARCH_CCDA_INDEX": CCDA_INDEX_NAME,
+            },
+            environment_encryption=self.encryption_key,
+            memory_size=1024,
+            reserved_concurrent_executions=2,
+            security_groups=[self.report_runner_security_group],
+            timeout=Duration.minutes(15),
+            tracing=lambda_.Tracing.ACTIVE,
+            vpc=self.vpc,
+            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_ISOLATED),
+        )
+
+    def _create_lambda_vpc_endpoint(self) -> ec2.InterfaceVpcEndpoint:
+        # The explorer invokes the runner over a private Lambda endpoint; no NAT path exists.
+        security_group = ec2.SecurityGroup(
+            self,
+            "LambdaEndpointSecurityGroup",
+            vpc=self.vpc,
+            allow_all_outbound=False,
+            description="Allows HTTPS to the Lambda API only from the explorer",
+        )
+        security_group.add_ingress_rule(
+            self.explorer_security_group,
+            ec2.Port.tcp(443),
+            "HTTPS from the explorer Lambda to the Lambda API",
+        )
+        return self.vpc.add_interface_endpoint(
+            "LambdaEndpoint",
+            service=ec2.InterfaceVpcEndpointAwsService.LAMBDA_,
+            private_dns_enabled=True,
+            open=False,
+            security_groups=[security_group],
+            subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_ISOLATED),
+        )
+
+    def _authorize_report_network(self) -> None:
+        # The runner and explorer reach OpenSearch Serverless only through the private endpoint.
+        self.serverless_endpoint_security_group.add_ingress_rule(
+            self.report_runner_security_group,
+            ec2.Port.tcp(443),
+            "HTTPS from the report runner Lambda to OpenSearch Serverless",
+        )
+        self.serverless_endpoint_security_group.add_ingress_rule(
+            self.explorer_security_group,
+            ec2.Port.tcp(443),
+            "HTTPS from the explorer Lambda to OpenSearch Serverless",
+        )
+        self.lambda_vpc_endpoint = self._create_lambda_vpc_endpoint()
+        # The explorer is the only principal permitted to dispatch report runs.
+        self.report_runner_function.grant_invoke(self.explorer_role)
+
+    def _create_reingest_planner_security_group(self) -> ec2.SecurityGroup:
+        return ec2.SecurityGroup(
+            self,
+            "ReingestPlannerSecurityGroup",
+            vpc=self.vpc,
+            allow_all_outbound=True,
+            description="Network access for the reingestion planner Lambda",
+        )
+
+    def _create_reindexer_security_group(self) -> ec2.SecurityGroup:
+        return ec2.SecurityGroup(
+            self,
+            "ReindexerSecurityGroup",
+            vpc=self.vpc,
+            allow_all_outbound=True,
+            description="Network access for the parsed-zone reindexer Lambda",
+        )
+
+    def _create_reingest_planner_role(self) -> iam.Role:
+        role = iam.Role(
+            self,
+            "ReingestPlannerRole",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            description="Least-privilege execution role for the reingestion planner",
+        )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "ec2:AssignPrivateIpAddresses",
+                    "ec2:CreateNetworkInterface",
+                    "ec2:DeleteNetworkInterface",
+                    "ec2:DescribeNetworkInterfaces",
+                    "ec2:UnassignPrivateIpAddresses",
+                ],
+                resources=["*"],
+            )
+        )
+        # The planner drives the job lifecycle and fans documents out to the reindex queue.
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["dynamodb:UpdateItem", "dynamodb:GetItem"],
+                resources=[self.reingest_jobs_table.table_arn],
+            )
+        )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["sqs:SendMessage"],
+                resources=[self.reindex_queue.queue_arn],
+            )
+        )
+        # Sending to the KMS-encrypted queue and reading the CMK-encrypted Aurora secret
+        # both require key usage; DynamoDB encryption at rest is served by its own grant.
+        self.encryption_key.grant_encrypt_decrypt(role)
+        NagSuppressions.add_resource_suppressions(
+            role,
+            [
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": (
+                        "Lambda VPC APIs require wildcard resources; DynamoDB and SQS access "
+                        "target the named jobs table and reindex queue; KMS APIs use "
+                        "service-defined wildcards on the single stack key."
+                    ),
+                }
+            ],
+            apply_to_children=True,
+        )
+        return role
+
+    def _create_reindexer_role(self) -> iam.Role:
+        role = iam.Role(
+            self,
+            "ReindexerRole",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            description="Least-privilege execution role for the parsed-zone reindexer",
+        )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "ec2:AssignPrivateIpAddresses",
+                    "ec2:CreateNetworkInterface",
+                    "ec2:DeleteNetworkInterface",
+                    "ec2:DescribeNetworkInterfaces",
+                    "ec2:UnassignPrivateIpAddresses",
+                ],
+                resources=["*"],
+            )
+        )
+        # The reindexer only reads already-parsed objects; it never touches raw source.
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["s3:GetObject", "s3:GetObjectVersion"],
+                resources=[self.parsed_bucket.arn_for_objects("*")],
+            )
+        )
+        # Per-document outcome counters are recorded with atomic ADD updates only.
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["dynamodb:UpdateItem"],
+                resources=[self.reingest_jobs_table.table_arn],
+            )
+        )
+        # Reading the SSE-KMS parsed object and consuming the KMS-encrypted queue both need
+        # only Decrypt; DynamoDB encryption at rest is served by its own service grant.
+        self.encryption_key.grant_decrypt(role)
+        NagSuppressions.add_resource_suppressions(
+            role,
+            [
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": (
+                        "Lambda VPC APIs require wildcard resources; the S3 object permission "
+                        "uses a suffix wildcard within the parsed data bucket; KMS APIs use "
+                        "service-defined wildcards on the single stack key."
+                    ),
+                }
+            ],
+            apply_to_children=True,
+        )
+        return role
+
+    def _authorize_reingest_planner_data_api(self) -> None:
+        # The planner resolves parsed-zone locations over the private Data API endpoint only.
+        self.reingest_planner_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["rds-data:ExecuteStatement"],
+                resources=[self.metadata_cluster.cluster_arn],
+            )
+        )
+        if self.metadata_cluster.secret is None:
+            raise RuntimeError(AURORA_CREDENTIALS_MISSING)
+        self.metadata_cluster.secret.grant_read(self.reingest_planner_role)
+        self.data_api_endpoint_security_group.add_ingress_rule(
+            self.reingest_planner_security_group,
+            ec2.Port.tcp(443),
+            "HTTPS from the reingestion planner Lambda to the RDS Data API",
+        )
+        self.data_api_endpoint.add_to_policy(
+            iam.PolicyStatement(
+                principals=[self.reingest_planner_role],
+                actions=["rds-data:ExecuteStatement"],
+                resources=[self.metadata_cluster.cluster_arn],
+            )
+        )
+
+    def _authorize_reindexer_network(self) -> None:
+        # The reindexer reaches OpenSearch Serverless only through the private endpoint.
+        self.serverless_endpoint_security_group.add_ingress_rule(
+            self.reindexer_security_group,
+            ec2.Port.tcp(443),
+            "HTTPS from the reindexer Lambda to OpenSearch Serverless",
+        )
+
+    def _create_reingest_planner_function(self) -> lambda_.Function:
+        function_name = f"{self.stack_prefix}-reingest-planner"
+        log_group = self._create_log_group(
+            "ReingestPlannerLogGroup",
+            f"/aws/lambda/{function_name}",
+        )
+        log_group.grant_write(self.reingest_planner_role)
+        if self.metadata_cluster.secret is None:
+            raise RuntimeError(AURORA_CREDENTIALS_MISSING)
+        return lambda_.Function(
+            self,
+            "ReingestPlannerFunction",
+            function_name=function_name,
+            runtime=lambda_.Runtime.PYTHON_3_14,
+            architecture=lambda_.Architecture.ARM_64,
+            code=self._lambda_code(),
+            handler="src.reingest_planner.handler",
+            role=self.reingest_planner_role,
+            description="Resolves a reingestion job's documents and enqueues them for reindexing",
+            environment={
+                "JOBS_TABLE": self.reingest_jobs_table.table_name,
+                "METADATA_CLUSTER_ARN": self.metadata_cluster.cluster_arn,
+                "METADATA_DATABASE": METADATA_DATABASE_NAME,
+                "METADATA_SECRET_ARN": self.metadata_cluster.secret.secret_arn,
+                "METADATA_TABLE": METADATA_TABLE_NAME,
+                "REINDEX_QUEUE_URL": self.reindex_queue.queue_url,
+            },
+            environment_encryption=self.encryption_key,
+            memory_size=1024,
+            reserved_concurrent_executions=1,
+            security_groups=[self.reingest_planner_security_group],
+            timeout=Duration.minutes(15),
+            tracing=lambda_.Tracing.ACTIVE,
+            vpc=self.vpc,
+            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_ISOLATED),
+        )
+
+    def _create_reindexer_function(self) -> lambda_.Function:
+        function_name = f"{self.stack_prefix}-reindexer"
+        log_group = self._create_log_group(
+            "ReindexerLogGroup",
+            f"/aws/lambda/{function_name}",
+        )
+        log_group.grant_write(self.reindexer_role)
+        return lambda_.Function(
+            self,
+            "ReindexerFunction",
+            function_name=function_name,
+            runtime=lambda_.Runtime.PYTHON_3_14,
+            architecture=lambda_.Architecture.ARM_64,
+            code=self._lambda_code(),
+            handler="src.reindexer_handler.handler",
+            role=self.reindexer_role,
+            description="Re-indexes already-parsed clinical documents for a reingestion job",
+            environment={
+                "PARSED_BUCKET": self.parsed_bucket.bucket_name,
+                "JOBS_TABLE": self.reingest_jobs_table.table_name,
+                "OPENSEARCH_ENDPOINT": self.search_collection.attr_collection_endpoint,
+                "OPENSEARCH_SERVICE": "aoss",
+                "OPENSEARCH_HL7_INDEX": HL7_INDEX_NAME,
+                "OPENSEARCH_CCDA_INDEX": CCDA_INDEX_NAME,
+                "MAX_RECEIVE_COUNT": "5",
+                # Parser versions are resolved at synth from the parser modules so the
+                # reindexer can flag stale parses without importing a parser at runtime.
+                "HL7_PARSER_VERSION": HL7_PARSER_VERSION,
+                "CCDA_PARSER_VERSION": CCDA_PARSER_VERSION,
+            },
+            environment_encryption=self.encryption_key,
+            memory_size=1024,
+            reserved_concurrent_executions=5,
+            security_groups=[self.reindexer_security_group],
+            timeout=Duration.minutes(5),
+            tracing=lambda_.Tracing.ACTIVE,
+            vpc=self.vpc,
+            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_ISOLATED),
+        )
+
+    def _connect_reindex_event_source(self) -> None:
+        # The reindexer consumes the reindex queue in bounded batches with partial-batch
+        # failure reporting; SqsEventSource generates the queue consume grants on its role.
+        self.reindexer_function.add_event_source(
+            lambda_event_sources.SqsEventSource(
+                self.reindex_queue,
+                batch_size=10,
+                max_concurrency=5,
+                report_batch_item_failures=True,
+            )
+        )
+
+    def _authorize_explorer_reingest(self) -> None:
+        # The explorer owns the reingestion jobs API: it previews, creates, lists, and reads
+        # job rows and dispatches the planner over the existing private Lambda endpoint.
+        self.explorer_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "dynamodb:GetItem",
+                    "dynamodb:PutItem",
+                    "dynamodb:UpdateItem",
+                    "dynamodb:Scan",
+                ],
+                resources=[self.reingest_jobs_table.table_arn],
+            )
+        )
+        self.reingest_planner_function.grant_invoke(self.explorer_role)
 
     def _create_explorer_function(self) -> lambda_.Function:
         function_name = f"{self.stack_prefix}-explorer"
@@ -1008,6 +1606,17 @@ class DataQualityStack(Stack):
                 "METADATA_TABLE": METADATA_TABLE_NAME,
                 "PARSED_BUCKET": self.parsed_bucket.bucket_name,
                 "RAW_BUCKET": self.raw_bucket.bucket_name,
+                "REPORT_BUCKET": self.reports_bucket.bucket_name,
+                "REPORT_CATALOG_TABLE": self.reports_catalog_table.table_name,
+                "REPORT_RUNS_TABLE": self.report_runs_table.table_name,
+                "REPORT_RUNS_INDEX": REPORT_RUNS_INDEX_NAME,
+                "REPORT_RUNNER_FUNCTION": self.report_runner_function.function_name,
+                "REINGEST_JOBS_TABLE": self.reingest_jobs_table.table_name,
+                "REINGEST_PLANNER_FUNCTION": self.reingest_planner_function.function_name,
+                "OPENSEARCH_ENDPOINT": self.search_collection.attr_collection_endpoint,
+                "OPENSEARCH_SERVICE": "aoss",
+                "OPENSEARCH_HL7_INDEX": HL7_INDEX_NAME,
+                "OPENSEARCH_CCDA_INDEX": CCDA_INDEX_NAME,
             },
             environment_encryption=self.encryption_key,
             memory_size=1024,
@@ -1215,6 +1824,29 @@ class DataQualityStack(Stack):
             ("/messages/{documentId}", apigwv2.HttpMethod.GET),
             ("/messages/{documentId}/body", apigwv2.HttpMethod.POST),
             ("/query", apigwv2.HttpMethod.POST),
+            ("/query-test", apigwv2.HttpMethod.POST),
+            ("/search", apigwv2.HttpMethod.POST),
+            ("/search/fields", apigwv2.HttpMethod.GET),
+            ("/facilities", apigwv2.HttpMethod.GET),
+            ("/reports", apigwv2.HttpMethod.GET),
+            ("/reports/import", apigwv2.HttpMethod.POST),
+            ("/reports/{id}", apigwv2.HttpMethod.GET),
+            ("/reports/{id}", apigwv2.HttpMethod.PUT),
+            ("/reports/{id}", apigwv2.HttpMethod.DELETE),
+            ("/reports/{id}/history", apigwv2.HttpMethod.GET),
+            ("/reports/{id}/export", apigwv2.HttpMethod.GET),
+            ("/reports/{id}/sections", apigwv2.HttpMethod.POST),
+            ("/reports/{id}/sections/{sseq}/rows", apigwv2.HttpMethod.POST),
+            ("/reports/{id}/sections/{sseq}/rows/{rseq}", apigwv2.HttpMethod.PUT),
+            ("/reports/{id}/sections/{sseq}/rows/{rseq}", apigwv2.HttpMethod.DELETE),
+            ("/reports/{id}/runs", apigwv2.HttpMethod.GET),
+            ("/reports/{id}/runs", apigwv2.HttpMethod.POST),
+            ("/runs/{runId}", apigwv2.HttpMethod.GET),
+            ("/runs/{runId}/download", apigwv2.HttpMethod.GET),
+            ("/reingest/preview", apigwv2.HttpMethod.POST),
+            ("/reingest/jobs", apigwv2.HttpMethod.POST),
+            ("/reingest/jobs", apigwv2.HttpMethod.GET),
+            ("/reingest/jobs/{jobId}", apigwv2.HttpMethod.GET),
         )
         for path, method in routes:
             self.http_api.add_routes(
@@ -1339,6 +1971,14 @@ class DataQualityStack(Stack):
             "ExplorerFunctionName": self.explorer_function.function_name,
             "ExplorerApiEndpoint": self.http_api.api_endpoint,
             "ExplorerApiStageName": self.http_stage.stage_name,
+            "ReportsBucketName": self.reports_bucket.bucket_name,
+            "ReportsCatalogTableName": self.reports_catalog_table.table_name,
+            "ReportRunsTableName": self.report_runs_table.table_name,
+            "ReportRunnerFunctionName": self.report_runner_function.function_name,
+            "ReindexQueueUrl": self.reindex_queue.queue_url,
+            "ReingestJobsTableName": self.reingest_jobs_table.table_name,
+            "ReingestPlannerFunctionName": self.reingest_planner_function.function_name,
+            "ReindexerFunctionName": self.reindexer_function.function_name,
             "UserPoolId": self.user_pool.user_pool_id,
             "UserPoolClientId": self.user_pool_client.user_pool_client_id,
             "UserPoolHostedUiDomain": self.user_pool_domain.domain_name,

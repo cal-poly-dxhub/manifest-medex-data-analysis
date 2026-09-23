@@ -64,6 +64,7 @@ Runtime dependencies are hash-pinned in `lambda-requirements.txt`. CDK dependenc
 │   ├── stack.py                   # AWS infrastructure and Lambda asset bundling
 │   ├── parser.py                  # HL7 splitting, parsing, identity, and ROOT projection
 │   ├── ccda_parser.py             # Secure CCDA parsing and CD projection
+│   ├── customer_field_catalog.py  # Customer-backed HL7 names and CCDA section aliases
 │   ├── document_handler.py        # Shared S3, parse, search, and metadata workflow
 │   ├── hl7_handler.py             # HL7 Lambda entry point
 │   ├── ccda_handler.py            # CCDA Lambda entry point
@@ -100,25 +101,17 @@ The HL7 parser supports:
 - HL7 timestamp normalization; timestamps without offsets are interpreted as UTC.
 - A 50 MiB raw-object limit.
 
-The indexed `ROOT` projection currently exposes 26 query-oriented MSH, PID, PV1, PV2, OBR, OBX, and NK1 field paths. This is an initial compatibility projection, not a complete HL7 representation. Fields outside it are not retained in parsed JSON or OpenSearch. `segmentCounts` records occurrence counts but not omitted values, so extending the projection requires reprocessing from raw S3.
+The indexed `ROOT` projection is driven by the committed customer field catalog. It contains 621 unambiguous, standards-backed HL7 v2.6 fields across 30 segment families whose exact output labels occur in the August 24 Kibana export. Composite datatype and subcomponent names are projected recursively, and repetitions remain arrays. Elasticsearch metadata, Prism enrichment keys, derived `_text`/`_resolution`/`_string` fields, and numeric nodes beyond valid segment ranges are intentionally excluded. `segmentCounts` still records every observed segment type; locally defined segments remain counted but are not fabricated into the customer projection.
 
-Parser output identifies the implementation as version `0.4.0`. HL7 document IDs are `SHA-256(bucket + key + SHA-256(normalized message))`; exact duplicate messages under one S3 key collapse to the first occurrence and retain its `messageOrdinal`. S3 version IDs and ETags remain provenance metadata but do not affect HL7 identity.
+Parser output identifies the implementation as version `0.5.0`. HL7 document IDs are `SHA-256(bucket + key + SHA-256(normalized message))`; exact duplicate messages under one S3 key collapse to the first occurrence and retain its `messageOrdinal`. S3 version IDs and ETags remain provenance metadata but do not affect HL7 identity.
 
 ## CCDA processing
 
 CCDA XML is parsed with `defusedxml`. The parser rejects DTDs, entities, external references, excessive markup, unsafe nesting depth, malformed XML, and roots other than `ClinicalDocument`.
 
-The indexed `CD` projection covers structured fields used by supplied dashboard queries for:
+The indexed `CD` projection covers structured fields used by supplied dashboard queries for patient role, custodian, medications, immunizations, problems, procedures, results, vital signs, and social history. Seven canonical sections are resolved by their standard LOINC codes. Other structured sections can be resolved by title or code display name through 108 normalized concepts representing all 116 exact section aliases observed in the August 24 Kibana export. Recognized sections generically project supported `substanceAdministration`, `organizer`, `act`, `observation`, and `procedure` entries. Narrative section bodies remain intentionally excluded.
 
-- Patient role and custodian
-- Medications and immunizations
-- Problems and procedures
-- Results and vital signs
-- Social history
-
-Sections are selected by standard LOINC section codes. Narrative section bodies are intentionally excluded from the projection.
-
-CCDA parser output identifies the implementation as version `0.2.0`. CCDA document IDs are `SHA-256(bucket + key + SHA-256(exact raw XML bytes))`. Identical XML bytes under one S3 key resolve to the same logical document across source versions; byte-level formatting changes create a new ID. S3 version IDs and ETags remain provenance metadata but do not affect CCDA identity.
+CCDA parser output identifies the implementation as version `0.3.0`. CCDA document IDs are `SHA-256(bucket + key + SHA-256(exact raw XML bytes))`. Identical XML bytes under one S3 key resolve to the same logical document across source versions; byte-level formatting changes create a new ID. S3 version IDs and ETags remain provenance metadata but do not affect CCDA identity.
 
 ## Metadata contract
 
@@ -203,6 +196,203 @@ The UI provides Messages and SQL query views. SQL queries can be named, saved, l
 Body content is fetched server-side from the exact stored S3 version and is never exposed through a presigned URL. Synchronous bodies are capped at 4 MiB and read through a bounded stream to remain below Lambda/API response limits. A successful body read writes a structured audit event containing the authenticated JWT `sub`, document ID, variant, and timestamp, but never the body, clinical fields, S3 key, SQL, or raw backend response. Successful SQL execution emits the caller `sub`, timestamp, row count, and affected-record count without logging the SQL text or returned values.
 
 This prototype provides authentication but not row-, facility-, or tenant-level authorization: every authenticated user in the pool can read every metadata row and body. The SQL console is deliberately unrestricted and uses the generated Aurora administrative credential, so any authenticated user can execute modifying or destructive SQL against the database, including changing or dropping metadata objects. IAM grants only `rds-data:ExecuteStatement`, but that action does not make SQL read-only. Before production, federate the user pool to the customer identity provider through approved SAML or OIDC configuration, add an authorization policy/data model, and replace the administrative credential with a database role whose grants match the intended console permissions.
+
+## Parsed-zone reingestion
+
+The SQL tab can restore historical documents from the durable parsed S3 zone into the OpenSearch hot window without reparsing raw input. This preserves the parsed JSON exactly, including its original `ingestTime`, and uses the stored `documentId` as the OpenSearch `_id`. Parser-version routing or upgrades are deliberately deferred; a document produced by an older parser is restored unchanged and counted as stale.
+
+A reingestion can select documents in two ways:
+
+- Check rows from the current SQL result and choose **Reingest selected**. At most 10,000 explicit document IDs are accepted.
+- Choose **Reingest all results**. The backend previews an exact distinct-document count, shows a confirmation, and reruns the selection asynchronously. SQL selections are capped at 100,000 documents.
+
+A reingestion SQL statement must be a single SELECT-only statement, contain a `document_id` projection, and contain no comments, additional statements, DML, DDL, `COPY`, procedure calls, or row locks. One trailing semicolon is accepted and removed only for safe derived-table execution; the submitted text remains verbatim in the authenticated job record. This guard is intentionally separate from the general `/query` endpoint, which remains unrestricted. The planner joins the selection to the validated `document_metadata` table and pages by `document_id > :cursor` with no `OFFSET` added by the planner.
+
+The API creates a job in the KMS-encrypted reingestion DynamoDB table and asynchronously invokes a dedicated planner Lambda. The planner runs in isolated subnets, resolves `parsed_s3_uri` and `source_format` through the private RDS Data API endpoint, and sends bounded batches of ten to the KMS-encrypted reindex SQS queue. A small delay between batches limits queue fan-out. The queue has its own DLQ, age alarm, and DLQ-content alarm.
+
+The DB-free reindexer Lambda runs in isolated subnets with reserved concurrency 5 and SQS partial-batch failure reporting. It reads only the parsed bucket, validates the stored JSON identity/format, and calls the existing deterministic `index_documents` path. It does not import either parser or forward data to ingestion queues. Current parser versions are injected into its environment at synth time only to classify stale stored parses.
+
+Jobs expose these atomic counters:
+
+- `enqueued`: accepted SQS messages.
+- `reindexed`: parsed documents restored successfully.
+- `reindexedStaleParser`: successful restores whose stored `parserVersion` differs from the current format parser; this is a subset of `reindexed`.
+- `missingParsed`: metadata referenced a parsed object that no longer exists; skipped without a DLQ failure.
+- `failed`: records that reached the terminal retry attempt.
+
+The SQL tab polls the jobs list and shows status, requester, expected count, all five counters, timestamps, and expandable SQL for SQL-mode jobs. Job creation logs only the caller, mode, count, SQL SHA-256, job ID, and timestamp. Message content, selected IDs, SQL results, and clinical values are never logged.
+
+The reindex queue has at-least-once delivery semantics. Restoring a duplicate is safe because OpenSearch uses the deterministic `documentId`, but in the rare case of a true duplicate delivery the advisory counters can overcount and may mark a job complete before another queued record finishes. The 15-minute queue visibility timeout exceeds the 5-minute worker timeout, reducing normal redelivery; exact per-message completion would require a separate idempotency ledger and is deferred for this development workflow.
+
+Authenticated routes are:
+
+- `POST /api/reingest/preview`
+- `POST|GET /api/reingest/jobs`
+- `GET /api/reingest/jobs/{jobId}`
+
+## Reports
+
+The authenticated **Reports** tab reproduces the fixed-definition Prism workflow without adding a scheduler or query builder. A report fixes its ordered sections and count-query rows; a run selects only the report, an inclusive `from`, an exclusive `to`, and 1–200 facilities returned by `/facilities`.
+
+### Row-granular definition storage
+
+Definitions are stored in one KMS-encrypted DynamoDB table using meaningful composite keys:
+
+```text
+PK = REPORT#<report-id>
+SK = META
+SK = SECTION#<storage-seq:03d>
+SK = SECTION#<storage-seq:03d>#ROW#<storage-seq:03d>
+```
+
+Storage sequences use gaps (`010`, `020`, …) so rows and sections can be inserted between existing items without renumbering. The JSON `seq` remains a separate compatibility value, allowing the canonical `seed/p4p-prototype.json` import/export shape to round-trip unchanged. A full definition is assembled with one DynamoDB Query in SK order. Row updates and deletes condition on `updated_at`; stale editors receive HTTP 409.
+
+Whole-definition import validates `schema/report_definition.schema.json`, writes a hidden `draft=true` META item, batch-writes sections/rows in groups of at most 25, and flips the draft visible only after every item succeeds. A failed import is never listed as a partial report. Export reassembles the clean interchange JSON. Every non-null row query is also validated independently and cannot contain `sourceFacilityId` or `messageTime` clauses.
+
+### Definition and query example
+
+A report definition fixes its sections, rows, target indexes, and OpenSearch query clauses. Users do not edit facility or date filters inside the definition; those filters are injected for each run.
+
+```json
+{
+  "report_id": "example-adt-report",
+  "name": "Example ADT Report",
+  "description": "Counts selected A08 fields",
+  "partition_field": "sourceFacilityId",
+  "time_field": "messageTime",
+  "sections": [
+    {
+      "seq": 10,
+      "name": "ADT A08",
+      "rows": [
+        {
+          "seq": 10,
+          "label": "PID-3.1",
+          "description": "A08 messages containing a patient identifier",
+          "index": "hl7-messages-v1",
+          "query": {
+            "bool": {
+              "filter": [
+                {
+                  "term": {
+                    "ROOT.MSH.MSH_9_Message_Type.MSG_1": "ADT"
+                  }
+                },
+                {
+                  "term": {
+                    "ROOT.MSH.MSH_9_Message_Type.MSG_2": "A08"
+                  }
+                },
+                {
+                  "exists": {
+                    "field": "ROOT.PID.PID_3_Patient_Identifier_List.CX_1"
+                  }
+                }
+              ]
+            }
+          }
+        },
+        {
+          "seq": 20,
+          "label": "PID-11",
+          "description": "Placeholder until the customer supplies its Prism logic",
+          "index": "hl7-messages-v1",
+          "query": null
+        }
+      ]
+    }
+  ]
+}
+```
+
+An implemented row stores only the query clause under `query`; it does not store `size`, `track_total_hits`, facility, or date constraints. A placeholder row uses `"query": null`: its label remains in the grid and CSV, its count cell is blank, and the runner does not send it to OpenSearch. A real query that executes and finds no documents produces `0`, which is distinct from a placeholder blank.
+
+For a run scoped to facility `FACILITY-A` and August 2026, the runner turns the implemented row above into an effective request equivalent to:
+
+```json
+{
+  "size": 0,
+  "track_total_hits": true,
+  "query": {
+    "bool": {
+      "filter": [
+        {
+          "term": {
+            "ROOT.MSH.MSH_9_Message_Type.MSG_1": "ADT"
+          }
+        },
+        {
+          "term": {
+            "ROOT.MSH.MSH_9_Message_Type.MSG_2": "A08"
+          }
+        },
+        {
+          "exists": {
+            "field": "ROOT.PID.PID_3_Patient_Identifier_List.CX_1"
+          }
+        },
+        {
+          "term": {
+            "sourceFacilityId": "FACILITY-A"
+          }
+        },
+        {
+          "range": {
+            "messageTime": {
+              "gte": "2026-08-01T00:00:00Z",
+              "lt": "2026-09-01T00:00:00Z"
+            }
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+The checked-in schema is `schema/report_definition.schema.json`. Larger working examples are available in `seed/p4p-prototype.json` and `seed/p4p-demo.json`.
+
+Every application-level definition mutation writes its audit record in the same DynamoDB `TransactWriteItems` call as the row/section/META change. Row audit sort keys are `AUDIT#SECTION#<sseq>#ROW#<rseq>#<timestamp>` and include action, editor, timestamp, and the full prior item for updates/deletes. Import writes one `action=import` audit item with its source rather than one item per imported row. `GET /api/reports/{id}/history?limit=50` reads audit items newest-first. Audit items are ignored during definition assembly and cannot alter export JSON. Direct DynamoDB console or table API writes bypass this application-level audit; this limitation is accepted for the POC because the explorer API and seed/migration tool are the only supported writers.
+
+### Spreadsheet editor and dry-run queries
+
+The Reports grid renders sections side by side as Label/Count column pairs, with each section heading spanning its own pair. Counts come from the newest completed run and are summed across that run's selected facilities; cells remain blank before a run, placeholders show no query, and a real zero renders as `0`. Selecting a row opens an editor for label, description, index, and query JSON with optimistic Save/Delete actions. The report detail also offers **Edit full report JSON**, protected by the report META `updated_at` lock, and **Delete report**, which requires typing the exact report ID and permanently removes the definition while preserving a deletion audit under `AUDITLOG#deleted-reports`. **Test query** uses the same injection/count implementation as the async runner, with an optional facility selected from the directory and an optional paired date range. A zero result is called out as `0 matches — check field names`.
+
+The API supports report import/export, gapped section/row insertion, conditional row update/delete, and `/query-test`; all routes use the same Cognito JWT authorizer.
+
+### Runner and CSV compatibility contract
+
+The dedicated 15-minute runner Lambda remains in isolated subnets. For each facility it injects a `sourceFacilityId` term and half-open `messageTime` range (`gte`/`lt`), uses `size: 0`, `track_total_hits: true`, and `_msearch` batches of at most 20 rows. Progress is persisted per facility. Any partition failure marks the run failed and uploads no partial ZIP.
+
+A run accepts 1–200 facilities. The cap is 200 rather than unlimited because the runner is intentionally a single sequential worker: it walks facilities one at a time inside one 15-minute Lambda, accumulates one CSV per facility, and packages them into one bounded in-memory ZIP delivered through a single API request. 200 is the largest fan-out that keeps the worst-case run comfortably within the Lambda timeout, the ZIP/archive size limit, and the request/response payload limits, without changing the sequential architecture. Raising it further would require a different execution model (for example, parallel or fan-out workers), which this POC does not adopt.
+
+Each facility produces `<UID>.csv`; all CSVs are packaged as `outputs/<report-id>/<run-id>.zip`. CSV is UTF-8, comma-delimited, and CRLF-terminated. Sections are sorted by section `seq` and rendered side by side as independent two-column blocks. Shorter sections are padded with two empty cells. Zero is written as `0`, never blank. Downstream Excel VLOOKUPs depend on this shape. The customer golden CSV is pending and may adjust the formatter after comparison.
+
+Downloads use only the authenticated backend, never presigned URLs. Each successful download audits only JWT `sub`, run ID, and timestamp.
+
+### Seed and migrate definitions
+
+After deployment, seed the canonical prototype through the same DynamoDB import path:
+
+```bash
+uv run python tools/seed_report.py \
+  --table <ReportsCatalogTableName> \
+  --region <region> \
+  --profile <approved-profile>
+```
+
+The tool is idempotent for identical content and requires explicit `--overwrite` for reviewed drift. To migrate old S3 definitions once, add `--migrate-bucket <old-bucket> --migrate-prefix definitions/`; each object is validated and imported through the same catalog API.
+
+Reports routes include:
+
+- `GET /api/reports`, `POST /api/reports/import`
+- `GET /api/reports/{id}`, `GET /api/reports/{id}/export`, `GET /api/reports/{id}/history?limit=50`
+- `POST /api/reports/{id}/sections`
+- `POST /api/reports/{id}/sections/{sseq}/rows`
+- `PUT|DELETE /api/reports/{id}/sections/{sseq}/rows/{rseq}`
+- `GET|POST /api/reports/{id}/runs`
+- `GET /api/runs/{runId}`, `GET /api/runs/{runId}/download`
+- `GET /api/facilities`, `POST /api/query-test`
 
 # Deployment
 

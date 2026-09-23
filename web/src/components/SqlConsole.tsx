@@ -1,7 +1,20 @@
-import { useMemo, useState, type FormEvent, type ReactNode } from 'react';
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type FormEvent,
+  type ReactNode,
+} from 'react';
 import { ApiError } from '../api/client';
 import { useMessageDetail, useSqlQuery } from '../api/queries';
 import { MessageDetail } from './MessageDetail';
+import { DetailDrawer } from './DetailDrawer';
+import {
+  ReingestConfirmDialog,
+  type ReingestSelection,
+} from './ReingestConfirmDialog';
+import { ReingestJobsPanel } from './ReingestJobsPanel';
 import { ErrorState, LoadingState } from './StateViews';
 
 interface SavedQuery {
@@ -14,6 +27,8 @@ const STORAGE_KEY = 'phi-explorer.saved-sql.v1';
 const MAX_SAVED_QUERIES = 50;
 const DOCUMENT_ID_PATTERN = /^[0-9a-f]{64}$/;
 const DOCUMENT_ID_COLUMNS = new Set(['document_id', 'documentid', '_id']);
+const NO_DOCUMENT_ID_TOOLTIP =
+  'Include a document_id column (or alias it as documentId) in the results to enable reingestion.';
 const DEFAULT_SQL = `SELECT
   document_id,
   source_format,
@@ -143,7 +158,21 @@ export function SqlConsole(): ReactNode {
     undefined,
   );
   const [storageError, setStorageError] = useState<string | undefined>(undefined);
+  // Document ids selected via per-row checkboxes for an id-mode reingestion job. Reset on
+  // every new query run or saved-query load so a stale selection can never be reingested.
+  const [selectedIds, setSelectedIds] = useState<ReadonlySet<string>>(
+    () => new Set<string>(),
+  );
+  // The SQL that produced the current results, captured at run time so an edit to the
+  // editor afterward cannot change what "Reingest all results" actually reingests.
+  const [executedSql, setExecutedSql] = useState<string | undefined>(undefined);
+  // The active reingestion confirmation, or undefined when no dialog is open.
+  const [reingestSelection, setReingestSelection] = useState<
+    ReingestSelection | undefined
+  >(undefined);
   const query = useSqlQuery();
+  const selectedRowRef = useRef<HTMLTableRowElement | null>(null);
+  const selectAllRef = useRef<HTMLInputElement | null>(null);
 
   const selectedSavedQuery = useMemo(
     () => savedQueries.find((item) => item.id === selectedSavedQueryId),
@@ -153,6 +182,68 @@ export function SqlConsole(): ReactNode {
     () => (query.data ? findDocumentIdColumn(query.data.columns) : -1),
     [query.data],
   );
+
+  // Ordered list of the document ids that can be opened, used to drive arrow navigation
+  // between selectable result rows without touching the query itself.
+  const selectableDocumentIds = useMemo(() => {
+    if (!query.data || documentIdColumn < 0) {
+      return [] as string[];
+    }
+    return query.data.rows
+      .map((row) => documentIdFromRow(row, documentIdColumn))
+      .filter((value): value is string => value !== undefined);
+  }, [query.data, documentIdColumn]);
+
+  // The subset of currently-selectable ids that are checked. Deriving from the live
+  // selectable set means rows that vanish on a re-run drop out of the selection for free.
+  const selectedDocumentIds = useMemo(
+    () => selectableDocumentIds.filter((id) => selectedIds.has(id)),
+    [selectableDocumentIds, selectedIds],
+  );
+  const selectedCount = selectedDocumentIds.length;
+  const allSelectableChecked =
+    selectableDocumentIds.length > 0 &&
+    selectedCount === selectableDocumentIds.length;
+  const someSelectableChecked = selectedCount > 0 && !allSelectableChecked;
+
+  // Reflect a partial selection as the indeterminate state on the header checkbox.
+  useEffect(() => {
+    if (selectAllRef.current) {
+      selectAllRef.current.indeterminate = someSelectableChecked;
+    }
+  }, [someSelectableChecked]);
+
+  const toggleOneSelected = (id: string, checked: boolean): void => {
+    setSelectedIds((previous) => {
+      const next = new Set(previous);
+      if (checked) {
+        next.add(id);
+      } else {
+        next.delete(id);
+      }
+      return next;
+    });
+  };
+
+  const toggleAllSelected = (checked: boolean): void => {
+    setSelectedIds(checked ? new Set(selectableDocumentIds) : new Set<string>());
+  };
+
+  // Move the selection to the adjacent selectable row, stopping at either end.
+  const navigateSelection = (delta: -1 | 1): void => {
+    if (!selectedDocumentId) {
+      return;
+    }
+    const currentIndex = selectableDocumentIds.indexOf(selectedDocumentId);
+    if (currentIndex < 0) {
+      return;
+    }
+    const nextIndex = currentIndex + delta;
+    if (nextIndex < 0 || nextIndex >= selectableDocumentIds.length) {
+      return;
+    }
+    setSelectedDocumentId(selectableDocumentIds[nextIndex]);
+  };
 
   const persist = (next: SavedQuery[]): boolean => {
     try {
@@ -172,6 +263,8 @@ export function SqlConsole(): ReactNode {
       return;
     }
     setSelectedDocumentId(undefined);
+    setSelectedIds(new Set<string>());
+    setExecutedSql(sql);
     query.mutate(sql);
   };
 
@@ -201,6 +294,8 @@ export function SqlConsole(): ReactNode {
       setSql(selectedSavedQuery.sql);
       setQueryName(selectedSavedQuery.name);
       setSelectedDocumentId(undefined);
+      setSelectedIds(new Set<string>());
+      setExecutedSql(undefined);
       query.reset();
     }
   };
@@ -320,82 +415,168 @@ export function SqlConsole(): ReactNode {
               result rows open the Raw/Parsed viewer.
             </p>
           )}
-          {query.data.columns.length > 0 ? (
-            <div
-              className={
-                documentIdColumn >= 0
-                  ? 'sql-results__workspace'
-                  : 'sql-results__workspace sql-results__workspace--single'
+          <div
+            className="reingest-toolbar"
+            role="group"
+            aria-label="Reingestion actions"
+          >
+            <button
+              type="button"
+              className="button"
+              disabled={documentIdColumn < 0 || selectedCount === 0}
+              title={documentIdColumn < 0 ? NO_DOCUMENT_ID_TOOLTIP : undefined}
+              onClick={() =>
+                setReingestSelection({
+                  kind: 'ids',
+                  documentIds: selectedDocumentIds,
+                })
               }
             >
-              <div
-                className="table-wrap sql-results__table-pane"
-                role="region"
-                aria-label="SQL query results"
-                tabIndex={0}
-              >
-                <table className="table sql-results__table">
-                  <thead>
-                    <tr>
-                      {query.data.columns.map((column, index) => (
-                        <th key={`${column}-${index}`} scope="col">
-                          {column}
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {query.data.rows.map((row, rowIndex) => {
-                      const rowDocumentId =
-                        documentIdColumn >= 0
-                          ? documentIdFromRow(row, documentIdColumn)
-                          : undefined;
-                      const isSelected = rowDocumentId === selectedDocumentId;
-                      return (
-                        <tr
-                          key={rowIndex}
-                          className={
-                            rowDocumentId
-                              ? isSelected
-                                ? 'row row--selected'
-                                : 'row'
-                              : undefined
+              Reingest selected ({selectedCount})
+            </button>
+            <button
+              type="button"
+              className="button"
+              disabled={documentIdColumn < 0 || !executedSql}
+              title={documentIdColumn < 0 ? NO_DOCUMENT_ID_TOOLTIP : undefined}
+              onClick={() => {
+                if (executedSql) {
+                  setReingestSelection({ kind: 'sql', sql: executedSql });
+                }
+              }}
+            >
+              Reingest all results
+            </button>
+          </div>
+          {query.data.columns.length > 0 ? (
+            <div className="table-wrap sql-results__table-pane"
+              role="region"
+              aria-label="SQL query results"
+              tabIndex={0}
+            >
+              <table className="table sql-results__table">
+                <thead>
+                  <tr>
+                    {documentIdColumn >= 0 ? (
+                      <th scope="col" className="sql-results__select-col">
+                        <input
+                          ref={selectAllRef}
+                          type="checkbox"
+                          aria-label="Select all rows with a document id"
+                          checked={allSelectableChecked}
+                          disabled={selectableDocumentIds.length === 0}
+                          onChange={(event) =>
+                            toggleAllSelected(event.target.checked)
                           }
-                          aria-selected={rowDocumentId ? isSelected : undefined}
-                          tabIndex={rowDocumentId ? 0 : undefined}
-                          onClick={() => {
-                            if (rowDocumentId) {
-                              setSelectedDocumentId(rowDocumentId);
-                            }
-                          }}
-                          onKeyDown={(event) => {
-                            if (
-                              rowDocumentId &&
-                              (event.key === 'Enter' || event.key === ' ')
-                            ) {
-                              event.preventDefault();
-                              setSelectedDocumentId(rowDocumentId);
-                            }
-                          }}
-                        >
-                          {row.map((value, columnIndex) => (
-                            <td key={columnIndex} className="sql-results__cell">
-                              {formatCell(value)}
-                            </td>
-                          ))}
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-              {documentIdColumn >= 0 ? (
-                <SqlMessageDetail documentId={selectedDocumentId} />
-              ) : null}
+                        />
+                      </th>
+                    ) : null}
+                    {query.data.columns.map((column, index) => (
+                      <th key={`${column}-${index}`} scope="col">
+                        {column}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {query.data.rows.map((row, rowIndex) => {
+                    const rowDocumentId =
+                      documentIdColumn >= 0
+                        ? documentIdFromRow(row, documentIdColumn)
+                        : undefined;
+                    const isSelected = rowDocumentId === selectedDocumentId;
+                    return (
+                      <tr
+                        key={rowIndex}
+                        ref={isSelected ? selectedRowRef : undefined}
+                        className={
+                          rowDocumentId
+                            ? isSelected
+                              ? 'row row--selected'
+                              : 'row'
+                            : undefined
+                        }
+                        aria-selected={rowDocumentId ? isSelected : undefined}
+                        tabIndex={rowDocumentId ? 0 : undefined}
+                        onClick={() => {
+                          if (rowDocumentId) {
+                            setSelectedDocumentId(rowDocumentId);
+                          }
+                        }}
+                        onKeyDown={(event) => {
+                          if (
+                            rowDocumentId &&
+                            (event.key === 'Enter' || event.key === ' ')
+                          ) {
+                            event.preventDefault();
+                            setSelectedDocumentId(rowDocumentId);
+                          }
+                        }}
+                      >
+                        {documentIdColumn >= 0 ? (
+                          <td
+                            className="sql-results__select-cell"
+                            onClick={(event) => event.stopPropagation()}
+                          >
+                            {rowDocumentId ? (
+                              <input
+                                type="checkbox"
+                                aria-label="Select this row for reingestion"
+                                checked={selectedIds.has(rowDocumentId)}
+                                onClick={(event) => event.stopPropagation()}
+                                onKeyDown={(event) => event.stopPropagation()}
+                                onChange={(event) =>
+                                  toggleOneSelected(
+                                    rowDocumentId,
+                                    event.target.checked,
+                                  )
+                                }
+                              />
+                            ) : null}
+                          </td>
+                        ) : null}
+                        {row.map((value, columnIndex) => (
+                          <td key={columnIndex} className="sql-results__cell">
+                            {formatCell(value)}
+                          </td>
+                        ))}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
             </div>
           ) : null}
         </div>
       ) : null}
+
+      {documentIdColumn >= 0 && selectedDocumentId ? (
+        <DetailDrawer
+          title="Message detail"
+          onClose={() => setSelectedDocumentId(undefined)}
+          returnFocusRef={selectedRowRef}
+          onNavigate={navigateSelection}
+        >
+          <SqlMessageDetail documentId={selectedDocumentId} />
+        </DetailDrawer>
+      ) : null}
+
+      {reingestSelection ? (
+        <ReingestConfirmDialog
+          selection={reingestSelection}
+          onClose={() => setReingestSelection(undefined)}
+          onCreated={() => {
+            // Clear a completed id selection so it cannot be reingested twice; a SQL
+            // selection leaves the query and its results untouched.
+            if (reingestSelection.kind === 'ids') {
+              setSelectedIds(new Set<string>());
+            }
+            setReingestSelection(undefined);
+          }}
+        />
+      ) : null}
+
+      <ReingestJobsPanel />
     </section>
   );
 }

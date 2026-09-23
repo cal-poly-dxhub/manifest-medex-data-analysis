@@ -1,4 +1,4 @@
-import { useMemo, type ReactNode } from 'react';
+import { useMemo, type ReactNode, type RefObject } from 'react';
 import {
   createColumnHelper,
   flexRender,
@@ -12,6 +12,8 @@ interface MessageTableProps {
   readonly rows: readonly MessageSummary[];
   readonly selectedId: string | undefined;
   readonly onSelect: (row: MessageSummary) => void;
+  /** Receives the currently selected row element so callers can restore focus to it. */
+  readonly selectedRowRef?: RefObject<HTMLTableRowElement | null>;
 }
 
 const columnHelper = createColumnHelper<MessageSummary>();
@@ -20,6 +22,7 @@ export function MessageTable({
   rows,
   selectedId,
   onSelect,
+  selectedRowRef,
 }: MessageTableProps): ReactNode {
   const columns = useMemo(
     () => [
@@ -75,6 +78,7 @@ export function MessageTable({
             return (
               <tr
                 key={row.id}
+                ref={isSelected ? selectedRowRef : undefined}
                 className={isSelected ? 'row row--selected' : 'row'}
                 aria-selected={isSelected}
                 tabIndex={0}

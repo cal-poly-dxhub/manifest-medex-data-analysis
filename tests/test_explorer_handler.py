@@ -617,3 +617,1666 @@ def test_execute_sql_supports_updates_and_rejects_invalid_or_failed_queries(
     )
     with pytest.raises(RequestError, match="sql_result_too_large"):
         too_large.execute_sql("SELECT 'large'", "caller")
+
+
+# --- Reports routes -------------------------------------------------------------------
+
+from src.message_search import FieldCatalog, SearchError, SearchRequestError  # noqa: E402
+from src.report_catalog import CatalogError, CatalogRequestError  # noqa: E402
+from src.report_facilities import FacilityDirectoryError  # noqa: E402
+from src.report_query import QueryTester, QueryTestError  # noqa: E402
+from src.report_runs import DownloadResult, RunError, RunRequestError  # noqa: E402
+
+
+def _row_body() -> dict[str, Any]:
+    return {
+        "seq": 3,
+        "label": "PID-7.1",
+        "description": "date of birth present",
+        "index": "hl7-messages-v1",
+        "query": {"term": {"ROOT.PID._present": "1"}},
+    }
+
+
+class StubCatalog:
+    def __init__(self) -> None:
+        self.imported: list[dict[str, Any]] = []
+        self.updated_rows: list[dict[str, Any]] = []
+        self.added_rows: list[dict[str, Any]] = []
+        self.deleted_rows: list[dict[str, Any]] = []
+        self.added_sections: list[dict[str, Any]] = []
+        self.history_calls: list[dict[str, Any]] = []
+        self.deleted_reports: list[dict[str, Any]] = []
+        self.replaced_reports: list[dict[str, Any]] = []
+
+    def list_reports(self) -> list[dict[str, Any]]:
+        return [{"reportId": "quality", "name": "Quality"}]
+
+    def get_report(self, report_id: str) -> dict[str, Any]:
+        return {
+            "reportId": report_id,
+            "definition": {"report_id": report_id},
+            "editor": {"reportId": report_id, "sections": []},
+        }
+
+    def export_report(self, report_id: str) -> dict[str, Any]:
+        definition = {"report_id": report_id}
+        return {
+            "reportId": report_id,
+            "definition": definition,
+            "text": json.dumps(definition, separators=(",", ":"), sort_keys=True),
+        }
+
+    def history(self, report_id: str, limit: int) -> list[dict[str, Any]]:
+        self.history_calls.append({"reportId": report_id, "limit": limit})
+        return [
+            {
+                "reportId": report_id,
+                "sk": "AUDIT#2026-09-09T00:00:00+00:00#import",
+                "action": "import",
+                "updatedAt": "2026-09-09T00:00:00+00:00",
+                "updatedBy": "caller-subject",
+                "source": "api",
+            }
+        ]
+
+    def import_report(
+        self, definition_text: str, *, updated_by: str, source: str = "api"
+    ) -> dict[str, Any]:
+        self.imported.append(
+            {"definition_text": definition_text, "updated_by": updated_by, "source": source}
+        )
+        return {"reportId": "quality", "name": "Quality", "updatedBy": updated_by}
+
+    def update_row(
+        self,
+        report_id: str,
+        section_storage_seq: int,
+        row_storage_seq: int,
+        row: dict[str, Any],
+        *,
+        expected_updated_at: str,
+        updated_by: str,
+    ) -> dict[str, Any]:
+        self.updated_rows.append(
+            {
+                "reportId": report_id,
+                "sectionStorageSeq": section_storage_seq,
+                "rowStorageSeq": row_storage_seq,
+                "row": row,
+                "expected_updated_at": expected_updated_at,
+                "updated_by": updated_by,
+            }
+        )
+        return {
+            "reportId": report_id,
+            "sectionStorageSeq": section_storage_seq,
+            "rowStorageSeq": row_storage_seq,
+            "updatedAt": "2026-09-09T00:00:00+00:00",
+        }
+
+    def add_row(
+        self,
+        report_id: str,
+        section_storage_seq: int,
+        row: dict[str, Any],
+        *,
+        after_storage_seq: int | None = None,
+        updated_by: str,
+    ) -> dict[str, Any]:
+        self.added_rows.append(
+            {
+                "reportId": report_id,
+                "sectionStorageSeq": section_storage_seq,
+                "row": row,
+                "after_storage_seq": after_storage_seq,
+                "updated_by": updated_by,
+            }
+        )
+        return {
+            "reportId": report_id,
+            "sectionStorageSeq": section_storage_seq,
+            "rowStorageSeq": 30,
+        }
+
+    def delete_row(
+        self,
+        report_id: str,
+        section_storage_seq: int,
+        row_storage_seq: int,
+        *,
+        expected_updated_at: str,
+        updated_by: str,
+    ) -> None:
+        self.deleted_rows.append(
+            {
+                "reportId": report_id,
+                "sectionStorageSeq": section_storage_seq,
+                "rowStorageSeq": row_storage_seq,
+                "expected_updated_at": expected_updated_at,
+                "updated_by": updated_by,
+            }
+        )
+
+    def add_section(
+        self,
+        report_id: str,
+        section: dict[str, Any],
+        *,
+        after_storage_seq: int | None = None,
+        updated_by: str,
+    ) -> dict[str, Any]:
+        self.added_sections.append(
+            {
+                "reportId": report_id,
+                "section": section,
+                "after_storage_seq": after_storage_seq,
+                "updated_by": updated_by,
+            }
+        )
+        return {"reportId": report_id, "sectionStorageSeq": 30}
+
+    def delete_report(self, report_id: str, *, updated_by: str) -> dict[str, Any]:
+        self.deleted_reports.append({"reportId": report_id, "updated_by": updated_by})
+        return {"reportId": report_id, "deleted": True}
+
+    def replace_report(
+        self,
+        definition_text: str,
+        *,
+        expected_updated_at: str,
+        updated_by: str,
+    ) -> dict[str, Any]:
+        self.replaced_reports.append(
+            {
+                "definition_text": definition_text,
+                "expected_updated_at": expected_updated_at,
+                "updated_by": updated_by,
+            }
+        )
+        return {
+            "reportId": "quality",
+            "name": "Quality",
+            "description": "",
+            "updatedAt": "2026-09-09T00:00:00+00:00",
+            "updatedBy": updated_by,
+        }
+
+
+class StubRuns:
+    def __init__(self) -> None:
+        self.started: list[tuple[str, str, str, list[str], str]] = []
+
+    def start_run(
+        self,
+        report_id: str,
+        from_time: str,
+        to_time: str,
+        partition_values: list[str],
+        caller_sub: str,
+    ) -> dict[str, Any]:
+        self.started.append((report_id, from_time, to_time, partition_values, caller_sub))
+        return {"runId": "run-1", "reportId": report_id, "status": "running"}
+
+    def list_runs_for_report(self, report_id: str) -> list[dict[str, Any]]:
+        return [{"runId": "run-1", "reportId": report_id, "status": "running"}]
+
+    def get_run_status(self, run_id: str) -> dict[str, Any]:
+        return {"runId": run_id, "status": "complete", "downloadReady": True}
+
+    def download_output(self, run_id: str, caller_sub: str) -> DownloadResult:
+        assert run_id == "run-1"
+        assert caller_sub == "caller-subject"
+        return DownloadResult(content=b"PK\x03\x04archive", content_type="application/zip")
+
+
+class StubFacilities:
+    def list_facilities(self) -> list[str]:
+        return ["facility-a", "facility-b"]
+
+
+class FakeSearchTransport:
+    def __init__(
+        self,
+        *,
+        status: int = 200,
+        response: dict[str, Any] | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self.status = status
+        self.response = response if response is not None else {"hits": {"total": {"value": 7}}}
+        self.error = error
+        self.calls: list[tuple[str, str, bytes | None]] = []
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        body: bytes | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        self.calls.append((method, path, body))
+        if self.error is not None:
+            raise self.error
+        return self.status, self.response
+
+
+def _install_report_stubs(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    catalog: object | None = None,
+    runs: object | None = None,
+    facilities: object | None = None,
+    query_tester: object | None = None,
+) -> tuple[Any, Any, Any, Any]:
+    catalog = catalog or StubCatalog()
+    runs = runs or StubRuns()
+    facilities = facilities or StubFacilities()
+    query_tester = query_tester or QueryTester(FakeSearchTransport(), StubFacilities())
+    monkeypatch.setattr(explorer_handler, "_RUNTIME_CATALOG", catalog)
+    monkeypatch.setattr(explorer_handler, "_RUNTIME_RUNS", runs)
+    monkeypatch.setattr(explorer_handler, "_RUNTIME_FACILITIES", facilities)
+    monkeypatch.setattr(explorer_handler, "_RUNTIME_QUERY_TESTER", query_tester)
+    return catalog, runs, facilities, query_tester
+
+
+def test_handler_lists_and_reads_reports(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_report_stubs(monkeypatch)
+
+    list_response = handler(_authorized_event("GET /reports"), None)
+    assert list_response["statusCode"] == 200
+    assert json.loads(list_response["body"]) == {
+        "items": [{"reportId": "quality", "name": "Quality"}]
+    }
+
+    detail_event = _authorized_event("GET /reports/{id}")
+    detail_event["pathParameters"] = {"id": "quality"}
+    detail_response = handler(detail_event, None)
+    body = json.loads(detail_response["body"])
+    assert body["reportId"] == "quality"
+    assert body["definition"] == {"report_id": "quality"}
+    assert body["editor"]["reportId"] == "quality"
+
+
+def test_handler_imports_whole_definition_with_caller_sub(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog, _runs, _facilities, _tester = _install_report_stubs(monkeypatch)
+    import_event = _authorized_event("POST /reports/import")
+    import_event["body"] = json.dumps({"report_id": "quality", "name": "Quality"})
+
+    response = handler(import_event, None)
+
+    assert response["statusCode"] == 201
+    assert json.loads(response["body"])["reportId"] == "quality"
+    assert catalog.imported[0]["updated_by"] == "caller-subject"
+    # The API import path always tags provenance as source='api' rather than the catalog default.
+    assert catalog.imported[0]["source"] == "api"
+    # The whole definition is forwarded as canonical JSON for whole-definition validation.
+    assert json.loads(catalog.imported[0]["definition_text"]) == {
+        "name": "Quality",
+        "report_id": "quality",
+    }
+
+
+def test_handler_import_maps_invalid_definition(monkeypatch: pytest.MonkeyPatch) -> None:
+    class RejectingCatalog(StubCatalog):
+        def import_report(
+            self,
+            _definition_text: str,
+            *,
+            updated_by: str,  # noqa: ARG002
+            source: str = "api",  # noqa: ARG002
+        ) -> dict[str, Any]:
+            raise CatalogRequestError(400, "invalid_definition")
+
+    _install_report_stubs(monkeypatch, catalog=RejectingCatalog())
+    import_event = _authorized_event("POST /reports/import")
+    import_event["body"] = json.dumps({"report_id": "quality"})
+
+    response = handler(import_event, None)
+
+    assert response["statusCode"] == 400
+    assert json.loads(response["body"]) == {"error": "invalid_definition"}
+
+
+def test_handler_exports_clean_definition_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_report_stubs(monkeypatch)
+    export_event = _authorized_event("GET /reports/{id}/export")
+    export_event["pathParameters"] = {"id": "quality"}
+
+    response = handler(export_event, None)
+
+    assert response["statusCode"] == 200
+    body = json.loads(response["body"])
+    assert body["reportId"] == "quality"
+    assert body["definition"] == {"report_id": "quality"}
+    assert body["text"] == '{"report_id":"quality"}'
+
+
+def test_handler_returns_report_history_with_default_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog, _runs, _facilities, _tester = _install_report_stubs(monkeypatch)
+    event = _authorized_event("GET /reports/{id}/history")
+    event["pathParameters"] = {"id": "quality"}
+
+    response = handler(event, None)
+
+    assert response["statusCode"] == 200
+    body = json.loads(response["body"])
+    assert [entry["action"] for entry in body["items"]] == ["import"]
+    assert body["items"][0]["source"] == "api"
+    # An absent limit falls back to the shared catalog default rather than an ad-hoc value.
+    assert catalog.history_calls == [{"reportId": "quality", "limit": 50}]
+
+
+def test_handler_report_history_forwards_explicit_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog, _runs, _facilities, _tester = _install_report_stubs(monkeypatch)
+    event = _authorized_event("GET /reports/{id}/history")
+    event["pathParameters"] = {"id": "quality"}
+    event["queryStringParameters"] = {"limit": "10"}
+
+    response = handler(event, None)
+
+    assert response["statusCode"] == 200
+    # The scalar query-string limit is converted to an integer before reaching the catalog.
+    assert catalog.history_calls == [{"reportId": "quality", "limit": 10}]
+
+
+@pytest.mark.parametrize("value", ["abc", "1.5", "", "ten"])
+def test_handler_report_history_rejects_non_integer_limit(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    catalog, _runs, _facilities, _tester = _install_report_stubs(monkeypatch)
+    event = _authorized_event("GET /reports/{id}/history")
+    event["pathParameters"] = {"id": "quality"}
+    event["queryStringParameters"] = {"limit": value}
+
+    response = handler(event, None)
+
+    assert response["statusCode"] == 400
+    assert json.loads(response["body"]) == {"error": "invalid_limit"}
+    # A non-integer scalar never reaches the catalog.
+    assert catalog.history_calls == []
+
+
+def test_handler_report_history_surfaces_catalog_limit_bounds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BoundedCatalog(StubCatalog):
+        def history(self, report_id: str, limit: int) -> list[dict[str, Any]]:
+            self.history_calls.append({"reportId": report_id, "limit": limit})
+            if not 1 <= limit <= 200:
+                raise CatalogRequestError(400, "invalid_limit")
+            return []
+
+    catalog = BoundedCatalog()
+    _install_report_stubs(monkeypatch, catalog=catalog)
+    event = _authorized_event("GET /reports/{id}/history")
+    event["pathParameters"] = {"id": "quality"}
+    event["queryStringParameters"] = {"limit": "999"}
+
+    response = handler(event, None)
+
+    assert response["statusCode"] == 400
+    assert json.loads(response["body"]) == {"error": "invalid_limit"}
+    # The handler forwards the parsed integer and lets the catalog own the range check.
+    assert catalog.history_calls == [{"reportId": "quality", "limit": 999}]
+
+
+def test_handler_report_history_requires_authentication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog, _runs, _facilities, _tester = _install_report_stubs(monkeypatch)
+    event = {"routeKey": "GET /reports/{id}/history", "pathParameters": {"id": "quality"}}
+
+    response = handler(event, None)
+
+    assert response["statusCode"] == 401
+    assert json.loads(response["body"]) == {"error": "authentication_required"}
+    assert catalog.history_calls == []
+
+
+def test_handler_report_history_rejects_non_object_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog, _runs, _facilities, _tester = _install_report_stubs(monkeypatch)
+    event = _authorized_event("GET /reports/{id}/history")
+    event["pathParameters"] = {"id": "quality"}
+    event["queryStringParameters"] = "not-an-object"
+
+    response = handler(event, None)
+
+    assert response["statusCode"] == 400
+    assert json.loads(response["body"]) == {"error": "invalid_query"}
+    assert catalog.history_calls == []
+
+
+def test_handler_report_history_maps_catalog_read_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class FailingCatalog(StubCatalog):
+        def history(
+            self,
+            report_id: str,  # noqa: ARG002
+            limit: int,  # noqa: ARG002
+        ) -> list[dict[str, Any]]:
+            raise CatalogError(SENSITIVE_FAILURE)
+
+    _install_report_stubs(monkeypatch, catalog=FailingCatalog())
+    caplog.set_level(logging.ERROR, logger="src.explorer_handler")
+    event = _authorized_event("GET /reports/{id}/history")
+    event["pathParameters"] = {"id": "quality"}
+
+    response = handler(event, None)
+
+    assert response["statusCode"] == 500
+    assert json.loads(response["body"]) == {"error": "explorer_request_failed"}
+    # A sanitized internal catalog failure never leaks its message to the caller or logs.
+    assert SENSITIVE_FAILURE not in response["body"]
+    assert SENSITIVE_FAILURE not in caplog.text
+
+
+def test_handler_replaces_whole_report_with_canonical_definition_and_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog, _runs, _facilities, _tester = _install_report_stubs(monkeypatch)
+    put_event = _authorized_event("PUT /reports/{id}")
+    put_event["pathParameters"] = {"id": "quality"}
+    put_event["body"] = json.dumps(
+        {
+            "definition": {"report_id": "quality", "name": "Quality"},
+            "updated_at": "2026-09-08T00:00:00+00:00",
+        }
+    )
+
+    response = handler(put_event, None)
+
+    assert response["statusCode"] == 200
+    assert json.loads(response["body"])["reportId"] == "quality"
+    recorded = catalog.replaced_reports[0]
+    assert recorded["expected_updated_at"] == "2026-09-08T00:00:00+00:00"
+    assert recorded["updated_by"] == "caller-subject"
+    # The definition is forwarded as the same canonical JSON the import path uses.
+    assert recorded["definition_text"] == '{"name":"Quality","report_id":"quality"}'
+    assert json.loads(recorded["definition_text"]) == {
+        "name": "Quality",
+        "report_id": "quality",
+    }
+
+
+def test_handler_replace_report_rejects_path_definition_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog, _runs, _facilities, _tester = _install_report_stubs(monkeypatch)
+    put_event = _authorized_event("PUT /reports/{id}")
+    put_event["pathParameters"] = {"id": "quality"}
+    put_event["body"] = json.dumps(
+        {
+            "definition": {"report_id": "other", "name": "Quality"},
+            "updated_at": "2026-09-08T00:00:00+00:00",
+        }
+    )
+
+    response = handler(put_event, None)
+
+    assert response["statusCode"] == 400
+    assert json.loads(response["body"]) == {"error": "report_id_mismatch"}
+    # A mismatched definition never reaches the catalog.
+    assert catalog.replaced_reports == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"updated_at": "lock"},
+        {"definition": "not-an-object", "updated_at": "lock"},
+        {"definition": {"report_id": "quality"}, "updated_at": 123},
+        {"definition": {"report_id": "quality"}},
+    ],
+)
+def test_handler_replace_report_rejects_malformed_body(
+    monkeypatch: pytest.MonkeyPatch, body: dict[str, Any]
+) -> None:
+    catalog, _runs, _facilities, _tester = _install_report_stubs(monkeypatch)
+    put_event = _authorized_event("PUT /reports/{id}")
+    put_event["pathParameters"] = {"id": "quality"}
+    put_event["body"] = json.dumps(body)
+
+    response = handler(put_event, None)
+
+    assert response["statusCode"] == 400
+    assert json.loads(response["body"]) == {"error": "invalid_report_update"}
+    assert catalog.replaced_reports == []
+
+
+def test_handler_replace_report_conflict_maps_to_409(monkeypatch: pytest.MonkeyPatch) -> None:
+    class ConflictCatalog(StubCatalog):
+        def replace_report(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            raise CatalogRequestError(409, "edit_conflict")
+
+    _install_report_stubs(monkeypatch, catalog=ConflictCatalog())
+    put_event = _authorized_event("PUT /reports/{id}")
+    put_event["pathParameters"] = {"id": "quality"}
+    put_event["body"] = json.dumps(
+        {
+            "definition": {"report_id": "quality", "name": "Quality"},
+            "updated_at": "stale-lock",
+        }
+    )
+
+    response = handler(put_event, None)
+
+    assert response["statusCode"] == 409
+    assert json.loads(response["body"]) == {"error": "edit_conflict"}
+
+
+def test_handler_replace_report_maps_invalid_definition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RejectingCatalog(StubCatalog):
+        def replace_report(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            raise CatalogRequestError(400, "invalid_definition")
+
+    _install_report_stubs(monkeypatch, catalog=RejectingCatalog())
+    put_event = _authorized_event("PUT /reports/{id}")
+    put_event["pathParameters"] = {"id": "quality"}
+    put_event["body"] = json.dumps(
+        {
+            "definition": {"report_id": "quality", "name": "Quality"},
+            "updated_at": "2026-09-08T00:00:00+00:00",
+        }
+    )
+
+    response = handler(put_event, None)
+
+    assert response["statusCode"] == 400
+    assert json.loads(response["body"]) == {"error": "invalid_definition"}
+
+
+def test_handler_replace_report_maps_catalog_save_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class FailingCatalog(StubCatalog):
+        def replace_report(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            raise CatalogError(SENSITIVE_FAILURE)
+
+    _install_report_stubs(monkeypatch, catalog=FailingCatalog())
+    caplog.set_level(logging.ERROR, logger="src.explorer_handler")
+    put_event = _authorized_event("PUT /reports/{id}")
+    put_event["pathParameters"] = {"id": "quality"}
+    put_event["body"] = json.dumps(
+        {
+            "definition": {"report_id": "quality", "name": "Quality"},
+            "updated_at": "2026-09-08T00:00:00+00:00",
+        }
+    )
+
+    response = handler(put_event, None)
+
+    assert response["statusCode"] == 500
+    assert json.loads(response["body"]) == {"error": "explorer_request_failed"}
+    # A sanitized internal catalog failure never leaks its message to the caller or logs.
+    assert SENSITIVE_FAILURE not in response["body"]
+    assert SENSITIVE_FAILURE not in caplog.text
+
+
+def test_handler_replace_report_requires_authentication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog, _runs, _facilities, _tester = _install_report_stubs(monkeypatch)
+    event = {
+        "routeKey": "PUT /reports/{id}",
+        "pathParameters": {"id": "quality"},
+        "body": json.dumps({"definition": {"report_id": "quality"}, "updated_at": "lock"}),
+    }
+
+    response = handler(event, None)
+
+    assert response["statusCode"] == 401
+    assert json.loads(response["body"]) == {"error": "authentication_required"}
+    assert catalog.replaced_reports == []
+
+
+def test_handler_deletes_whole_report_returns_no_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog, _runs, _facilities, _tester = _install_report_stubs(monkeypatch)
+    delete_event = _authorized_event("DELETE /reports/{id}")
+    delete_event["pathParameters"] = {"id": "quality"}
+
+    response = handler(delete_event, None)
+
+    assert response["statusCode"] == 204
+    assert response["body"] == ""
+    assert response["headers"]["cache-control"] == "no-store"
+    assert response["headers"]["x-content-type-options"] == "nosniff"
+    assert catalog.deleted_reports == [{"reportId": "quality", "updated_by": "caller-subject"}]
+
+
+def test_handler_delete_report_is_idempotent_and_still_returns_204(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MissingReportCatalog(StubCatalog):
+        def delete_report(self, report_id: str, *, updated_by: str) -> dict[str, Any]:
+            self.deleted_reports.append({"reportId": report_id, "updated_by": updated_by})
+            # A repeat delete finds no live META and reports deleted=False without error.
+            return {"reportId": report_id, "deleted": False}
+
+    catalog = MissingReportCatalog()
+    _install_report_stubs(monkeypatch, catalog=catalog)
+    delete_event = _authorized_event("DELETE /reports/{id}")
+    delete_event["pathParameters"] = {"id": "quality"}
+
+    response = handler(delete_event, None)
+
+    assert response["statusCode"] == 204
+    assert response["body"] == ""
+    assert catalog.deleted_reports == [{"reportId": "quality", "updated_by": "caller-subject"}]
+
+
+def test_handler_delete_report_requires_authentication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog, _runs, _facilities, _tester = _install_report_stubs(monkeypatch)
+    event = {"routeKey": "DELETE /reports/{id}", "pathParameters": {"id": "quality"}}
+
+    response = handler(event, None)
+
+    assert response["statusCode"] == 401
+    assert json.loads(response["body"]) == {"error": "authentication_required"}
+    assert catalog.deleted_reports == []
+
+
+def test_handler_delete_report_maps_catalog_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class FailingCatalog(StubCatalog):
+        def delete_report(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            raise CatalogError(SENSITIVE_FAILURE)
+
+    _install_report_stubs(monkeypatch, catalog=FailingCatalog())
+    caplog.set_level(logging.ERROR, logger="src.explorer_handler")
+    delete_event = _authorized_event("DELETE /reports/{id}")
+    delete_event["pathParameters"] = {"id": "quality"}
+
+    response = handler(delete_event, None)
+
+    assert response["statusCode"] == 500
+    assert json.loads(response["body"]) == {"error": "explorer_request_failed"}
+    assert SENSITIVE_FAILURE not in response["body"]
+    assert SENSITIVE_FAILURE not in caplog.text
+
+
+def test_handler_updates_row_with_storage_seqs_and_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog, _runs, _facilities, _tester = _install_report_stubs(monkeypatch)
+    event = _authorized_event("PUT /reports/{id}/sections/{sseq}/rows/{rseq}")
+    event["pathParameters"] = {"id": "quality", "sseq": "10", "rseq": "20"}
+    event["body"] = json.dumps({"row": _row_body(), "updated_at": "2026-09-08T00:00:00+00:00"})
+
+    response = handler(event, None)
+
+    assert response["statusCode"] == 200
+    assert json.loads(response["body"])["rowStorageSeq"] == 20
+    recorded = catalog.updated_rows[0]
+    assert recorded["sectionStorageSeq"] == 10
+    assert recorded["rowStorageSeq"] == 20
+    assert recorded["expected_updated_at"] == "2026-09-08T00:00:00+00:00"
+    assert recorded["updated_by"] == "caller-subject"
+    assert recorded["row"] == _row_body()
+
+
+def test_handler_update_row_conflict_maps_to_409(monkeypatch: pytest.MonkeyPatch) -> None:
+    class ConflictCatalog(StubCatalog):
+        def update_row(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            raise CatalogRequestError(409, "edit_conflict")
+
+    _install_report_stubs(monkeypatch, catalog=ConflictCatalog())
+    event = _authorized_event("PUT /reports/{id}/sections/{sseq}/rows/{rseq}")
+    event["pathParameters"] = {"id": "quality", "sseq": "10", "rseq": "20"}
+    event["body"] = json.dumps({"row": _row_body(), "updated_at": "lock"})
+
+    response = handler(event, None)
+
+    assert response["statusCode"] == 409
+    assert json.loads(response["body"]) == {"error": "edit_conflict"}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"updated_at": "lock"},
+        {"row": "not-an-object", "updated_at": "lock"},
+        {"row": {}, "updated_at": 123},
+    ],
+)
+def test_handler_update_row_rejects_malformed_body(
+    monkeypatch: pytest.MonkeyPatch, body: dict[str, Any]
+) -> None:
+    _install_report_stubs(monkeypatch)
+    event = _authorized_event("PUT /reports/{id}/sections/{sseq}/rows/{rseq}")
+    event["pathParameters"] = {"id": "quality", "sseq": "10", "rseq": "20"}
+    event["body"] = json.dumps(body)
+
+    response = handler(event, None)
+
+    assert response["statusCode"] == 400
+    assert json.loads(response["body"]) == {"error": "invalid_row_edit"}
+
+
+@pytest.mark.parametrize("value", ["abc", "0", "-1", "010", ""])
+def test_handler_rejects_non_positive_storage_seq_path(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    _install_report_stubs(monkeypatch)
+    event = _authorized_event("PUT /reports/{id}/sections/{sseq}/rows/{rseq}")
+    event["pathParameters"] = {"id": "quality", "sseq": value, "rseq": "20"}
+    event["body"] = json.dumps({"row": _row_body(), "updated_at": "lock"})
+
+    response = handler(event, None)
+
+    assert response["statusCode"] == 400
+    assert json.loads(response["body"]) == {"error": "invalid_storage_seq"}
+
+
+def test_handler_adds_row_with_optional_after_seq(monkeypatch: pytest.MonkeyPatch) -> None:
+    catalog, _runs, _facilities, _tester = _install_report_stubs(monkeypatch)
+    event = _authorized_event("POST /reports/{id}/sections/{sseq}/rows")
+    event["pathParameters"] = {"id": "quality", "sseq": "10"}
+    event["body"] = json.dumps({"row": _row_body(), "after_seq": 10})
+
+    response = handler(event, None)
+
+    assert response["statusCode"] == 201
+    assert json.loads(response["body"])["rowStorageSeq"] == 30
+    recorded = catalog.added_rows[0]
+    assert recorded["sectionStorageSeq"] == 10
+    assert recorded["after_storage_seq"] == 10
+    assert recorded["updated_by"] == "caller-subject"
+
+
+def test_handler_add_row_rejects_missing_row_and_bad_after_seq(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_report_stubs(monkeypatch)
+    missing = _authorized_event("POST /reports/{id}/sections/{sseq}/rows")
+    missing["pathParameters"] = {"id": "quality", "sseq": "10"}
+    missing["body"] = json.dumps({"after_seq": 10})
+    assert json.loads(handler(missing, None)["body"]) == {"error": "invalid_row_add"}
+
+    bad_after = _authorized_event("POST /reports/{id}/sections/{sseq}/rows")
+    bad_after["pathParameters"] = {"id": "quality", "sseq": "10"}
+    bad_after["body"] = json.dumps({"row": _row_body(), "after_seq": 0})
+    assert json.loads(handler(bad_after, None)["body"]) == {"error": "invalid_storage_seq"}
+
+
+def test_handler_deletes_row_returns_no_content(monkeypatch: pytest.MonkeyPatch) -> None:
+    catalog, _runs, _facilities, _tester = _install_report_stubs(monkeypatch)
+    event = _authorized_event("DELETE /reports/{id}/sections/{sseq}/rows/{rseq}")
+    event["pathParameters"] = {"id": "quality", "sseq": "10", "rseq": "20"}
+    event["body"] = json.dumps({"updated_at": "2026-09-08T00:00:00+00:00"})
+
+    response = handler(event, None)
+
+    assert response["statusCode"] == 204
+    assert response["body"] == ""
+    recorded = catalog.deleted_rows[0]
+    assert recorded["sectionStorageSeq"] == 10
+    assert recorded["rowStorageSeq"] == 20
+    assert recorded["expected_updated_at"] == "2026-09-08T00:00:00+00:00"
+    assert recorded["updated_by"] == "caller-subject"
+
+
+def test_handler_delete_row_rejects_missing_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_report_stubs(monkeypatch)
+    event = _authorized_event("DELETE /reports/{id}/sections/{sseq}/rows/{rseq}")
+    event["pathParameters"] = {"id": "quality", "sseq": "10", "rseq": "20"}
+    event["body"] = json.dumps({})
+
+    response = handler(event, None)
+
+    assert response["statusCode"] == 400
+    assert json.loads(response["body"]) == {"error": "invalid_row_delete"}
+
+
+def test_handler_adds_section_forwards_name_seq_and_position(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog, _runs, _facilities, _tester = _install_report_stubs(monkeypatch)
+    event = _authorized_event("POST /reports/{id}/sections")
+    event["pathParameters"] = {"id": "quality"}
+    event["body"] = json.dumps({"name": "New Section", "seq": 3, "after_seq": 10})
+
+    response = handler(event, None)
+
+    assert response["statusCode"] == 201
+    assert json.loads(response["body"])["sectionStorageSeq"] == 30
+    recorded = catalog.added_sections[0]
+    assert recorded["section"] == {"name": "New Section", "seq": 3}
+    assert recorded["after_storage_seq"] == 10
+    assert recorded["updated_by"] == "caller-subject"
+
+
+def test_handler_add_section_defers_shape_validation_to_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RejectingCatalog(StubCatalog):
+        def add_section(
+            self,
+            _report_id: str,
+            _section: dict[str, Any],
+            *,
+            after_storage_seq: int | None = None,  # noqa: ARG002
+            updated_by: str,  # noqa: ARG002
+        ) -> dict[str, Any]:
+            raise CatalogRequestError(400, "invalid_definition")
+
+    _install_report_stubs(monkeypatch, catalog=RejectingCatalog())
+    event = _authorized_event("POST /reports/{id}/sections")
+    event["pathParameters"] = {"id": "quality"}
+    event["body"] = json.dumps({"name": "New Section"})
+
+    response = handler(event, None)
+
+    assert response["statusCode"] == 400
+    assert json.loads(response["body"]) == {"error": "invalid_definition"}
+
+
+def test_handler_routes_report_run_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    _catalog, runs, _facilities, _tester = _install_report_stubs(monkeypatch)
+
+    start_event = _authorized_event("POST /reports/{id}/runs")
+    start_event["pathParameters"] = {"id": "quality"}
+    start_event["body"] = json.dumps(
+        {
+            "from": "2026-08-01T00:00:00Z",
+            "to": "2026-08-31T00:00:00Z",
+            "partitions": ["facility-a", "facility-b"],
+        }
+    )
+    start_response = handler(start_event, None)
+    assert start_response["statusCode"] == 202
+    assert json.loads(start_response["body"])["runId"] == "run-1"
+    assert runs.started == [
+        (
+            "quality",
+            "2026-08-01T00:00:00Z",
+            "2026-08-31T00:00:00Z",
+            ["facility-a", "facility-b"],
+            "caller-subject",
+        )
+    ]
+
+    list_event = _authorized_event("GET /reports/{id}/runs")
+    list_event["pathParameters"] = {"id": "quality"}
+    list_response = handler(list_event, None)
+    assert json.loads(list_response["body"]) == {
+        "items": [{"runId": "run-1", "reportId": "quality", "status": "running"}]
+    }
+
+    status_event = _authorized_event("GET /runs/{runId}")
+    status_event["pathParameters"] = {"runId": "run-1"}
+    status_response = handler(status_event, None)
+    assert json.loads(status_response["body"])["status"] == "complete"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"from": "2026-08-01T00:00:00Z", "to": "2026-08-31T00:00:00Z"},
+        {"from": 1, "to": "2026-08-31T00:00:00Z", "partitions": ["a"]},
+        {"from": "2026-08-01T00:00:00Z", "to": "2026-08-31T00:00:00Z", "partitions": "a"},
+    ],
+)
+def test_handler_start_run_rejects_malformed_body(
+    monkeypatch: pytest.MonkeyPatch, body: dict[str, Any]
+) -> None:
+    _install_report_stubs(monkeypatch)
+    start_event = _authorized_event("POST /reports/{id}/runs")
+    start_event["pathParameters"] = {"id": "quality"}
+    start_event["body"] = json.dumps(body)
+
+    response = handler(start_event, None)
+
+    assert response["statusCode"] == 400
+    assert json.loads(response["body"]) == {"error": "invalid_run_request"}
+
+
+def test_handler_downloads_run_output_as_no_store_zip_attachment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_report_stubs(monkeypatch)
+    download_event = _authorized_event("GET /runs/{runId}/download")
+    download_event["pathParameters"] = {"runId": "run-1"}
+
+    response = handler(download_event, None)
+
+    assert response["statusCode"] == 200
+    assert response["isBase64Encoded"] is True
+    assert base64.b64decode(response["body"]) == b"PK\x03\x04archive"
+    assert response["headers"]["content-type"] == "application/zip"
+    assert response["headers"]["cache-control"] == "no-store"
+    assert response["headers"]["content-disposition"] == 'attachment; filename="run-1.zip"'
+    assert response["headers"]["x-content-type-options"] == "nosniff"
+
+
+def test_handler_routes_facilities(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_report_stubs(monkeypatch)
+
+    response = handler(_authorized_event("GET /facilities"), None)
+
+    assert response["statusCode"] == 200
+    assert json.loads(response["body"]) == {"facilities": ["facility-a", "facility-b"]}
+
+
+def test_handler_query_test_without_injection_uses_size_zero_search(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    transport = FakeSearchTransport(response={"hits": {"total": {"value": 4}}})
+    tester = QueryTester(transport, StubFacilities())
+    _install_report_stubs(monkeypatch, query_tester=tester)
+    caplog.set_level(logging.INFO, logger="src.explorer_handler")
+
+    event = _authorized_event("POST /query-test")
+    event["body"] = json.dumps(
+        {"index": "hl7-messages-v1", "query": {"term": {"ROOT.PID._present": "1"}}}
+    )
+    response = handler(event, None)
+
+    assert response["statusCode"] == 200
+    assert json.loads(response["body"]) == {"count": 4}
+    method, path, body = transport.calls[0]
+    assert method == "POST"
+    assert path == "/hl7-messages-v1/_search"
+    assert body is not None
+    sent = json.loads(body.decode())
+    assert sent["size"] == 0
+    assert sent["track_total_hits"] is True
+    filters = sent["query"]["bool"]["filter"]
+    assert {"term": {"ROOT.PID._present": "1"}} in filters
+    # No facility term and no time range are injected when neither is supplied.
+    assert not any("range" in clause for clause in filters)
+    assert not any("sourceFacilityId" in clause.get("term", {}) for clause in filters)
+    # The clinical query body and count must never be logged.
+    assert "ROOT.PID._present" not in caplog.text
+
+
+def test_handler_query_test_injects_facility_and_time_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = FakeSearchTransport(response={"hits": {"total": {"value": 9}}})
+    tester = QueryTester(transport, StubFacilities())
+    _install_report_stubs(monkeypatch, query_tester=tester)
+
+    event = _authorized_event("POST /query-test")
+    event["body"] = json.dumps(
+        {
+            "index": "hl7-messages-v1",
+            "query": {"term": {"ROOT.PID._present": "1"}},
+            "facility": "facility-a",
+            "from": "2026-08-01T00:00:00Z",
+            "to": "2026-08-31T00:00:00Z",
+        }
+    )
+    response = handler(event, None)
+
+    assert json.loads(response["body"]) == {"count": 9}
+    _method, _path, body = transport.calls[0]
+    assert body is not None
+    filters = json.loads(body.decode())["query"]["bool"]["filter"]
+    assert {"term": {"ROOT.PID._present": "1"}} in filters
+    assert {"term": {"sourceFacilityId": "facility-a"}} in filters
+    assert {
+        "range": {"messageTime": {"gte": "2026-08-01T00:00:00Z", "lt": "2026-08-31T00:00:00Z"}}
+    } in filters
+
+
+def test_handler_query_test_rejects_unknown_facility(monkeypatch: pytest.MonkeyPatch) -> None:
+    transport = FakeSearchTransport()
+    tester = QueryTester(transport, StubFacilities())
+    _install_report_stubs(monkeypatch, query_tester=tester)
+
+    event = _authorized_event("POST /query-test")
+    event["body"] = json.dumps(
+        {
+            "index": "hl7-messages-v1",
+            "query": {"term": {"ROOT.PID._present": "1"}},
+            "facility": "arbitrary free text",
+        }
+    )
+    response = handler(event, None)
+
+    assert response["statusCode"] == 400
+    assert json.loads(response["body"]) == {"error": "unknown_facility"}
+    # A rejected facility must never reach the search backend.
+    assert transport.calls == []
+
+
+def test_handler_query_test_rejects_reserved_field_guardrail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = FakeSearchTransport()
+    tester = QueryTester(transport, StubFacilities())
+    _install_report_stubs(monkeypatch, query_tester=tester)
+
+    event = _authorized_event("POST /query-test")
+    event["body"] = json.dumps(
+        {"index": "hl7-messages-v1", "query": {"term": {"sourceFacilityId": "facility-a"}}}
+    )
+    response = handler(event, None)
+
+    assert response["statusCode"] == 400
+    assert json.loads(response["body"]) == {"error": "invalid_query"}
+    assert transport.calls == []
+
+
+@pytest.mark.parametrize(
+    ("body", "code"),
+    [
+        ({"index": "hl7-messages-v1"}, "placeholder_query_not_implemented"),
+        ({"index": "unknown-index", "query": {"term": {"a": "b"}}}, "invalid_query"),
+        ({"index": "hl7-messages-v1", "query": {}}, "invalid_query"),
+        (
+            {
+                "index": "hl7-messages-v1",
+                "query": {"term": {"a": "b"}},
+                "from": "2026-08-01T00:00:00Z",
+            },
+            "invalid_time_range",
+        ),
+        (
+            {
+                "index": "hl7-messages-v1",
+                "query": {"term": {"a": "b"}},
+                "from": "2026-08-31T00:00:00Z",
+                "to": "2026-08-01T00:00:00Z",
+            },
+            "invalid_time_range",
+        ),
+        (
+            {
+                "index": "hl7-messages-v1",
+                "query": {"term": {"a": "b"}},
+                "from": "not-a-time",
+                "to": "2026-08-01T00:00:00Z",
+            },
+            "invalid_time",
+        ),
+    ],
+)
+def test_handler_query_test_rejects_invalid_request(
+    monkeypatch: pytest.MonkeyPatch, body: dict[str, Any], code: str
+) -> None:
+    transport = FakeSearchTransport()
+    tester = QueryTester(transport, StubFacilities())
+    _install_report_stubs(monkeypatch, query_tester=tester)
+
+    event = _authorized_event("POST /query-test")
+    event["body"] = json.dumps(body)
+    response = handler(event, None)
+
+    assert response["statusCode"] == 400
+    assert json.loads(response["body"]) == {"error": code}
+    assert transport.calls == []
+
+
+def test_handler_query_test_sanitizes_backend_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    transport = FakeSearchTransport(error=RuntimeError(SENSITIVE_FAILURE))
+    tester = QueryTester(transport, StubFacilities())
+    _install_report_stubs(monkeypatch, query_tester=tester)
+    caplog.set_level(logging.ERROR, logger="src.explorer_handler")
+
+    event = _authorized_event("POST /query-test")
+    event["body"] = json.dumps(
+        {"index": "hl7-messages-v1", "query": {"term": {"ROOT.PID._present": "1"}}}
+    )
+    response = handler(event, None)
+
+    assert response["statusCode"] == 500
+    assert json.loads(response["body"]) == {"error": "explorer_request_failed"}
+    assert SENSITIVE_FAILURE not in response["body"]
+    assert SENSITIVE_FAILURE not in caplog.text
+
+
+def test_handler_maps_typed_report_request_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    class MissingCatalog(StubCatalog):
+        def get_report(self, _report_id: str) -> dict[str, Any]:
+            raise CatalogRequestError(404, "report_not_found")
+
+    class ConflictRuns(StubRuns):
+        def download_output(self, _run_id: str, _caller_sub: str) -> DownloadResult:
+            raise RunRequestError(409, "run_output_not_ready")
+
+    _install_report_stubs(monkeypatch, catalog=MissingCatalog(), runs=ConflictRuns())
+
+    detail_event = _authorized_event("GET /reports/{id}")
+    detail_event["pathParameters"] = {"id": "quality"}
+    detail_response = handler(detail_event, None)
+    assert detail_response["statusCode"] == 404
+    assert json.loads(detail_response["body"]) == {"error": "report_not_found"}
+
+    download_event = _authorized_event("GET /runs/{runId}/download")
+    download_event["pathParameters"] = {"runId": "run-1"}
+    download_response = handler(download_event, None)
+    assert download_response["statusCode"] == 409
+    assert json.loads(download_response["body"]) == {"error": "run_output_not_ready"}
+
+
+def test_handler_sanitizes_internal_report_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class FailingCatalog(StubCatalog):
+        def list_reports(self) -> list[dict[str, Any]]:
+            raise CatalogError(SENSITIVE_FAILURE)
+
+    class FailingRuns(StubRuns):
+        def get_run_status(self, _run_id: str) -> dict[str, Any]:
+            raise RunError(SENSITIVE_FAILURE)
+
+    class FailingFacilities(StubFacilities):
+        def list_facilities(self) -> list[str]:
+            raise FacilityDirectoryError(SENSITIVE_FAILURE)
+
+    _install_report_stubs(
+        monkeypatch,
+        catalog=FailingCatalog(),
+        runs=FailingRuns(),
+        facilities=FailingFacilities(),
+    )
+    caplog.set_level(logging.ERROR, logger="src.explorer_handler")
+
+    catalog_response = handler(_authorized_event("GET /reports"), None)
+    assert catalog_response["statusCode"] == 500
+    assert json.loads(catalog_response["body"]) == {"error": "explorer_request_failed"}
+
+    status_event = _authorized_event("GET /runs/{runId}")
+    status_event["pathParameters"] = {"runId": "run-1"}
+    assert handler(status_event, None)["statusCode"] == 500
+
+    facilities_response = handler(_authorized_event("GET /facilities"), None)
+    assert facilities_response["statusCode"] == 500
+
+    assert SENSITIVE_FAILURE not in caplog.text
+    for response in (catalog_response, facilities_response):
+        assert SENSITIVE_FAILURE not in response["body"]
+
+
+def test_handler_query_test_maps_sanitized_error_class() -> None:
+    # QueryTestError is a plain sanitized failure that carries no caller-safe code.
+    assert not hasattr(QueryTestError("boom"), "status_code")
+
+
+def test_report_routes_require_authentication(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_report_stubs(monkeypatch)
+    for route in ("GET /reports", "POST /reports/import", "POST /query-test"):
+        assert handler({"routeKey": route}, None)["statusCode"] == 401
+
+
+def test_runtime_report_services_build_and_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    clients = {
+        "s3": FakeS3(),
+        "dynamodb": object(),
+        "lambda": object(),
+    }
+    monkeypatch.setattr(explorer_handler, "_RUNTIME_CATALOG", None)
+    monkeypatch.setattr(explorer_handler, "_RUNTIME_RUNS", None)
+    monkeypatch.setattr(explorer_handler, "_RUNTIME_FACILITIES", None)
+    monkeypatch.setattr(explorer_handler, "_RUNTIME_QUERY_TESTER", None)
+    monkeypatch.setattr(explorer_handler, "_aws_client", clients.__getitem__)
+    monkeypatch.setenv("REPORT_BUCKET", "report-bucket")
+    monkeypatch.setenv("REPORT_CATALOG_TABLE", "report-catalog")
+    monkeypatch.setenv("REPORT_RUNS_TABLE", "report-runs")
+    monkeypatch.setenv("REPORT_RUNNER_FUNCTION", "report-runner")
+    monkeypatch.setenv("OPENSEARCH_ENDPOINT", "https://example.aoss.us-west-2.amazonaws.com")
+    monkeypatch.setenv("AWS_REGION", "us-west-2")
+
+    assert explorer_handler._runtime_catalog() is explorer_handler._runtime_catalog()
+    assert explorer_handler._runtime_runs() is explorer_handler._runtime_runs()
+    assert explorer_handler._runtime_facilities() is explorer_handler._runtime_facilities()
+    assert explorer_handler._runtime_query_tester() is explorer_handler._runtime_query_tester()
+
+
+# --- Metadata attribute-search routes -------------------------------------------------
+
+
+class StubMessageSearch:
+    def __init__(
+        self,
+        *,
+        result: dict[str, Any] | None = None,
+        fields: list[str] | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self.result = (
+            result if result is not None else {"items": [], "total": 0, "nextCursor": None}
+        )
+        self.fields = fields if fields is not None else ["documentId", "messageType"]
+        self.error = error
+        self.searches: list[dict[str, Any]] = []
+        self.field_lookups: list[str] = []
+
+    def search(
+        self,
+        *,
+        index: Any,
+        caller_sub: Any,
+        filters: Any = None,
+        facility: Any = None,
+        from_time: Any = None,
+        to_time: Any = None,
+        limit: Any = None,
+        cursor: Any = None,
+    ) -> dict[str, Any]:
+        self.searches.append(
+            {
+                "index": index,
+                "caller_sub": caller_sub,
+                "filters": filters,
+                "facility": facility,
+                "from_time": from_time,
+                "to_time": to_time,
+                "limit": limit,
+                "cursor": cursor,
+            }
+        )
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+    def field_catalog(self, index: str) -> FieldCatalog:
+        self.field_lookups.append(index)
+        if self.error is not None:
+            raise self.error
+        return FieldCatalog(
+            present=frozenset(self.fields),
+            text_fields=frozenset(),
+            keyword_subfields=frozenset(),
+        )
+
+
+def test_handler_runs_metadata_search_and_lists_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = StubMessageSearch(
+        result={
+            "items": [{"documentId": DOCUMENT_A, "messageType": "ORU"}],
+            "total": 1,
+            "nextCursor": None,
+        },
+        fields=["messageType", "documentId", "sourceFacilityId"],
+    )
+    monkeypatch.setattr(explorer_handler, "_RUNTIME_MESSAGE_SEARCH", service)
+
+    search_event = _authorized_event("POST /search")
+    search_event["body"] = json.dumps(
+        {
+            "index": "hl7-messages-v1",
+            "filters": [{"field": "messageType", "operator": "equals", "value": "ORU"}],
+            "facility": "facility-a",
+            "from": "2026-08-01T00:00:00+00:00",
+            "to": "2026-09-01T00:00:00+00:00",
+            "limit": 25,
+            "cursor": "opaque",
+        }
+    )
+    search_response = handler(search_event, None)
+    assert search_response["statusCode"] == 200
+    assert json.loads(search_response["body"]) == {
+        "items": [{"documentId": DOCUMENT_A, "messageType": "ORU"}],
+        "total": 1,
+        "nextCursor": None,
+    }
+    # The caller subject is resolved from the JWT claim and forwarded before routing, and the
+    # request JSON is unpacked into the service's typed keyword parameters verbatim.
+    assert service.searches == [
+        {
+            "index": "hl7-messages-v1",
+            "caller_sub": "caller-subject",
+            "filters": [{"field": "messageType", "operator": "equals", "value": "ORU"}],
+            "facility": "facility-a",
+            "from_time": "2026-08-01T00:00:00+00:00",
+            "to_time": "2026-09-01T00:00:00+00:00",
+            "limit": 25,
+            "cursor": "opaque",
+        }
+    ]
+
+    fields_event = _authorized_event("GET /search/fields")
+    fields_event["queryStringParameters"] = {"index": "ccda-documents-v1"}
+    fields_response = handler(fields_event, None)
+    assert fields_response["statusCode"] == 200
+    # Fields are returned in deterministic sorted order regardless of caps ordering.
+    assert json.loads(fields_response["body"]) == {
+        "fields": ["documentId", "messageType", "sourceFacilityId"]
+    }
+    assert service.field_lookups == ["ccda-documents-v1"]
+
+
+def test_handler_search_requires_authentication(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(explorer_handler, "_RUNTIME_MESSAGE_SEARCH", StubMessageSearch())
+
+    assert handler({"routeKey": "POST /search"}, None)["statusCode"] == 401
+    assert handler({"routeKey": "GET /search/fields"}, None)["statusCode"] == 401
+
+
+def test_handler_search_maps_typed_request_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        explorer_handler,
+        "_RUNTIME_MESSAGE_SEARCH",
+        StubMessageSearch(error=SearchRequestError(400, "unknown_field")),
+    )
+
+    # A typed request failure (here an unknown field) surfaces its own safe status and code.
+    search_event = _authorized_event("POST /search")
+    search_event["body"] = json.dumps(
+        {"index": "hl7-messages-v1", "filters": [{"field": "nope", "operator": "exists"}]}
+    )
+    response = handler(search_event, None)
+    assert response["statusCode"] == 400
+    assert json.loads(response["body"]) == {"error": "unknown_field"}
+
+    # The fields route requires the index query-string parameter before touching the service.
+    missing_index = _authorized_event("GET /search/fields")
+    missing_index["queryStringParameters"] = {}
+    missing_response = handler(missing_index, None)
+    assert missing_response["statusCode"] == 400
+    assert json.loads(missing_response["body"]) == {"error": "invalid_index"}
+
+    bad_query = _authorized_event("GET /search/fields")
+    bad_query["queryStringParameters"] = "not-an-object"
+    assert handler(bad_query, None)["statusCode"] == 400
+
+
+def test_handler_search_sanitizes_internal_error(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sensitive = "backend cluster detail and clinical value"
+    monkeypatch.setattr(
+        explorer_handler,
+        "_RUNTIME_MESSAGE_SEARCH",
+        StubMessageSearch(error=SearchError(sensitive)),
+    )
+    caplog.set_level(logging.ERROR, logger="src.explorer_handler")
+
+    search_event = _authorized_event("POST /search")
+    search_event["body"] = json.dumps({"index": "hl7-messages-v1"})
+    response = handler(search_event, None)
+
+    # A non-request SearchError collapses to a generic sanitized 500 that never echoes the
+    # backend detail, and the request body is never logged.
+    assert response["statusCode"] == 500
+    assert sensitive not in response["body"]
+    assert sensitive not in caplog.text
+    assert "hl7-messages-v1" not in caplog.text
+
+
+def test_runtime_message_search_builds_and_caches(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(explorer_handler, "_RUNTIME_MESSAGE_SEARCH", None)
+    monkeypatch.setenv("OPENSEARCH_ENDPOINT", "https://example.aoss.us-west-2.amazonaws.com")
+    monkeypatch.setenv("AWS_REGION", "us-west-2")
+
+    first = explorer_handler._runtime_message_search()
+    second = explorer_handler._runtime_message_search()
+
+    assert first is second
+
+
+# --- Parsed-zone reingestion routes ---------------------------------------------------
+
+from src.reingest_jobs import (  # noqa: E402
+    INVALID_JOB_REQUEST,
+    JOB_NOT_FOUND,
+    ReingestError,
+    ReingestRequestError,
+)
+
+JOB_ID = "a" * 32
+
+
+class StubReingest:
+    def __init__(self, *, error: Exception | None = None) -> None:
+        self.error = error
+        self.previews: list[dict[str, Any]] = []
+        self.created: list[dict[str, Any]] = []
+        self.listed: list[Any] = []
+        self.fetched: list[str] = []
+
+    def preview(self, sql: Any, caller_sub: str) -> dict[str, Any]:
+        if self.error is not None:
+            raise self.error
+        self.previews.append({"sql": sql, "caller_sub": caller_sub})
+        return {"count": 3}
+
+    def create_job(
+        self,
+        caller_sub: str,
+        *,
+        sql: Any = None,
+        document_ids: Any = None,
+    ) -> dict[str, Any]:
+        if self.error is not None:
+            raise self.error
+        self.created.append({"caller_sub": caller_sub, "sql": sql, "document_ids": document_ids})
+        return {
+            "jobId": JOB_ID,
+            "status": "queued",
+            "mode": "sql" if sql is not None else "ids",
+        }
+
+    def list_jobs(self, limit: Any = None) -> dict[str, Any]:
+        if self.error is not None:
+            raise self.error
+        self.listed.append(limit)
+        return {"items": []}
+
+    def get_job(self, job_id: str) -> dict[str, Any]:
+        if self.error is not None:
+            raise self.error
+        self.fetched.append(job_id)
+        return {"jobId": job_id, "status": "queued"}
+
+
+def test_reingest_routes_require_authentication(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(explorer_handler, "_RUNTIME_REINGEST", StubReingest())
+    for route in (
+        "POST /reingest/preview",
+        "POST /reingest/jobs",
+        "GET /reingest/jobs",
+        "GET /reingest/jobs/{jobId}",
+    ):
+        assert handler({"routeKey": route}, None)["statusCode"] == 401
+
+
+def test_reingest_preview_forwards_sql_and_caller(monkeypatch: pytest.MonkeyPatch) -> None:
+    stub = StubReingest()
+    monkeypatch.setattr(explorer_handler, "_RUNTIME_REINGEST", stub)
+
+    event = _authorized_event("POST /reingest/preview")
+    event["body"] = json.dumps({"sql": "SELECT document_id FROM document_metadata"})
+    response = handler(event, None)
+
+    assert response["statusCode"] == 200
+    assert json.loads(response["body"]) == {"count": 3}
+    assert stub.previews == [
+        {
+            "sql": "SELECT document_id FROM document_metadata",
+            "caller_sub": "caller-subject",
+        }
+    ]
+
+
+def test_reingest_create_job_from_sql_returns_202(monkeypatch: pytest.MonkeyPatch) -> None:
+    stub = StubReingest()
+    monkeypatch.setattr(explorer_handler, "_RUNTIME_REINGEST", stub)
+
+    event = _authorized_event("POST /reingest/jobs")
+    event["body"] = json.dumps({"sql": "SELECT document_id FROM document_metadata"})
+    response = handler(event, None)
+
+    assert response["statusCode"] == 202
+    assert json.loads(response["body"]) == {
+        "jobId": JOB_ID,
+        "status": "queued",
+        "mode": "sql",
+    }
+    # The handler forwards both selection sources verbatim so the service enforces the
+    # exactly-one-of rule from a single source of truth.
+    assert stub.created == [
+        {
+            "caller_sub": "caller-subject",
+            "sql": "SELECT document_id FROM document_metadata",
+            "document_ids": None,
+        }
+    ]
+
+
+def test_reingest_create_job_from_ids_returns_202(monkeypatch: pytest.MonkeyPatch) -> None:
+    stub = StubReingest()
+    monkeypatch.setattr(explorer_handler, "_RUNTIME_REINGEST", stub)
+
+    event = _authorized_event("POST /reingest/jobs")
+    event["body"] = json.dumps({"documentIds": [DOCUMENT_A, DOCUMENT_B]})
+    response = handler(event, None)
+
+    assert response["statusCode"] == 202
+    assert json.loads(response["body"])["mode"] == "ids"
+    assert stub.created == [
+        {
+            "caller_sub": "caller-subject",
+            "sql": None,
+            "document_ids": [DOCUMENT_A, DOCUMENT_B],
+        }
+    ]
+
+
+def test_reingest_lists_and_reads_jobs(monkeypatch: pytest.MonkeyPatch) -> None:
+    stub = StubReingest()
+    monkeypatch.setattr(explorer_handler, "_RUNTIME_REINGEST", stub)
+
+    list_event = _authorized_event("GET /reingest/jobs")
+    list_event["queryStringParameters"] = {"limit": "25"}
+    list_response = handler(list_event, None)
+    assert list_response["statusCode"] == 200
+    assert json.loads(list_response["body"]) == {"items": []}
+    assert stub.listed == [25]
+
+    # An absent limit is forwarded as None so the service applies its own default.
+    default_event = _authorized_event("GET /reingest/jobs")
+    handler(default_event, None)
+    assert stub.listed == [25, None]
+
+    get_event = _authorized_event("GET /reingest/jobs/{jobId}")
+    get_event["pathParameters"] = {"jobId": JOB_ID}
+    get_response = handler(get_event, None)
+    assert get_response["statusCode"] == 200
+    assert json.loads(get_response["body"]) == {"jobId": JOB_ID, "status": "queued"}
+    assert stub.fetched == [JOB_ID]
+
+
+def test_reingest_rejects_invalid_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(explorer_handler, "_RUNTIME_REINGEST", StubReingest())
+
+    invalid_json = _authorized_event("POST /reingest/jobs")
+    invalid_json["body"] = "not-json"
+    assert handler(invalid_json, None)["statusCode"] == 400
+
+    invalid_limit = _authorized_event("GET /reingest/jobs")
+    invalid_limit["queryStringParameters"] = {"limit": "not-a-number"}
+    limit_response = handler(invalid_limit, None)
+    assert limit_response["statusCode"] == 400
+    assert json.loads(limit_response["body"]) == {"error": "invalid_limit"}
+
+    missing_job_id = _authorized_event("GET /reingest/jobs/{jobId}")
+    missing_job_id["pathParameters"] = {}
+    job_response = handler(missing_job_id, None)
+    assert job_response["statusCode"] == 400
+    assert json.loads(job_response["body"]) == {"error": "invalid_job_id"}
+
+
+def test_reingest_maps_typed_request_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    class ConflictingSelection(StubReingest):
+        def create_job(
+            self,
+            _caller_sub: str,
+            *,
+            sql: Any = None,  # noqa: ARG002 - signature must match the service contract
+            document_ids: Any = None,  # noqa: ARG002 - signature must match the contract
+        ) -> dict[str, Any]:
+            raise ReingestRequestError(400, INVALID_JOB_REQUEST)
+
+    class MissingJob(StubReingest):
+        def get_job(self, _job_id: str) -> dict[str, Any]:
+            raise ReingestRequestError(404, JOB_NOT_FOUND)
+
+    monkeypatch.setattr(explorer_handler, "_RUNTIME_REINGEST", ConflictingSelection())
+    create_event = _authorized_event("POST /reingest/jobs")
+    create_event["body"] = json.dumps({"sql": "SELECT 1", "documentIds": [DOCUMENT_A]})
+    create_response = handler(create_event, None)
+    assert create_response["statusCode"] == 400
+    assert json.loads(create_response["body"]) == {"error": INVALID_JOB_REQUEST}
+
+    monkeypatch.setattr(explorer_handler, "_RUNTIME_REINGEST", MissingJob())
+    get_event = _authorized_event("GET /reingest/jobs/{jobId}")
+    get_event["pathParameters"] = {"jobId": JOB_ID}
+    get_response = handler(get_event, None)
+    assert get_response["statusCode"] == 404
+    assert json.loads(get_response["body"]) == {"error": JOB_NOT_FOUND}
+
+
+def test_reingest_sanitizes_internal_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sensitive = "sensitive SQL text and DynamoDB detail"
+    monkeypatch.setattr(
+        explorer_handler,
+        "_RUNTIME_REINGEST",
+        StubReingest(error=ReingestError(sensitive)),
+    )
+    caplog.set_level(logging.ERROR, logger="src.explorer_handler")
+
+    event = _authorized_event("POST /reingest/preview")
+    event["body"] = json.dumps({"sql": "SELECT document_id FROM document_metadata"})
+    response = handler(event, None)
+
+    # A non-request ReingestError collapses to a generic sanitized 500 that never echoes the
+    # SQL or backend detail, and the request body is never logged.
+    assert response["statusCode"] == 500
+    assert json.loads(response["body"]) == {"error": "explorer_request_failed"}
+    assert sensitive not in response["body"]
+    assert sensitive not in caplog.text
+    assert "document_metadata" not in caplog.text
+
+
+def test_runtime_reingest_builds_and_caches(monkeypatch: pytest.MonkeyPatch) -> None:
+    clients = {
+        "rds-data": object(),
+        "dynamodb": object(),
+        "lambda": object(),
+    }
+    monkeypatch.setattr(explorer_handler, "_RUNTIME_REINGEST", None)
+    monkeypatch.setattr(explorer_handler, "_aws_client", clients.__getitem__)
+    monkeypatch.setenv("METADATA_CLUSTER_ARN", "cluster")
+    monkeypatch.setenv("METADATA_SECRET_ARN", "secret")
+    monkeypatch.setenv("METADATA_DATABASE", "manifest_medex")
+    monkeypatch.setenv("METADATA_TABLE", "document_metadata")
+    monkeypatch.setenv("REINGEST_JOBS_TABLE", "reingest-jobs")
+    monkeypatch.setenv("REINGEST_PLANNER_FUNCTION", "reingest-planner")
+
+    first = explorer_handler._runtime_reingest()
+    second = explorer_handler._runtime_reingest()
+
+    assert first is second
