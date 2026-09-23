@@ -50,3 +50,9 @@ tools/hl7_dictionary.json
 # Frontend dependencies and build output
 web/node_modules/
 web/dist/
+
+# Track the supported report seeding utility while keeping ad-hoc tools ignored.
+!tools/
+tools/*
+!tools/seed_report.py
+!tools/audit_catalog_vs_export.py
