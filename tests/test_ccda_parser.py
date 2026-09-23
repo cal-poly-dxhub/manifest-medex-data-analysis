@@ -104,7 +104,7 @@ def test_ccda_document_id_uses_bucket_key_and_raw_xml_content() -> None:
     checksum = hashlib.sha256(SYNTHETIC_CCDA).hexdigest()
     expected = hashlib.sha256(f"raw\0document.xml\0{checksum}".encode()).hexdigest()
 
-    assert first["parserVersion"] == "0.2.0"
+    assert first["parserVersion"] == "0.3.0"
     assert first["documentId"] == expected
     assert second["documentId"] == expected
     assert first["rawObject"]["sha256"] == checksum
@@ -140,6 +140,26 @@ def test_ccda_parser_rejects_dtd_entities_and_wrong_root() -> None:
 
     with pytest.raises(ParseError, match="root is not an HL7 ClinicalDocument"):
         parse_ccda_document(b"<NotClinicalDocument/>", SourceReference(bucket="raw", key="bad.xml"))
+
+
+def test_ccda_parser_resolves_customer_section_title_aliases() -> None:
+    payload = b"""<ClinicalDocument xmlns="urn:hl7-org:v3">
+      <component><structuredBody><component><section>
+        <code code="local-allergies" displayName="Allergies"/>
+        <title>Allergies</title>
+        <entry><act><statusCode code="active"/><effectiveTime><low value="20260101"/></effectiveTime></act></entry>
+      </section></component></structuredBody></component>
+    </ClinicalDocument>"""
+
+    document = parse_ccda_document(
+        payload,
+        SourceReference(bucket="raw", key="customer-section.xml"),
+    )
+
+    section = document["CD"]["body"]["allergies-section"]
+    assert section["_present"] is True
+    assert section["entry"]["act"]["statusCode"]["code"] == "active"
+    assert section["entry"]["act"]["effectiveTime"]["low"]["value"] == "20260101"
 
 
 def test_ccda_parser_rejects_excessive_markup(monkeypatch: pytest.MonkeyPatch) -> None:

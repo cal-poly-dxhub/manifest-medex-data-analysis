@@ -12,9 +12,10 @@ from xml.etree.ElementTree import ParseError as XmlParseError
 
 from defusedxml import ElementTree
 from defusedxml.common import DefusedXmlException
+from src.customer_field_catalog import CCDA_SECTION_TITLE_CATALOG
 from src.parser import ParseError, SourceReference
 
-PARSER_VERSION = "0.2.0"
+PARSER_VERSION = "0.3.0"
 INVALID_XML = "Raw object is not a safe, well-formed XML document"
 INVALID_DOCUMENT = "XML root is not an HL7 ClinicalDocument"
 XML_TOO_COMPLEX = "XML document exceeds the configured structural complexity limit"
@@ -156,10 +157,11 @@ def _custodian(custodian: Element | None) -> dict[str, Any] | None:
 def _body(root: Element) -> dict[str, Any]:
     body: dict[str, Any] = {}
     for section in root.findall(".//{*}structuredBody/{*}component/{*}section"):
-        code = _attribute(_child(section, "code"), "code")
-        section_name = _SECTION_NAMES.get(code or "")
+        code_element = _child(section, "code")
+        code = _attribute(code_element, "code")
+        section_name = _resolve_section_name(section, code_element, code)
         if section_name is None:
-            # Unknown sections still count, but do not enter the compatibility projection.
+            # Unknown sections still count, but only customer-observed aliases enter CD.body.
             continue
         projected = _section(section, section_name)
         existing = body.get(section_name)
@@ -183,21 +185,47 @@ def _section(section: Element, section_name: str) -> dict[str, Any]:
 
 
 def _entry(entry: Element, section_name: str) -> dict[str, Any]:
-    if section_name in {"medications-section", "immunizations-section"}:
-        administration = _child(entry, "substanceAdministration")
+    administration = _child(entry, "substanceAdministration")
+    if administration is not None:
         return _compact_dict({"substanceAdministration": _substance_administration(administration)})
-    if section_name in {"results-section", "vitalSigns-section"}:
-        return _compact_dict({"organizer": _organizer(_child(entry, "organizer"))})
-    if section_name == "problem-section":
-        return _compact_dict({"act": _act(_child(entry, "act"))})
-    if section_name == "procedures-section":
-        return _compact_dict({"procedure": _procedure(_child(entry, "procedure"))})
-    if section_name == "socialHistory-section":
-        activity = _child(entry, "act")
-        if activity is None:
-            activity = _child(entry, "observation")
+    organizer = _child(entry, "organizer")
+    if organizer is not None:
+        return _compact_dict({"organizer": _organizer(organizer)})
+    activity = _child(entry, "act")
+    if activity is not None:
         return _compact_dict({"act": _act(activity)})
+    observation = _child(entry, "observation")
+    if observation is not None:
+        # Preserve the established socialHistory-section path used by saved queries.
+        key = "act" if section_name == "socialHistory-section" else "observation"
+        projector = _act if key == "act" else _observation
+        return _compact_dict({key: projector(observation)})
+    procedure = _child(entry, "procedure")
+    if procedure is not None:
+        return _compact_dict({"procedure": _procedure(procedure)})
     return {}
+
+
+def _resolve_section_name(
+    section: Element,
+    code_element: Element | None,
+    code: str | None,
+) -> str | None:
+    canonical = _SECTION_NAMES.get(code or "")
+    if canonical is not None:
+        return canonical
+    candidates = [
+        _text(_child(section, "title")),
+        _attribute(code_element, "displayName"),
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        normalized = re.sub(r"[^a-z0-9]", "", candidate.lower())
+        alias = CCDA_SECTION_TITLE_CATALOG.get(normalized)
+        if alias is not None:
+            return alias
+    return None
 
 
 def _substance_administration(element: Element | None) -> dict[str, Any] | None:

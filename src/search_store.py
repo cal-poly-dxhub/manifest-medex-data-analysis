@@ -9,7 +9,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Protocol
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 BULK_REQUEST_FAILED = "OpenSearch bulk request failed"
 BULK_COUNT_MISMATCH = "OpenSearch bulk response item count did not match request"
@@ -39,8 +39,12 @@ _ALLOWED_BACKEND_ERROR_TYPES = frozenset(
     }
 )
 
+# The customer-backed projection can produce ~6,700 distinct object and leaf paths.
+INDEX_TOTAL_FIELDS_LIMIT = 10_000
+
 # HL7 values are exact codes/identifiers, so dynamic strings remain keywords.
 HL7_INDEX_MAPPING: dict[str, Any] = {
+    "settings": {"index.mapping.total_fields.limit": INDEX_TOTAL_FIELDS_LIMIT},
     "mappings": {
         "dynamic_templates": [
             {
@@ -68,6 +72,7 @@ HL7_INDEX_MAPPING: dict[str, Any] = {
 
 # CCDA supports free-text search while retaining keyword subfields for exact dashboard rules.
 CCDA_INDEX_MAPPING: dict[str, Any] = {
+    "settings": {"index.mapping.total_fields.limit": INDEX_TOTAL_FIELDS_LIMIT},
     "mappings": {
         "dynamic_templates": [
             {
@@ -264,6 +269,30 @@ def _safe_backend_error_type(value: object) -> str | None:
     return normalized if normalized in _ALLOWED_BACKEND_ERROR_TYPES else "other"
 
 
+def _canonicalize_path(path: str) -> str:
+    """Percent-encode a request path's query string into SigV4 canonical form.
+
+    botocore's ``SigV4Auth`` signs the URL's query string verbatim, while the service
+    side re-encodes it per the SigV4 canonicalization rules (RFC 3986: everything
+    outside unreserved characters becomes percent-encoded, so ``*`` -> ``%2A``). A raw
+    query value such as ``fields=*`` therefore produces a signature the backend
+    rejects. Encoding the query string before signing makes the signed bytes and the
+    wire bytes identical, so both sides canonicalize to the same string.
+    """
+    raw_path, separator, query = path.partition("?")
+    if not separator:
+        return path
+    encoded_pairs = []
+    for pair in query.split("&"):
+        key, key_separator, value = pair.partition("=")
+        encoded_key = quote(unquote(key), safe="-_.~")
+        if key_separator:
+            encoded_pairs.append(f"{encoded_key}={quote(unquote(value), safe='-_.~')}")
+        else:
+            encoded_pairs.append(encoded_key)
+    return f"{raw_path}?{'&'.join(encoded_pairs)}"
+
+
 class SignedOpenSearchTransport:
     """Small SigV4 HTTP transport using botocore included in the Lambda runtime."""
 
@@ -288,7 +317,7 @@ class SignedOpenSearchTransport:
         from botocore.awsrequest import AWSRequest  # type: ignore[import-not-found]
         from botocore.session import Session  # type: ignore[import-not-found]
 
-        url = f"{self.endpoint}{path}"
+        url = f"{self.endpoint}{_canonicalize_path(path)}"
         # SigV4 requires the digest of the exact bytes sent on the wire.
         headers = {
             "Content-Type": "application/x-ndjson" if path == "/_bulk" else "application/json",

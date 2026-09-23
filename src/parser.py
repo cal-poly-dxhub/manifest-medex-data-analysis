@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import re
 from collections import Counter
-from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -13,8 +12,9 @@ from typing import Any
 import hl7
 from hl7.containers import Message, Segment
 from hl7.exceptions import HL7Exception
+from src.customer_field_catalog import HL7_DATATYPE_CATALOG, HL7_FIELD_CATALOG
 
-PARSER_VERSION = "0.4.0"
+PARSER_VERSION = "0.5.0"
 INVALID_UTF8 = "Raw object is not valid UTF-8"
 CONTENT_BEFORE_MSH = "Content appeared before the first MSH segment"
 MISSING_MSH = "No HL7 MSH segment was found"
@@ -47,12 +47,14 @@ class _SegmentView:
     escape_character: str
     subcomponent_separator: str
 
-    def field(self, number: int) -> str:
+    def raw_field(self, number: int) -> str:
         try:
-            raw = str(self.container[number])
+            return str(self.container[number])
         except IndexError:
             return ""
-        return _decode_escapes(raw, self)
+
+    def field(self, number: int) -> str:
+        return _decode_escapes(self.raw_field(number), self)
 
     def component(self, number: int, component: int) -> str:
         try:
@@ -229,78 +231,64 @@ def _parse_with_library(message: str) -> Message:
 
 
 def _legacy_projection(segment: _SegmentView) -> dict[str, Any] | None:
-    """Project fields used by supplied dashboard queries without claiming Prism parity."""
-    mapping_factories: dict[str, Callable[[], dict[str, Any]]] = {
-        "MSH": lambda: {
-            "MSH_1_Field_Separator": segment.field(1),
-            "MSH_4_Sending_Facility": {
-                "HD_1": segment.component(4, 1),
-                "HD_2": segment.component(4, 2),
-            },
-            "MSH_7_Date-Time_of_Message": segment.field(7),
-            "MSH_9_Message_Type": {
-                "MSG_1": segment.component(9, 1),
-                "MSG_2": segment.component(9, 2),
-            },
-            "MSH_10_Message_Control_ID": segment.field(10),
-        },
-        "PID": lambda: {
-            "PID_3_Patient_Identifier_List": {"CX_1": segment.component(3, 1)},
-            "PID_5_Patient_Name": {
-                "XPN_1": {"FN_1": segment.component(5, 1)},
-                "XPN_2": segment.component(5, 2),
-            },
-            "PID_7_Date-Time_of_Birth": segment.field(7),
-            "PID_8_Administrative_Sex": segment.field(8),
-        },
-        "NK1": lambda: {
-            # Referenced by the supplied ADT report query rows (next-of-kin relationship).
-            "NK1_3_Relationship": {
-                "CWE_1": segment.component(3, 1),
-                "CWE_2": segment.component(3, 2),
-            }
-        },
-        "PV1": lambda: {
-            "PV1_2_Patient_Class": segment.field(2),
-            "PV1_7_Attending_Doctor": {"XCN_1": segment.component(7, 1)},
-            "PV1_8_Referring_Doctor": {"XCN_1": segment.component(8, 1)},
-            "PV1_9_Consulting_Doctor": {"XCN_1": segment.component(9, 1)},
-            "PV1_17_Admitting_Doctor": {"XCN_1": segment.component(17, 1)},
-            "PV1_44_Admit_Date-Time": segment.field(44),
-            "PV1_45_Discharge_Date-Time": segment.field(45),
-        },
-        "PV2": lambda: {
-            "PV2_3_Admit_Reason": {
-                "CWE_1": segment.component(3, 1),
-                "CWE_2": segment.component(3, 2),
-            }
-        },
-        "OBR": lambda: {
-            "OBR_4_Universal_Service_Identifier": {
-                "CWE_1": segment.component(4, 1),
-                "CWE_3": segment.component(4, 3),
-            },
-            "OBR_22_Results_Rpt-Status_Chng_-_Date-Time_": segment.field(22),
-            "OBR_24_Diagnostic_Serv_Sect_ID": segment.field(24),
-            "OBR_25_Result_Status_": segment.field(25),
-        },
-        "OBX": lambda: {
-            "OBX_1_Set_ID_-_OBX": segment.field(1),
-            "OBX_2_Value_Type": segment.field(2),
-            "OBX_3_Observation_Identifier": {
-                "CWE_1": segment.component(3, 1),
-                "CWE_3": segment.component(3, 3),
-            },
-            "OBX_11_Observation_Result_Status": segment.field(11),
-        },
-    }
-    factory = mapping_factories.get(segment.name)
-    if factory is None:
+    """Project every standards-backed field whose exact label occurs in the customer export."""
+    field_catalog = HL7_FIELD_CATALOG.get(segment.name)
+    if field_catalog is None:
         return None
-    mapped = factory()
-    # Object fields are not searchable for existence, so each projected segment gets a marker.
-    mapped["_present"] = True
+    mapped: dict[str, Any] = {"_present": True}
+    for field_number, (label, datatype) in field_catalog.items():
+        value = _project_field(segment, field_number, datatype)
+        if value is not None and value != "" and value != () and value != []:
+            mapped[label] = value
     return _without_empty_values(mapped)
+
+
+def _project_field(segment: _SegmentView, field_number: int, datatype: str | None) -> Any:
+    raw = segment.raw_field(field_number)
+    if not raw:
+        return None
+    if datatype is None or datatype not in HL7_DATATYPE_CATALOG:
+        return _decode_escapes(raw, segment)
+    repetitions = raw.split(segment.repetition_separator)
+    projected = [
+        _project_datatype(repetition, datatype, segment, use_subcomponents=False)
+        for repetition in repetitions
+    ]
+    values = [value for value in projected if value]
+    if not values:
+        return None
+    return values[0] if len(values) == 1 else values
+
+
+def _project_datatype(
+    raw: str,
+    datatype: str,
+    segment: _SegmentView,
+    *,
+    use_subcomponents: bool,
+) -> dict[str, Any]:
+    separator = segment.subcomponent_separator if use_subcomponents else segment.component_separator
+    values = raw.split(separator)
+    projected: dict[str, Any] = {}
+    for index, (component_name, nested_datatype) in enumerate(
+        HL7_DATATYPE_CATALOG.get(datatype, ()),
+        start=1,
+    ):
+        if index > len(values) or not values[index - 1]:
+            continue
+        component_value = values[index - 1]
+        if nested_datatype in HL7_DATATYPE_CATALOG:
+            nested = _project_datatype(
+                component_value,
+                nested_datatype,
+                segment,
+                use_subcomponents=True,
+            )
+            if nested:
+                projected[component_name] = nested
+        else:
+            projected[component_name] = _decode_escapes(component_value, segment)
+    return projected
 
 
 def _without_empty_values(value: dict[str, Any]) -> dict[str, Any]:

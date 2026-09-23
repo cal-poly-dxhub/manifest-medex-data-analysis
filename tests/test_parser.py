@@ -35,7 +35,11 @@ def test_split_and_parse_batch_with_legacy_query_paths() -> None:
     assert oru["participantId"] == "FACILITY_A"
     assert oru["messageTime"] == "2026-08-10T19:30:45Z"
     assert oru["segmentCounts"]["OBX"] == 2
-    assert oru["ROOT"]["MSH"]["MSH_9_Message_Type"] == {"MSG_1": "ORU", "MSG_2": "R01"}
+    assert oru["ROOT"]["MSH"]["MSH_9_Message_Type"] == {
+        "MSG_1": "ORU",
+        "MSG_2": "R01",
+        "MSG_3": "ORU_R01",
+    }
     assert oru["ROOT"]["PID"]["PID_3_Patient_Identifier_List"]["CX_1"] == "PATIENT-1"
     assert oru["ROOT"]["PV1"]["PV1_7_Attending_Doctor"]["XCN_1"] == "1234567890"
     assert oru["ROOT"]["PV2"]["PV2_3_Admit_Reason"]["CWE_2"] == "Synthetic reason"
@@ -135,11 +139,14 @@ def test_library_parsing_handles_custom_delimiters_and_unknown_segments() -> Non
 
     document = parse_hl7_file(payload.encode(), SourceReference(bucket="raw", key="custom.hl7"))[0]
 
-    assert document["parserVersion"] == "0.4.0"
+    assert document["parserVersion"] == "0.5.0"
     assert document["sourceFacilityId"] == "FACILITY"
     assert document["messageType"] == "ORU"
     assert document["triggerEvent"] == "R01"
-    assert document["ROOT"]["PID"]["PID_3_Patient_Identifier_List"]["CX_1"] == "FIRST"
+    assert document["ROOT"]["PID"]["PID_3_Patient_Identifier_List"] == [
+        {"CX_1": "FIRST"},
+        {"CX_1": "SECOND"},
+    ]
     assert document["ROOT"]["PID"]["PID_5_Patient_Name"]["XPN_1"]["FN_1"] == ("Family$Suffix")
     assert document["segmentCounts"]["Z99"] == 1
 
@@ -167,11 +174,65 @@ def test_report_query_fields_absent_from_the_dashboard_queries_are_projected() -
     assert document["ROOT"]["NK1"]["NK1_3_Relationship"] == {
         "CWE_1": "SPO",
         "CWE_2": "Spouse",
+        "CWE_3": "HL70063",
     }
 
 
+def test_customer_catalog_projects_additional_standard_segments_and_fields() -> None:
+    payload = (
+        "MSH|^~\\&|SYNTH|FACILITY|RECEIVER|DEST|20260810123045||ADT^A08|MSG-1|P|2.6\r"
+        "EVN|A08|20260810123100|||1234567890^Operator^One|20260810123000|FACILITY^OID^ISO\r"
+        "PID|1|LEGACY-ID|PATIENT-1^^^FACILITY^MR||Example^Synthetic||20000101|F||"
+        "2106-3^White^HL70005|1 TEST ST^^TOWN^CA^90001\r"
+        "AL1|1|DA|PEN^Penicillin^RXNORM|SV^Severe^HL70128|Hives|20260101\r"
+        "DG1|1|ICD10|A00^Cholera^I10|Example diagnosis|20260102|F\r"
+        "ORC|NW|PLACER^FACILITY|FILLER^FACILITY||SC||||20260810123200|||1234567890^Doctor^One\r"
+    )
+
+    document = parse_hl7_file(
+        payload.encode(),
+        SourceReference(bucket="raw", key="customer-fields.hl7"),
+    )[0]
+
+    root = document["ROOT"]
+    assert root["MSH"]["MSH_12_Version_ID"]["VID_1"] == "2.6"
+    assert root["EVN"]["EVN_2_Recorded_Date-Time"] == "20260810123100"
+    assert root["PID"]["PID_10_Race"]["CWE_1"] == "2106-3"
+    assert root["PID"]["PID_11_Patient_Address"]["XAD_3"] == "TOWN"
+    assert root["AL1"]["AL1_3_Allergen_Code-Mnemonic-Description"]["CWE_2"] == ("Penicillin")
+    assert root["DG1"]["DG1_3_Diagnosis_Code_-_DG1"]["CWE_1"] == "A00"
+    assert root["ORC"]["ORC_2_Placer_Order_Number"]["EI_1"] == "PLACER"
+    assert root["ORC"]["ORC_12_Ordering_Provider"]["XCN_1"] == "1234567890"
+
+
+def test_customer_catalog_projects_deprecated_dg1_8_and_pr1_11_fields() -> None:
+    """DG1-8 (CNE) and PR1-11 (XCN) are deprecated-but-observed customer export fields."""
+    payload = (
+        "MSH|^~\\&|SYNTH|FACILITY|RECEIVER|DEST|20260810123045||ADT^A08|MSG-1|P|2.6\r"
+        "DG1|1|ICD10|A00^Cholera^I10|Example diagnosis|20260102|F||"
+        "470^Major Joint Replacement^MS-DRG\r"
+        "PR1|1|C4|47.0^Appendectomy^I9|Appendectomy|20260103||||||"
+        "9876543210^Surgeon^Jane\r"
+    )
+
+    document = parse_hl7_file(
+        payload.encode(),
+        SourceReference(bucket="raw", key="dg1-8-pr1-11.hl7"),
+    )[0]
+
+    root = document["ROOT"]
+    assert root["DG1"]["DG1_8_Diagnostic_Related_Group"] == {
+        "CNE_1": "470",
+        "CNE_2": "Major Joint Replacement",
+        "CNE_3": "MS-DRG",
+    }
+    assert root["PR1"]["PR1_11_Surgeon"]["XCN_1"] == "9876543210"
+    assert root["PR1"]["PR1_11_Surgeon"]["XCN_2"] == {"FN_1": "Surgeon"}
+    assert root["PR1"]["PR1_11_Surgeon"]["XCN_3"] == "Jane"
+
+
 def test_dynamic_segment_projection_is_not_emitted() -> None:
-    """v1 indexes only the curated ROOT projection; no second projection is stored."""
+    """The customer-backed ROOT projection is emitted without a duplicate SEGMENTS tree."""
     document = parse_hl7_file(
         SYNTHETIC_BATCH.encode(),
         SourceReference(bucket="raw", key="synthetic.hl7"),

@@ -43,6 +43,22 @@ def _document(document_id: str = "doc-1", source_format: str = "hl7-v2") -> dict
     }
 
 
+def test_canonicalize_path_encodes_query_values_for_sigv4() -> None:
+    from src.search_store import _canonicalize_path
+
+    # "*" must become %2A so the signed bytes match the service-side canonical form.
+    assert (
+        _canonicalize_path("/hl7-messages-v1/_field_caps?fields=*")
+        == "/hl7-messages-v1/_field_caps?fields=%2A"
+    )
+    # Paths without query strings pass through untouched.
+    assert _canonicalize_path("/_bulk") == "/_bulk"
+    # Already-encoded values stay stable (idempotent).
+    assert _canonicalize_path("/i/_field_caps?fields=%2A") == "/i/_field_caps?fields=%2A"
+    # Multiple parameters are each encoded.
+    assert _canonicalize_path("/i/_x?a=1&b=*") == "/i/_x?a=1&b=%2A"
+
+
 def test_index_documents_creates_index_and_uses_deterministic_ids() -> None:
     transport = FakeTransport(
         [
@@ -62,7 +78,7 @@ def test_index_documents_creates_index_and_uses_deterministic_ids() -> None:
     mapping_body = transport.calls[1][2]
     assert mapping_body is not None
     mapping = json.loads(mapping_body)
-    assert "settings" not in mapping
+    assert mapping["settings"] == {"index.mapping.total_fields.limit": 10_000}
     assert mapping["mappings"]["properties"]["messageTime"] == {"type": "date"}
     bulk_body = transport.calls[2][2]
     assert bulk_body is not None
@@ -83,7 +99,9 @@ def test_ccda_index_has_text_and_keyword_mapping() -> None:
     assert transport.calls[0][:2] == ("HEAD", "/ccda-documents-v1")
     body = transport.calls[1][2]
     assert body is not None
-    mapping = json.loads(body)["mappings"]
+    payload = json.loads(body)
+    assert payload["settings"] == {"index.mapping.total_fields.limit": 10_000}
+    mapping = payload["mappings"]
     dynamic = mapping["dynamic_templates"][0]["strings_with_keyword"]["mapping"]
     assert dynamic["type"] == "text"
     assert dynamic["fields"]["keyword"] == {"type": "keyword", "ignore_above": 2048}
