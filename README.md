@@ -681,18 +681,51 @@ Correct the context values rather than bypassing validation.
 
 # Support
 
-Use the repository's approved issue or code-review channel for defects and feature requests. Include reproducible synthetic inputs, expected behavior, validation output, and the affected environment. Never attach customer query files, PHI, credentials, account-specific secrets, raw clinical payloads, or identifying logs.
-
-For deployment incidents, engage the service owner and the organization's security/operations process rather than posting sensitive details publicly.
+For any queries or issues, please contact:
+- Darren Kraker, Sr. Solutions Architect - dkraker@amazon.com
+- Shrey Shah, Student Developer - sshah84@calpoly.edu
 
 # License
 
-This repository does not currently include a `LICENSE` file. Do not assume permission to copy, redistribute, or use the code outside the terms supplied by the repository owner. Add an organization-approved license before publishing the project as open source.
+This project is licensed under the [MIT License](./LICENSE).
+
+```plaintext
+MIT License
+
+Copyright (c) 2026 Cal Poly DXHub
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+---
+
+# Collaboration
+
+Thanks for your interest in our solution. Having specific examples of replication and usage allows us to continue to grow and scale our work. If you clone or use this repository, kindly shoot us a quick email to let us know you are interested in this work!
 
 # Disclaimers
 
-Customers and users are responsible for making their own independent assessment of this implementation, including its security, cost, reliability, regulatory suitability, and fitness for a particular purpose.
+**Customers are responsible for making their own independent assessment of the information in this document.**
 
-This project is provided for informational and prototyping purposes. AWS services and practices can change without notice. The implementation creates no commitments or assurances from AWS or its affiliates, suppliers, or licensors. AWS products and services are governed by their applicable agreements.
+**This document:**
+(a) is for informational purposes only, (b) references AWS product offerings and practices, which are subject to change without notice, (c) does not create any commitments or assurances from AWS and its affiliates, suppliers or licensors. AWS products or services are provided "as is" without warranties, representations, or conditions of any kind, whether express or implied. The responsibilities and liabilities of AWS to its customers are controlled by AWS agreements, and this document is not part of, nor does it modify, any agreement between AWS and its customers, and (d) is not to be considered a recommendation or viewpoint of AWS.
 
-Treat all code and assets as provided as-is, without warranties or representations of any kind. They are not production-ready by default and may contain deliberate prototype tradeoffs. Test, secure, monitor, operate, and optimize the system independently before using it with production, critical, regulated, or clinical data.
+Additionally, you are solely responsible for testing, security and optimizing all code and assets on GitHub repo, and all such code and assets should be considered: (a) as-is and without warranties or representations of any kind, (b) not suitable for production environments, or on production or other critical data, and (c) to include shortcuts in order to support rapid prototyping such as, but not limited to, relaxed authentication and authorization and a lack of strict adherence to security best practices.
+
+All work produced is open source. More information can be found in the GitHub repo.
