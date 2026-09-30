@@ -459,15 +459,18 @@ uv run cdk synth
 
 ### Recommended: scripted deployment
 
+For a step-by-step first deployment (prerequisites → deploy → first user → load data → verify), see **[DEPLOYMENT.md](DEPLOYMENT.md)**. The summary below covers the same script.
+
 `deploy.sh` performs the whole sequence — credential check, dependency install, validation, CDK bootstrap (only when the account/region needs it), and deploy — from `config.yaml`, and resolves the OpenSearch Dashboards role from your current credentials so you do not need to construct an ARN by hand.
 
 ```bash
+cp config.yaml.sample config.yaml
 # edit config.yaml: set account and region; review the optional keys
 ./deploy.sh --diff      # optional: preview the changes without deploying
 ./deploy.sh             # deploy
 ```
 
-The config keys map to the CDK context documented below. The script refuses to run while `account` is still the placeholder value, or if the credential's account does not match `account`. On success it prints the frontend URL, Cognito pool identifiers, raw bucket name, and Dashboards URL, followed by first-use steps; the generated `cdk-outputs.json` is git-ignored.
+`config.yaml.sample` is the tracked template; `config.yaml` is git-ignored so account-specific values stay out of the repository. The config keys map to the CDK context documented below. The script refuses to run while `account` is still the `<account-number>` placeholder, or if the credential's account does not match `account`. On success it prints the frontend URL, Cognito pool identifiers, raw bucket name, and Dashboards URL, followed by first-use steps; the generated `cdk-outputs.json` is also git-ignored.
 
 When `enable_public_dashboard` is `true` and `dashboard_principal_arn` is blank, the current credentials must be an assumed role (for example an SSO session); otherwise set `dashboard_principal_arn` explicitly.
 
@@ -479,7 +482,7 @@ Bootstrap each target account and region once:
 
 ```bash
 uv run cdk bootstrap \
-  -c account=111122223333 \
+  -c account=<account-number> \
   -c region=us-west-2 \
   --profile <approved-aws-profile>
 ```
@@ -489,7 +492,7 @@ Review the proposed development changes:
 ```bash
 uv run cdk diff \
   -c environment=dev \
-  -c account=111122223333 \
+  -c account=<account-number> \
   -c region=us-west-2 \
   --profile <approved-aws-profile>
 ```
@@ -499,7 +502,7 @@ After review and explicit approval, deploy:
 ```bash
 uv run cdk deploy \
   -c environment=dev \
-  -c account=111122223333 \
+  -c account=<account-number> \
   -c region=us-west-2 \
   --profile <approved-aws-profile>
 ```
@@ -513,10 +516,10 @@ The collection API and Dashboards are private by default, so a fresh deployment 
 ```bash
 uv run cdk deploy \
   -c environment=dev \
-  -c account=111122223333 \
+  -c account=<account-number> \
   -c region=us-west-2 \
   -c enable_public_dashboard=true \
-  -c dashboard_principal_arn=arn:aws:iam::111122223333:role/<role-name> \
+  -c dashboard_principal_arn=arn:aws:iam::<account-number>:role/<role-name> \
   --profile <approved-aws-profile>
 ```
 
@@ -533,8 +536,8 @@ Notes:
   ```json
   {
       "UserId": "AROA...:jsmith",
-      "Account": "111122223333",
-      "Arn": "arn:aws:sts::111122223333:assumed-role/AWSReservedSSO_AdministratorAccess_0123456789abcdef/jsmith"
+      "Account": "<account-number>",
+      "Arn": "arn:aws:sts::<account-number>:assumed-role/AWSReservedSSO_AdministratorAccess_0123456789abcdef/jsmith"
   }
   ```
 
@@ -543,10 +546,10 @@ Notes:
   - The `Arn` shown is a *session* ARN (`sts` / `assumed-role`); the flag needs the *role* ARN (`iam` / `role`). For an IAM Identity Center (SSO) role the path is `aws-reserved/sso.amazonaws.com/<region>/`, so the value becomes:
 
     ```text
-    arn:aws:iam::111122223333:role/aws-reserved/sso.amazonaws.com/us-west-2/AWSReservedSSO_AdministratorAccess_0123456789abcdef
+    arn:aws:iam::<account-number>:role/aws-reserved/sso.amazonaws.com/us-west-2/AWSReservedSSO_AdministratorAccess_0123456789abcdef
     ```
 
-    For a plain IAM role (not SSO) it is simply `arn:aws:iam::111122223333:role/<role-name>`.
+    For a plain IAM role (not SSO) it is simply `arn:aws:iam::<account-number>:role/<role-name>`.
 
   To copy the exact role ARN rather than construct it:
 
@@ -658,8 +661,24 @@ After uploading safe synthetic inputs:
 
 After an approved deployment:
 
-1. Read the `FrontendDistributionDomainName`, `UserPoolId`, `UserPoolClientId`, and `UserPoolHostedUiDomain` stack outputs.
-2. Create users through an approved administrative workflow or configure customer-IdP federation; self-signup is intentionally unavailable.
+1. Read the `FrontendDistributionDomainName`, `UserPoolId`, `UserPoolClientId`, and `UserPoolHostedUiDomain` stack outputs (`deploy.sh` prints them; they are also in `cdk-outputs.json`).
+2. Create at least one user. Self-signup is intentionally disabled, so nobody can sign in until an administrator creates an account. The username is the user's email address.
+
+   ```bash
+   aws cognito-idp admin-create-user \
+     --user-pool-id <UserPoolId> \
+     --username reviewer@example.com \
+     --user-attributes Name=email,Value=reviewer@example.com Name=email_verified,Value=true \
+     --message-action SUPPRESS
+
+   aws cognito-idp admin-set-user-password \
+     --user-pool-id <UserPoolId> \
+     --username reviewer@example.com \
+     --password '<TheirPassword123!>' \
+     --permanent
+   ```
+
+   `--message-action SUPPRESS` skips the invitation email and `--permanent` lets the user sign in immediately; this is the reliable path because the pool uses Cognito's default, rate-limited email sender. Passwords must be at least 14 characters with upper- and lower-case letters, a number, and a symbol. MFA (authenticator app) is available but optional. Console alternative: Amazon Cognito → User pools → `<project_name>-<environment>-explorer` → Users → Create user. See `DEPLOYMENT.md` for the full first-deployment walkthrough. For production, federate the pool to the organization's identity provider (SAML/OIDC) instead of managing local users.
 3. Open `https://<FrontendDistributionDomainName>/`. The app redirects unauthenticated users to Cognito Hosted UI and returns to the distribution after Authorization Code + PKCE completes.
 4. Apply ingestion-time/source-format filters, page using the opaque keyset cursor, select one document, and open only the required raw or parsed body tab.
 5. If SQL access is required, open **SQL query**, enter one statement, and use **Run query**. The loading circle remains visible until execution finishes. Saved queries stay only in that browser's local storage.

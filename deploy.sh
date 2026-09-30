@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Deploy the Manifest MedEx data-quality stack from a single config file.
 #
-#   edit config.yaml (account, region)   # then:
+#   cp config.yaml.sample config.yaml     # then edit account, region
 #   ./deploy.sh                          # deploy
 #   ./deploy.sh --diff                   # preview changes only
 #   ./deploy.sh --config other.yaml      # alternate config file
@@ -55,7 +55,7 @@ is_true() { [[ "$(echo "${1:-}" | tr '[:upper:]' '[:lower:]')" =~ ^(true|yes|1)$
 
 # ---- preflight ---------------------------------------------------------------------
 
-[[ -f "$CONFIG_FILE" ]] || die "Config file '$CONFIG_FILE' not found."
+[[ -f "$CONFIG_FILE" ]] || die "Config file '$CONFIG_FILE' not found. Run: cp config.yaml.sample config.yaml  and edit it."
 need python3; need uv; need node; need npm; need aws
 command -v cdk >/dev/null 2>&1 || info "cdk CLI not on PATH; using 'uv run cdk' (bundled)."
 
@@ -68,7 +68,7 @@ ENABLE_DASH="$(cfg enable_public_dashboard)"
 DASH_ARN="$(cfg dashboard_principal_arn)"
 DO_VALIDATE="$(cfg validate)"
 
-[[ "$ACCOUNT" != "111122223333" ]] || die "'account' in $CONFIG_FILE is still the placeholder value. Set it to your AWS account ID."
+[[ "$ACCOUNT" != "<account-number>" ]] || die "'account' in $CONFIG_FILE is still the placeholder value. Set it to your AWS account ID."
 [[ "$ACCOUNT" =~ ^[0-9]{12}$ ]] || die "'account' must be a 12-digit AWS account ID (got '${ACCOUNT:-<empty>}')."
 [[ "$REGION" =~ ^[a-z]{2}(-gov)?-[a-z]+-[0-9]$ ]] || die "'region' looks invalid (got '${REGION:-<empty>}')."
 
@@ -179,9 +179,13 @@ fi
 
 cat <<EOF
 
-Next steps:
-  1. Create a Cognito user in pool above (Console → Cognito → User pools → Users → Create user).
+Next steps (full walkthrough: DEPLOYMENT.md):
+  1. Create the first user (self-signup is disabled):
+       aws cognito-idp admin-create-user --user-pool-id <UserPoolId> --username you@example.com \
+         --user-attributes Name=email,Value=you@example.com Name=email_verified,Value=true --message-action SUPPRESS
+       aws cognito-idp admin-set-user-password --user-pool-id <UserPoolId> --username you@example.com \
+         --password '<14+ chars, mixed case, number, symbol>' --permanent
   2. Open https://<FrontendDistributionDomainName> and sign in.
   3. Upload a test file:  aws s3 cp sample.hl7 s3://<RawBucketName>/incoming/hl7/sample.hl7
-  4. See README → "Upload inputs" for the bulk-load key layout and → "Verify processing".
+  4. Bulk-load layout and verification steps: README.md → "Upload inputs" / "Verify processing".
 EOF
