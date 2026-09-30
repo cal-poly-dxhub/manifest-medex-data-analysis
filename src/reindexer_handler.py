@@ -3,8 +3,10 @@
 The reindexer reads a previously parsed document from the parsed S3 zone and
 writes it back into OpenSearch without re-parsing raw source. It never imports
 the format parsers: the parsed object is treated as an opaque, already-valid
-document and indexed unchanged so its ``ingestTime`` and every other field are
-preserved exactly as originally produced.
+document. Every field is indexed as originally produced except ``ingestTime``,
+which is set to the reingestion time (customer decision, 2026-09-23); the
+original value is retained as ``originalIngestTime``. The S3 parsed object is
+never modified.
 
 Job progress is tracked with atomic DynamoDB counters so many concurrent Lambda
 invocations converge on a single completion transition.
@@ -186,7 +188,14 @@ class Reindexer:
             raise
         document = _load_document(payload, message)
         stale = _is_stale_parser(document, message.source_format)
-        # Index the parsed document exactly as stored so ingestTime is preserved.
+        # Customer decision (2026-09-23): a reingested document shows the time it was
+        # reingested, not its original arrival. Keep the original for provenance so the
+        # S3 parsed object remains the unchanged source of truth.
+        original_ingest_time = document.get("ingestTime")
+        if original_ingest_time is not None:
+            document["originalIngestTime"] = original_ingest_time
+        # Match the parsers' Z-suffixed ISO format so the date mapping stays uniform.
+        document["ingestTime"] = _utc_now_iso().replace("+00:00", "Z")
         index_documents([document], self.transport)
         counters = self.job_store.record_reindexed(message.job_id, stale=stale)
         self._finalize(message.job_id, counters)

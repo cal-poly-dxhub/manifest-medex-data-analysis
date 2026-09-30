@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import json
 import logging
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -19,8 +20,8 @@ from src.reindexer_handler import (
 )
 
 PARSED_BUCKET = "parsed-bucket"
-HL7_VERSION = "0.5.0"
-CCDA_VERSION = "0.3.0"
+HL7_VERSION = "1.0.0"
+CCDA_VERSION = "1.0.0"
 
 
 class FakeClientError(Exception):
@@ -212,7 +213,7 @@ def _parsed_bucket_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CCDA_PARSER_VERSION", CCDA_VERSION)
 
 
-def test_happy_path_indexes_document_unchanged_and_counts_reindexed() -> None:
+def test_happy_path_restamps_ingest_time_and_counts_reindexed() -> None:
     document = _parsed_doc()
     s3 = FakeS3(json.dumps(document).encode())
     transport = _ok_transport(1)
@@ -225,8 +226,31 @@ def test_happy_path_indexes_document_unchanged_and_counts_reindexed() -> None:
     assert store.reindexed_calls == [("job-1", False)]
     assert store.missing_calls == []
     indexed = _indexed_documents(transport)
-    assert indexed == [document]
-    assert indexed[0]["ingestTime"] == "2026-08-10T19:00:00Z"
+    assert len(indexed) == 1
+    restored = indexed[0]
+    # Customer decision: a reingested document reports the reingestion time as its
+    # ingestTime, while the original arrival time is retained for provenance.
+    assert restored["originalIngestTime"] == "2026-08-10T19:00:00Z"
+    assert restored["ingestTime"] != "2026-08-10T19:00:00Z"
+    assert restored["ingestTime"].endswith("Z")
+    datetime.fromisoformat(restored["ingestTime"].replace("Z", "+00:00"))
+    # Every other field is indexed exactly as stored in the parsed zone.
+    for key, value in document.items():
+        if key != "ingestTime":
+            assert restored[key] == value
+
+
+def test_reingested_document_without_ingest_time_gets_one() -> None:
+    document = _parsed_doc()
+    del document["ingestTime"]
+    s3 = FakeS3(json.dumps(document).encode())
+    transport = _ok_transport(1)
+
+    Reindexer(s3, transport, FakeJobStore()).process_batch(_event(_record()))
+
+    restored = _indexed_documents(transport)[0]
+    assert "originalIngestTime" not in restored
+    assert restored["ingestTime"].endswith("Z")
 
 
 def test_stale_parser_version_counts_stale_but_still_indexes() -> None:
@@ -240,7 +264,13 @@ def test_stale_parser_version_counts_stale_but_still_indexes() -> None:
     assert result == {"batchItemFailures": []}
     assert store.reindexed_calls == [("job-1", True)]
     assert store.counters["reindexedStaleParser"] == 1
-    assert _indexed_documents(transport) == [document]
+    restored = _indexed_documents(transport)[0]
+    # Stale documents are still indexed as stored, apart from the ingestTime restamp.
+    assert restored["parserVersion"] == "0.4.0"
+    assert restored["originalIngestTime"] == document["ingestTime"]
+    assert {k: v for k, v in restored.items() if k not in ("ingestTime", "originalIngestTime")} == {
+        k: v for k, v in document.items() if k != "ingestTime"
+    }
 
 
 @pytest.mark.parametrize(

@@ -155,8 +155,9 @@ export function ReingestConfirmDialog({
           ) : (
             <>
               <p className="reingest-confirm__message">
-                This will reingest {count} documents as originally parsed. Documents from
-                older parser versions are restored unchanged.
+                This will reingest {count} documents as originally parsed, stamped with the
+                current time as their ingest time. Documents from older parser versions are
+                restored unchanged.
               </p>
               {empty ? (
                 <p className="reingest-confirm__hint" role="alert">
