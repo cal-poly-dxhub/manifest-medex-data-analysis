@@ -270,14 +270,16 @@ def test_aurora_is_one_private_serverless_v2_writer_with_data_api_and_retention(
 def test_private_endpoints_allow_https_only_from_ingestion_security_group() -> None:
     _, _, template = build_stack()
     endpoints = template.find_resources("AWS::EC2::VPCEndpoint")
-    # S3 and DynamoDB gateway endpoints plus the RDS Data API and Lambda interface endpoints.
-    assert len(endpoints) == 4
+    # S3 and DynamoDB gateway endpoints plus the RDS Data API, Lambda, and SQS interface
+    # endpoints. SQS is required because the reingestion planner sends to the reindex
+    # queue from the isolated subnets (every other function is queue-invoked).
+    assert len(endpoints) == 5
     interface_endpoints = [
         endpoint
         for endpoint in endpoints.values()
         if endpoint["Properties"]["VpcEndpointType"] == "Interface"
     ]
-    assert len(interface_endpoints) == 2
+    assert len(interface_endpoints) == 3
     interface_endpoint = next(
         endpoint for endpoint in interface_endpoints if ".rds-data" in json.dumps(endpoint)
     )
@@ -296,8 +298,32 @@ def test_private_endpoints_allow_https_only_from_ingestion_security_group() -> N
     )
     assert lambda_endpoint["Properties"]["PrivateDnsEnabled"] is True
 
+    sqs_endpoint = next(
+        endpoint for endpoint in interface_endpoints if ".sqs" in json.dumps(endpoint)
+    )
+    sqs_json = json.dumps(sqs_endpoint)
+    assert sqs_endpoint["Properties"]["PrivateDnsEnabled"] is True
+    assert len(sqs_endpoint["Properties"]["SubnetIds"]) == 2
+    # Least privilege: only the planner may send, and only to the reindex queue.
+    assert "sqs:SendMessage" in sqs_json
+    assert "ReingestPlannerRole" in sqs_json
+    assert "ReindexQueue" in sqs_json
+    assert "Hl7IngestionRole" not in sqs_json
+    assert "sqs:ReceiveMessage" not in sqs_json
+
     ingress_rules = template.find_resources("AWS::EC2::SecurityGroupIngress")
-    assert len(ingress_rules) == 8
+    assert len(ingress_rules) == 9
+    # The SQS endpoint admits only the reingestion planner; ingestion Lambdas are
+    # queue-invoked and must not gain an outbound SQS path they do not need.
+    sqs_ingress = [
+        ingress
+        for ingress in ingress_rules.values()
+        if "SqsEndpointSecurityGroup" in json.dumps(ingress["Properties"]["GroupId"])
+    ]
+    assert len(sqs_ingress) == 1
+    assert "ReingestPlannerSecurityGroup" in json.dumps(
+        sqs_ingress[0]["Properties"]["SourceSecurityGroupId"]
+    )
     allowed_sources = {
         "IngestionSecurityGroup",
         "ExplorerSecurityGroup",

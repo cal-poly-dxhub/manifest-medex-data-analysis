@@ -163,8 +163,21 @@ class ReingestPlanner:
         self._progress.mark_running(job_id)
         try:
             enqueued = self._plan(job_id, mode, sql, document_ids)
-        except Exception:
+        except Exception as error:
             # Never surface Data API, SQS, or clinical detail; record the sanitized failure.
+            # The exception class name alone (e.g. EndpointConnectionError, ClientError) is
+            # non-sensitive and distinguishes a network gap from an authorization failure.
+            LOGGER.error(  # noqa: TRY400 - a traceback could expose SDK request details
+                json.dumps(
+                    {
+                        "event": "reingest_plan_failed",
+                        "errorType": type(error).__name__,
+                        "mode": mode,
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            )
             self._progress.mark_failed(job_id)
             raise PlannerError(PLANNER_FAILED) from None
         self._progress.mark_enqueue_complete(job_id)

@@ -165,6 +165,12 @@ class DataQualityStack(Stack):
             "DataApiEndpointSecurityGroup",
             "RDS Data API",
         )
+        self.sqs_endpoint_security_group = self._create_endpoint_security_group(
+            "SqsEndpointSecurityGroup",
+            "Amazon SQS",
+            # Ingestion Lambdas are queue-invoked and never send; only the planner needs SQS.
+            allow_ingestion=False,
+        )
 
         self.hl7_role = self._create_ingestion_role("Hl7", "incoming/hl7/*", "hl7/*")
         self.ccda_role = self._create_ingestion_role("Ccda", "incoming/ccda/*", "ccda/*")
@@ -210,6 +216,7 @@ class DataQualityStack(Stack):
             ],
         )
         self.data_api_endpoint = self._create_data_api_endpoint()
+        self.sqs_endpoint = self._create_sqs_endpoint()
         self._grant_metadata_access(self.hl7_role)
         self._grant_metadata_access(self.ccda_role)
 
@@ -525,20 +532,25 @@ class DataQualityStack(Stack):
         return vpc
 
     def _create_endpoint_security_group(
-        self, construct_id: str, service_name: str
+        self,
+        construct_id: str,
+        service_name: str,
+        *,
+        allow_ingestion: bool = True,
     ) -> ec2.SecurityGroup:
         security_group = ec2.SecurityGroup(
             self,
             construct_id,
             vpc=self.vpc,
             allow_all_outbound=False,
-            description=f"Allows HTTPS to {service_name} only from ingestion Lambdas",
+            description=f"Allows HTTPS to {service_name} only from authorized Lambdas",
         )
-        security_group.add_ingress_rule(
-            self.ingestion_security_group,
-            ec2.Port.tcp(443),
-            f"HTTPS from ingestion Lambdas to {service_name}",
-        )
+        if allow_ingestion:
+            security_group.add_ingress_rule(
+                self.ingestion_security_group,
+                ec2.Port.tcp(443),
+                f"HTTPS from ingestion Lambdas to {service_name}",
+            )
         return security_group
 
     def _create_ingestion_role(
@@ -861,6 +873,21 @@ class DataQualityStack(Stack):
             )
         )
         return endpoint
+
+    def _create_sqs_endpoint(self) -> ec2.InterfaceVpcEndpoint:
+        # The reingestion planner is the only Lambda that *sends* to SQS from inside the
+        # isolated subnets (every other function is invoked by a queue, which needs no
+        # outbound path). Without this endpoint, SendMessage hangs through boto retries
+        # and the job never advances past its expected count. The endpoint policy and
+        # security-group ingress are granted where the planner role is defined.
+        return self.vpc.add_interface_endpoint(
+            "SqsEndpoint",
+            service=ec2.InterfaceVpcEndpointAwsService.SQS,
+            private_dns_enabled=True,
+            open=False,
+            security_groups=[self.sqs_endpoint_security_group],
+            subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_ISOLATED),
+        )
 
     def _grant_metadata_access(self, role: iam.Role) -> None:
         role.add_to_policy(
@@ -1463,6 +1490,18 @@ class DataQualityStack(Stack):
                 principals=[self.reingest_planner_role],
                 actions=["rds-data:ExecuteStatement"],
                 resources=[self.metadata_cluster.cluster_arn],
+            )
+        )
+        self.sqs_endpoint_security_group.add_ingress_rule(
+            self.reingest_planner_security_group,
+            ec2.Port.tcp(443),
+            "HTTPS from the reingestion planner Lambda to Amazon SQS",
+        )
+        self.sqs_endpoint.add_to_policy(
+            iam.PolicyStatement(
+                principals=[self.reingest_planner_role],
+                actions=["sqs:SendMessage"],
+                resources=[self.reindex_queue.queue_arn],
             )
         )
 
