@@ -1,0 +1,76 @@
+[project]
+name = "manifest-medex-data-quality"
+version = "0.1.0"
+description = "AWS CDK infrastructure for Manifest MedEx data-quality processing"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "aws-cdk-lib==2.263.0",
+  "constructs==10.8.1",
+  "defusedxml==0.7.1",
+  "hl7==0.4.5",
+  "pydantic==2.13.4",
+]
+
+[dependency-groups]
+dev = [
+  "cdk-nag==2.38.2",
+  "hl7apy==1.3.5",
+  "mypy==2.3.0",
+  "pytest==9.1.1",
+  "pytest-cov==7.1.0",
+  "ruff==0.16.2",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+addopts = [
+  "--strict-config",
+  "--strict-markers",
+  "--cov=src",
+  "--cov-report=term-missing",
+  "--cov-fail-under=90",
+]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.coverage.run]
+branch = true
+
+[tool.coverage.report]
+exclude_also = [
+  "if TYPE_CHECKING:",
+  "if __name__ == .__main__.:",
+  "raise NotImplementedError",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["A", "ANN", "ARG", "B", "C4", "DTZ", "E", "F", "I", "N", "PTH", "PT", "RUF", "S", "SIM", "TRY", "UP"]
+ignore = ["ANN401"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+explicit_package_bases = true
+plugins = ["pydantic.mypy"]
+files = ["app.py", "src", "tests"]
+exclude = ["cdk.out"]
+
+[[tool.mypy.overrides]]
+module = ["aws_cdk.*", "cdk_nag.*", "constructs.*", "defusedxml.*", "hl7.*"]
+ignore_missing_imports = true

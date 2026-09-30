@@ -1,0 +1,261 @@
+{
+  "report_id": "p4p-prototype",
+  "name": "P4P Prototype (ADT A08 + ORU)",
+  "description": "Prototype of the Prism P4P backend report. Sections and rows mirror the customer's ADT A08 section report and ORU chart-notes report, restricted to fields present in the current curated ROOT projection. Row logic derived from the plain-English descriptions in the customer's spreadsheets, per the 2026-08-26 walkthrough agreement. ORU document-type rows approximate the customer's classification via OBR-24 service-sector codes pending their row-query export.",
+  "partition_field": "sourceFacilityId",
+  "time_field": "messageTime",
+  "sections": [
+    {
+      "seq": 1,
+      "name": "ADT A08",
+      "rows": [
+        {
+          "seq": 1,
+          "label": "PID-3.1",
+          "description": "A08 messages containing a patient identifier (PID-3.1)",
+          "index": "hl7-messages-v1",
+          "query": {
+            "bool": {
+              "filter": [
+                { "term": { "ROOT.MSH.MSH_9_Message_Type.MSG_1": "ADT" } },
+                { "term": { "ROOT.MSH.MSH_9_Message_Type.MSG_2": "A08" } },
+                { "exists": { "field": "ROOT.PID.PID_3_Patient_Identifier_List.CX_1" } }
+              ]
+            }
+          }
+        },
+        {
+          "seq": 2,
+          "label": "PID-5.1",
+          "description": "A08 messages containing a patient family name (PID-5.1.1)",
+          "index": "hl7-messages-v1",
+          "query": {
+            "bool": {
+              "filter": [
+                { "term": { "ROOT.MSH.MSH_9_Message_Type.MSG_1": "ADT" } },
+                { "term": { "ROOT.MSH.MSH_9_Message_Type.MSG_2": "A08" } },
+                { "exists": { "field": "ROOT.PID.PID_5_Patient_Name.XPN_1.FN_1" } }
+              ]
+            }
+          }
+        },
+        {
+          "seq": 3,
+          "label": "PID-7.1",
+          "description": "A08 messages containing a date of birth (PID-7)",
+          "index": "hl7-messages-v1",
+          "query": {
+            "bool": {
+              "filter": [
+                { "term": { "ROOT.MSH.MSH_9_Message_Type.MSG_1": "ADT" } },
+                { "term": { "ROOT.MSH.MSH_9_Message_Type.MSG_2": "A08" } },
+                { "exists": { "field": "ROOT.PID.PID_7_Date-Time_of_Birth" } }
+              ]
+            }
+          }
+        },
+        {
+          "seq": 4,
+          "label": "PID-8",
+          "description": "A08 messages containing administrative sex (PID-8)",
+          "index": "hl7-messages-v1",
+          "query": {
+            "bool": {
+              "filter": [
+                { "term": { "ROOT.MSH.MSH_9_Message_Type.MSG_1": "ADT" } },
+                { "term": { "ROOT.MSH.MSH_9_Message_Type.MSG_2": "A08" } },
+                { "exists": { "field": "ROOT.PID.PID_8_Administrative_Sex" } }
+              ]
+            }
+          }
+        },
+        {
+          "seq": 5,
+          "label": "PV1-2",
+          "description": "A08 messages containing a patient class (PV1-2)",
+          "index": "hl7-messages-v1",
+          "query": {
+            "bool": {
+              "filter": [
+                { "term": { "ROOT.MSH.MSH_9_Message_Type.MSG_1": "ADT" } },
+                { "term": { "ROOT.MSH.MSH_9_Message_Type.MSG_2": "A08" } },
+                { "exists": { "field": "ROOT.PV1.PV1_2_Patient_Class" } }
+              ]
+            }
+          }
+        },
+        {
+          "seq": 6,
+          "label": "PV1-PROVIDERS",
+          "description": "A08 messages containing at least one provider: attending (PV1-7), referring (PV1-8), consulting (PV1-9), or admitting (PV1-17). Counted once per message, matching the customer's PV1-PROVIDERS row semantics.",
+          "index": "hl7-messages-v1",
+          "query": {
+            "bool": {
+              "filter": [
+                { "term": { "ROOT.MSH.MSH_9_Message_Type.MSG_1": "ADT" } },
+                { "term": { "ROOT.MSH.MSH_9_Message_Type.MSG_2": "A08" } }
+              ],
+              "should": [
+                { "exists": { "field": "ROOT.PV1.PV1_7_Attending_Doctor.XCN_1" } },
+                { "exists": { "field": "ROOT.PV1.PV1_8_Referring_Doctor.XCN_1" } },
+                { "exists": { "field": "ROOT.PV1.PV1_9_Consulting_Doctor.XCN_1" } },
+                { "exists": { "field": "ROOT.PV1.PV1_17_Admitting_Doctor.XCN_1" } }
+              ],
+              "minimum_should_match": 1
+            }
+          }
+        },
+        {
+          "seq": 7,
+          "label": "NK1-3.1",
+          "description": "A08 messages containing a next-of-kin relationship code (NK1-3.1)",
+          "index": "hl7-messages-v1",
+          "query": {
+            "bool": {
+              "filter": [
+                { "term": { "ROOT.MSH.MSH_9_Message_Type.MSG_1": "ADT" } },
+                { "term": { "ROOT.MSH.MSH_9_Message_Type.MSG_2": "A08" } },
+                { "exists": { "field": "ROOT.NK1.NK1_3_Relationship.CWE_1" } }
+              ]
+            }
+          }
+        },
+        {
+          "seq": 8,
+          "label": "TotalNK1",
+          "description": "A08 messages containing any NK1 segment",
+          "index": "hl7-messages-v1",
+          "query": {
+            "bool": {
+              "filter": [
+                { "term": { "ROOT.MSH.MSH_9_Message_Type.MSG_1": "ADT" } },
+                { "term": { "ROOT.MSH.MSH_9_Message_Type.MSG_2": "A08" } },
+                { "exists": { "field": "ROOT.NK1._present" } }
+              ]
+            }
+          }
+        },
+        {
+          "seq": 9,
+          "label": "TotalPV2",
+          "description": "A08 messages containing any PV2 segment",
+          "index": "hl7-messages-v1",
+          "query": {
+            "bool": {
+              "filter": [
+                { "term": { "ROOT.MSH.MSH_9_Message_Type.MSG_1": "ADT" } },
+                { "term": { "ROOT.MSH.MSH_9_Message_Type.MSG_2": "A08" } },
+                { "exists": { "field": "ROOT.PV2._present" } }
+              ]
+            }
+          }
+        },
+        {
+          "seq": 10,
+          "label": "TotalA08",
+          "description": "All A08 messages (denominator). MSH-1 exists on every parsed message.",
+          "index": "hl7-messages-v1",
+          "query": {
+            "bool": {
+              "filter": [
+                { "term": { "ROOT.MSH.MSH_9_Message_Type.MSG_1": "ADT" } },
+                { "term": { "ROOT.MSH.MSH_9_Message_Type.MSG_2": "A08" } },
+                { "exists": { "field": "ROOT.MSH.MSH_1_Field_Separator" } }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "seq": 2,
+      "name": "ORU",
+      "rows": [
+        {
+          "seq": 1,
+          "label": "OBRSegment",
+          "description": "ORU messages containing any OBR segment",
+          "index": "hl7-messages-v1",
+          "query": {
+            "bool": {
+              "filter": [
+                { "term": { "ROOT.MSH.MSH_9_Message_Type.MSG_1": "ORU" } },
+                { "exists": { "field": "ROOT.OBR._present" } }
+              ]
+            }
+          }
+        },
+        {
+          "seq": 2,
+          "label": "LabDocument",
+          "description": "APPROXIMATION pending customer row-query export: ORU messages with OBR-24 diagnostic service sector = LAB",
+          "index": "hl7-messages-v1",
+          "query": {
+            "bool": {
+              "filter": [
+                { "term": { "ROOT.MSH.MSH_9_Message_Type.MSG_1": "ORU" } },
+                { "term": { "ROOT.OBR.OBR_24_Diagnostic_Serv_Sect_ID": "LAB" } }
+              ]
+            }
+          }
+        },
+        {
+          "seq": 3,
+          "label": "RadiologyDocument",
+          "description": "APPROXIMATION pending customer row-query export: ORU messages with OBR-24 = RAD",
+          "index": "hl7-messages-v1",
+          "query": {
+            "bool": {
+              "filter": [
+                { "term": { "ROOT.MSH.MSH_9_Message_Type.MSG_1": "ORU" } },
+                { "term": { "ROOT.OBR.OBR_24_Diagnostic_Serv_Sect_ID": "RAD" } }
+              ]
+            }
+          }
+        },
+        {
+          "seq": 4,
+          "label": "PathologyDocument",
+          "description": "APPROXIMATION pending customer row-query export: ORU messages with OBR-24 = PAT",
+          "index": "hl7-messages-v1",
+          "query": {
+            "bool": {
+              "filter": [
+                { "term": { "ROOT.MSH.MSH_9_Message_Type.MSG_1": "ORU" } },
+                { "term": { "ROOT.OBR.OBR_24_Diagnostic_Serv_Sect_ID": "PAT" } }
+              ]
+            }
+          }
+        },
+        {
+          "seq": 5,
+          "label": "OBX-11(F/C)",
+          "description": "ORU messages with a final, amended, or corrected result status (OBX-11 in F, FINAL, C)",
+          "index": "hl7-messages-v1",
+          "query": {
+            "bool": {
+              "filter": [
+                { "term": { "ROOT.MSH.MSH_9_Message_Type.MSG_1": "ORU" } },
+                { "terms": { "ROOT.OBX.OBX_11_Observation_Result_Status": ["F", "FINAL", "C"] } }
+              ]
+            }
+          }
+        },
+        {
+          "seq": 6,
+          "label": "TotalORU",
+          "description": "All ORU messages (denominator)",
+          "index": "hl7-messages-v1",
+          "query": {
+            "bool": {
+              "filter": [
+                { "term": { "ROOT.MSH.MSH_9_Message_Type.MSG_1": "ORU" } },
+                { "exists": { "field": "ROOT.MSH.MSH_1_Field_Separator" } }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

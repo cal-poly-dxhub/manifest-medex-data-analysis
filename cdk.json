@@ -1,0 +1,21 @@
+{
+  "app": "uv run python app.py",
+  "context": {
+    "enable_cdk_nag": true,
+    "environment": "dev",
+    "project_name": "manifest-medex-data-quality",
+    "enable_public_dashboard": false
+  },
+  "watch": {
+    "include": [
+      "app.py",
+      "src/**/*.py"
+    ],
+    "exclude": [
+      "README.md",
+      "cdk*.json",
+      "**/__pycache__",
+      "tests"
+    ]
+  }
+}
