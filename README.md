@@ -24,7 +24,7 @@ The design keeps the raw object as the complete source of truth while exposing a
 
 This repository is an implementation prototype. It does not establish HL7 profile conformance, CCDA template conformance, customer-data parity, production capacity, or regulatory compliance. Validate those concerns independently before handling production or regulated data.
 
-# Architecture Diagram
+# Architecture
 
 ![Architecture Diagram](doc/arch_diagram.png)
 
@@ -103,7 +103,7 @@ The HL7 parser supports:
 
 The indexed `ROOT` projection is driven by the committed customer field catalog. It contains 621 unambiguous, standards-backed HL7 v2.6 fields across 30 segment families whose exact output labels occur in the August 24 Kibana export. Composite datatype and subcomponent names are projected recursively, and repetitions remain arrays. Elasticsearch metadata, Prism enrichment keys, derived `_text`/`_resolution`/`_string` fields, and numeric nodes beyond valid segment ranges are intentionally excluded. `segmentCounts` still records every observed segment type; locally defined segments remain counted but are not fabricated into the customer projection.
 
-Parser output identifies the implementation as version `0.5.0`. HL7 document IDs are `SHA-256(bucket + key + SHA-256(normalized message))`; exact duplicate messages under one S3 key collapse to the first occurrence and retain its `messageOrdinal`. S3 version IDs and ETags remain provenance metadata but do not affect HL7 identity.
+Parser output identifies the implementation as version `1.0.0`. HL7 document IDs are `SHA-256(bucket + key + SHA-256(normalized message))`; exact duplicate messages under one S3 key collapse to the first occurrence and retain its `messageOrdinal`. S3 version IDs and ETags remain provenance metadata but do not affect HL7 identity.
 
 ## CCDA processing
 
@@ -111,7 +111,7 @@ CCDA XML is parsed with `defusedxml`. The parser rejects DTDs, entities, externa
 
 The indexed `CD` projection covers structured fields used by supplied dashboard queries for patient role, custodian, medications, immunizations, problems, procedures, results, vital signs, and social history. Seven canonical sections are resolved by their standard LOINC codes. Other structured sections can be resolved by title or code display name through 108 normalized concepts representing all 116 exact section aliases observed in the August 24 Kibana export. Recognized sections generically project supported `substanceAdministration`, `organizer`, `act`, `observation`, and `procedure` entries. Narrative section bodies remain intentionally excluded.
 
-CCDA parser output identifies the implementation as version `0.3.0`. CCDA document IDs are `SHA-256(bucket + key + SHA-256(exact raw XML bytes))`. Identical XML bytes under one S3 key resolve to the same logical document across source versions; byte-level formatting changes create a new ID. S3 version IDs and ETags remain provenance metadata but do not affect CCDA identity.
+CCDA parser output identifies the implementation as version `1.0.0`. CCDA document IDs are `SHA-256(bucket + key + SHA-256(exact raw XML bytes))`. Identical XML bytes under one S3 key resolve to the same logical document across source versions; byte-level formatting changes create a new ID. S3 version IDs and ETags remain provenance metadata but do not affect CCDA identity.
 
 ## Metadata contract
 
@@ -199,7 +199,7 @@ This prototype provides authentication but not row-, facility-, or tenant-level 
 
 ## Parsed-zone reingestion
 
-The SQL tab can restore historical documents from the durable parsed S3 zone into the OpenSearch hot window without reparsing raw input. This preserves the parsed JSON exactly, including its original `ingestTime`, and uses the stored `documentId` as the OpenSearch `_id`. Parser-version routing or upgrades are deliberately deferred; a document produced by an older parser is restored unchanged and counted as stale.
+The SQL tab can restore historical documents from the durable parsed S3 zone into the OpenSearch hot window without reparsing raw input. The parsed JSON is indexed as stored, with one exception agreed with the customer: `ingestTime` is set to the reingestion time so restored documents appear as new arrivals in time-based views, and the original arrival time is retained as `originalIngestTime`. The stored `documentId` is used as the OpenSearch `_id`, and the S3 parsed object is never modified. Parser-version routing or upgrades are deliberately deferred; a document produced by an older parser is restored unchanged and counted as stale.
 
 A reingestion can select documents in two ways:
 
@@ -488,6 +488,82 @@ uv run cdk deploy \
 
 Do not use production credentials or disable termination/deletion protections merely to simplify deployment.
 
+### Enable OpenSearch Dashboards access
+
+The collection API and Dashboards are private by default, so a fresh deployment returns 403 in the browser until access is granted. To enable Dashboards for the role you sign in with, add both flags to the deploy (development only):
+
+```bash
+uv run cdk deploy \
+  -c environment=dev \
+  -c account=111122223333 \
+  -c region=us-west-2 \
+  -c enable_public_dashboard=true \
+  -c dashboard_principal_arn=arn:aws:iam::111122223333:role/<role-name> \
+  --profile <approved-aws-profile>
+```
+
+Notes:
+
+- The principal must be an IAM **role** in the same account as the stack; the deploy fails validation otherwise. Find both values for the identity you are deploying with:
+
+  ```bash
+  aws sts get-caller-identity --profile <approved-aws-profile>
+  ```
+
+  Example output and how to read it:
+
+  ```json
+  {
+      "UserId": "AROA...:jsmith",
+      "Account": "111122223333",
+      "Arn": "arn:aws:sts::111122223333:assumed-role/AWSReservedSSO_AdministratorAccess_0123456789abcdef/jsmith"
+  }
+  ```
+
+  - `Account` is the value for `-c account=` and the account portion of the principal ARN.
+  - The role name is the segment after `assumed-role/` and before the final `/<session-name>` — here `AWSReservedSSO_AdministratorAccess_0123456789abcdef`.
+  - The `Arn` shown is a *session* ARN (`sts` / `assumed-role`); the flag needs the *role* ARN (`iam` / `role`). For an IAM Identity Center (SSO) role the path is `aws-reserved/sso.amazonaws.com/<region>/`, so the value becomes:
+
+    ```text
+    arn:aws:iam::111122223333:role/aws-reserved/sso.amazonaws.com/us-west-2/AWSReservedSSO_AdministratorAccess_0123456789abcdef
+    ```
+
+    For a plain IAM role (not SSO) it is simply `arn:aws:iam::111122223333:role/<role-name>`.
+
+  To copy the exact role ARN rather than construct it:
+
+  ```bash
+  aws iam get-role \
+    --role-name AWSReservedSSO_AdministratorAccess_0123456789abcdef \
+    --query "Role.Arn" --output text \
+    --profile <approved-aws-profile>
+  ```
+
+  Or resolve it from the current identity in one step:
+
+  ```bash
+  aws iam get-role \
+    --role-name "$(aws sts get-caller-identity --query Arn --output text \
+      | sed -E 's#arn:aws:sts::[0-9]+:assumed-role/([^/]+)/.*#\1#')" \
+    --query "Role.Arn" --output text
+  ```
+
+  This requires the current credentials to be an assumed role (SSO or otherwise). If you deploy with an IAM user, the dashboard principal must still be a role; pick the role you will browse Dashboards with and pass its ARN instead.
+
+  **In the console:** the account ID is under your account name in the top-right menu. The role is at IAM → Roles → search for the role name from the `sts` output above → the **ARN** field on the role's summary page has a copy button. SSO roles are listed there too, under their `AWSReservedSSO_…` names.
+
+- The role also needs the IAM permissions `aoss:APIAccessAll` and `aoss:DashboardsAccessAll` on the collection; administrator roles already have them.
+- Context flags apply per invocation. A later `cdk deploy` without them reverts Dashboards to private. To make the setting persist for a development environment, add both keys to the `context` block in `cdk.json`.
+- Read the Dashboards URL from the collection page in the OpenSearch Serverless console, or with:
+
+  ```bash
+  aws opensearchserverless batch-get-collection \
+    --names <collection-name> \
+    --query "collectionDetails[0].dashboardEndpoint" --output text
+  ```
+
+  The collection name is in the `OpenSearchCollectionName` stack output. In Dashboards, create index patterns `hl7-messages-v1` and `ccda-documents-v1` (time field `ingestTime` for both) before using Discover.
+
 ## Cost considerations
 
 This stack is not a free-tier architecture. Major recurring cost drivers include:
@@ -513,6 +589,29 @@ Only objects created after deployment under these prefixes are routed:
 | CCDA | `incoming/ccda/*.xml` | One parsed document and metadata row |
 
 Use non-identifying object keys. Do not put patient names, medical record numbers, or other identifiers in S3 keys.
+
+### Key layout for bulk and historical loads
+
+The router matches on prefix and extension only, so any folder structure may be nested **under** the required prefixes. A date-partitioned layout such as `year/month/day/hour` is recommended for large loads because it keeps listings and lifecycle rules manageable:
+
+```text
+incoming/hl7/2026/01/15/09/RUHS_CA_RUHS_H_ADT_20260115090412_000123.hl7
+incoming/ccda/participant=RUHS_CA_RUHS_H/2026/01/15/09/000456.xml
+```
+
+Requirements and behavior to plan around:
+
+| Concern | Rule |
+| --- | --- |
+| Prefix | Must begin with `incoming/hl7/` or `incoming/ccda/`. Objects elsewhere are ignored entirely. |
+| Extension | HL7: `.hl7` or `.txt`. CCDA: `.xml`. Any other extension is routed to the queue, rejected as an invalid route, and lands in the DLQ. |
+| Facility for HL7 | Taken from **MSH-4.1 inside the message**. The key does not need to carry it. |
+| Facility for CCDA | Taken from the **key**: include a `participant=<facility UID>` path segment (see example). Without it, `sourceFacilityId` is empty and per-facility reports and filters exclude the document. |
+| Filenames | Free-form, but keep them non-identifying. Facility, message type, and MSH-7 date in the name are fine and useful for browsing. |
+| Ordering | Not guaranteed. Objects are processed by parallel consumers from a standard queue, so arrival order is not preserved. This does not affect counts or report results. |
+| Re-uploads | Safe. Document identity is derived from the object (bucket, key, version) so a re-drop of an unchanged object updates rather than duplicates. Note that a *changed* object body under a new version produces a new document. |
+| Throughput | Default ingestion concurrency is 10 (HL7) and 5 (CCDA). For multi-million-object backfills, upload in batches and watch the queue-age and DLQ alarms rather than dropping everything at once; the queue absorbs bursts but end-to-end latency grows with backlog. |
+| Size | Objects over 50 MB are rejected. Multi-megabyte CCDAs are supported. |
 
 Example uploads with synthetic, non-PHI data:
 
