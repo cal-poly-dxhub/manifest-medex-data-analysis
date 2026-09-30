@@ -58,3 +58,4 @@ tools/*
 !tools/audit_catalog_vs_export.py
 # Account-specific deployment settings and outputs
 cdk-outputs.json
+config.yaml
