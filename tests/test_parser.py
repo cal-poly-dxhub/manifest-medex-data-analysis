@@ -139,7 +139,7 @@ def test_library_parsing_handles_custom_delimiters_and_unknown_segments() -> Non
 
     document = parse_hl7_file(payload.encode(), SourceReference(bucket="raw", key="custom.hl7"))[0]
 
-    assert document["parserVersion"] == "0.5.0"
+    assert document["parserVersion"] == "1.0.0"
     assert document["sourceFacilityId"] == "FACILITY"
     assert document["messageType"] == "ORU"
     assert document["triggerEvent"] == "R01"

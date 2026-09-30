@@ -104,7 +104,7 @@ def test_ccda_document_id_uses_bucket_key_and_raw_xml_content() -> None:
     checksum = hashlib.sha256(SYNTHETIC_CCDA).hexdigest()
     expected = hashlib.sha256(f"raw\0document.xml\0{checksum}".encode()).hexdigest()
 
-    assert first["parserVersion"] == "0.3.0"
+    assert first["parserVersion"] == "1.0.0"
     assert first["documentId"] == expected
     assert second["documentId"] == expected
     assert first["rawObject"]["sha256"] == checksum

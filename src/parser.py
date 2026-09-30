@@ -14,7 +14,9 @@ from hl7.containers import Message, Segment
 from hl7.exceptions import HL7Exception
 from src.customer_field_catalog import HL7_DATATYPE_CATALOG, HL7_FIELD_CATALOG
 
-PARSER_VERSION = "0.5.0"
+# Bumping this marks every previously parsed document as stale for reingestion
+# accounting (reindexed_stale_parser). Bump deliberately, not for cosmetic changes.
+PARSER_VERSION = "1.0.0"
 INVALID_UTF8 = "Raw object is not valid UTF-8"
 CONTENT_BEFORE_MSH = "Content appeared before the first MSH segment"
 MISSING_MSH = "No HL7 MSH segment was found"

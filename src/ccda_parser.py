@@ -15,7 +15,9 @@ from defusedxml.common import DefusedXmlException
 from src.customer_field_catalog import CCDA_SECTION_TITLE_CATALOG
 from src.parser import ParseError, SourceReference
 
-PARSER_VERSION = "0.3.0"
+# Bumping this marks every previously parsed document as stale for reingestion
+# accounting (reindexed_stale_parser). Bump deliberately, not for cosmetic changes.
+PARSER_VERSION = "1.0.0"
 INVALID_XML = "Raw object is not a safe, well-formed XML document"
 INVALID_DOCUMENT = "XML root is not an HL7 ClinicalDocument"
 XML_TOO_COMPLEX = "XML document exceeds the configured structural complexity limit"
