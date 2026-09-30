@@ -123,6 +123,10 @@ info "Installing dependencies"
 uv sync --all-groups --frozen
 ( cd web && npm ci --silent )
 
+# The CDK stack embeds the built frontend, so tests and synthesis both need web/dist.
+info "Building frontend"
+make web-build
+
 if is_true "$DO_VALIDATE"; then
   info "Running validation (lint, types, tests, synth)"
   make validate

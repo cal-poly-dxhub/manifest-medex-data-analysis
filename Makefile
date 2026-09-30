@@ -23,7 +23,7 @@ lint:
 typecheck:
 	uv run mypy
 
-test:
+test: web-build
 	uv run pytest
 
 web-install:
