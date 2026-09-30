@@ -199,7 +199,7 @@ This prototype provides authentication but not row-, facility-, or tenant-level 
 
 ## Parsed-zone reingestion
 
-The SQL tab can restore historical documents from the durable parsed S3 zone into the OpenSearch hot window without reparsing raw input. The parsed JSON is indexed as stored, with one exception agreed with the customer: `ingestTime` is set to the reingestion time so restored documents appear as new arrivals in time-based views, and the original arrival time is retained as `originalIngestTime`. The stored `documentId` is used as the OpenSearch `_id`, and the S3 parsed object is never modified. Parser-version routing or upgrades are deliberately deferred; a document produced by an older parser is restored unchanged and counted as stale.
+The SQL tab can restore historical documents from the durable parsed S3 zone into the OpenSearch hot window without reparsing raw input. The parsed JSON is indexed as stored, with one exception agreed with the customer: `ingestTime` is set to the reingestion time so restored documents appear as new arrivals in time-based views, and the original arrival time is retained as `originalIngestTime`. That field is declared in both index mappings: the reindexer role holds `aoss:WriteDocument` but not `aoss:UpdateIndex`, so any field it wrote that the mapping did not already declare would trigger a dynamic mapping update and be rejected with 403. A test asserts every field the reindexer adds is declared. The stored `documentId` is used as the OpenSearch `_id`, and the S3 parsed object is never modified. Parser-version routing or upgrades are deliberately deferred; a document produced by an older parser is restored unchanged and counted as stale.
 
 A reingestion can select documents in two ways:
 
@@ -470,7 +470,7 @@ cp config.yaml.sample config.yaml
 ./deploy.sh             # deploy
 ```
 
-`config.yaml.sample` is the tracked template; `config.yaml` is git-ignored so account-specific values stay out of the repository. The config keys map to the CDK context documented below. The script refuses to run while `account` is still the `<account-number>` placeholder, or if the credential's account does not match `account`. On success it prints the frontend URL, Cognito pool identifiers, raw bucket name, and Dashboards URL, followed by first-use steps; the generated `cdk-outputs.json` is also git-ignored.
+`config.yaml.sample` is the tracked template; `config.yaml` is git-ignored so account-specific values stay out of the repository. The config keys map to the CDK context documented below. The script refuses to run while `account` or `region` is still a placeholder (`<account-number>`, `<region>`), or if the credential's account does not match `account`. On success it prints the frontend URL, Cognito pool identifiers, raw bucket name, and Dashboards URL, followed by first-use steps; the generated `cdk-outputs.json` is also git-ignored.
 
 When `enable_public_dashboard` is `true` and `dashboard_principal_arn` is blank, the current credentials must be an assumed role (for example an SSO session); otherwise set `dashboard_principal_arn` explicitly.
 

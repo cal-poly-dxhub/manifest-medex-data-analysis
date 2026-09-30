@@ -40,6 +40,7 @@ BODY_NOT_READABLE = "S3 response body is not readable"
 MAX_PARSED_BYTES_DEFAULT = 10 * 1024 * 1024
 MAX_RECEIVE_COUNT_DEFAULT = 5
 STATUS_COMPLETE = "complete"
+STATUS_FAILED = "failed"
 SUPPORTED_FORMATS = frozenset({"hl7-v2", "ccda"})
 _PARSER_VERSION_ENV = {
     "hl7-v2": "HL7_PARSER_VERSION",
@@ -80,7 +81,7 @@ class JobStore(Protocol):
 
     def record_failed(self, job_id: str) -> dict[str, Any]: ...
 
-    def finalize(self, job_id: str) -> None: ...
+    def finalize(self, job_id: str, *, failed: bool = False) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -134,17 +135,22 @@ class DynamoJobStore:
         )
         return _decode_counters(response.get("Attributes", {}))
 
-    def finalize(self, job_id: str) -> None:
+    def finalize(self, job_id: str, *, failed: bool = False) -> None:
+        status = STATUS_FAILED if failed else STATUS_COMPLETE
         try:
             self.client.update_item(
                 TableName=self.table_name,
                 Key={"jobId": {"S": job_id}},
-                UpdateExpression="SET #status = :complete, finishedAt = :finishedAt",
+                UpdateExpression="SET #status = :terminal, finishedAt = :finishedAt",
                 # Only the first invocation flips the status, so completion is idempotent.
-                ConditionExpression="attribute_not_exists(#status) OR #status <> :complete",
+                ConditionExpression=(
+                    "attribute_not_exists(#status) OR NOT #status IN (:complete, :failed)"
+                ),
                 ExpressionAttributeNames={"#status": "status"},
                 ExpressionAttributeValues={
+                    ":terminal": {"S": status},
                     ":complete": {"S": STATUS_COMPLETE},
+                    ":failed": {"S": STATUS_FAILED},
                     ":finishedAt": {"S": _utc_now_iso()},
                 },
             )
@@ -230,8 +236,11 @@ class Reindexer:
     def _finalize(self, job_id: str, counters: dict[str, Any]) -> None:
         if not _is_complete(counters):
             return
+        # A job with any permanently failed document is a failed job, not a complete one;
+        # the counters still show how many succeeded.
+        any_failed = int(counters.get("failed", 0)) > 0
         try:
-            self.job_store.finalize(job_id)
+            self.job_store.finalize(job_id, failed=any_failed)
         except Exception:
             # Swallowing keeps a rare finalize error from retrying and re-adding a counter.
             LOGGER.error(  # noqa: TRY400 - traceback could expose a sensitive SDK exception
@@ -380,6 +389,9 @@ def _log_failure(error: Exception, *, terminal: bool) -> None:
         "terminal": terminal,
     }
     if isinstance(error, IndexingError):
+        # The message is one of the fixed, non-clinical constants in search_store
+        # (index lookup vs bulk request vs document rejected); it names the failing stage.
+        event["indexingStage"] = str(error)
         if error.http_status is not None:
             event["httpStatus"] = error.http_status
         if error.backend_error_type is not None:

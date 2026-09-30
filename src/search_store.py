@@ -66,6 +66,10 @@ HL7_INDEX_MAPPING: dict[str, Any] = {
             "messageControlId": {"type": "keyword"},
             "messageTime": {"type": "date"},
             "ingestTime": {"type": "date"},
+            # Written by the reindexer on reingestion. Declared here so a reingest never
+            # triggers a dynamic mapping update, which the reindexer's role (WriteDocument
+            # only, no UpdateIndex) is not permitted to perform.
+            "originalIngestTime": {"type": "date"},
             "rawObject": {"type": "object", "enabled": False},
         },
     },
@@ -94,6 +98,7 @@ CCDA_INDEX_MAPPING: dict[str, Any] = {
             "participantId": {"type": "keyword"},
             "documentTime": {"type": "date"},
             "ingestTime": {"type": "date"},
+            "originalIngestTime": {"type": "date"},
             "rawObject": {"type": "object", "enabled": False},
         },
     },
