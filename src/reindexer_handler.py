@@ -196,7 +196,9 @@ class Reindexer:
             document["originalIngestTime"] = original_ingest_time
         # Match the parsers' Z-suffixed ISO format so the date mapping stays uniform.
         document["ingestTime"] = _utc_now_iso().replace("+00:00", "Z")
-        index_documents([document], self.transport)
+        # The reindexer holds only WriteDocument, by design: a parsed document implies the
+        # ingestion path already created its index, so never attempt creation here.
+        index_documents([document], self.transport, create_index=False)
         counters = self.job_store.record_reindexed(message.job_id, stale=stale)
         self._finalize(message.job_id, counters)
         _log_event("reindex_succeeded", message.source_format, stale=stale)

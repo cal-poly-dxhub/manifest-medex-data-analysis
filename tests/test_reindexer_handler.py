@@ -184,10 +184,10 @@ def _event(*records: dict[str, Any]) -> dict[str, Any]:
 
 
 def _ok_transport(count: int = 1) -> FakeTransport:
+    # The index already exists (HEAD 200); the reindexer never creates indexes.
     return FakeTransport(
         [
-            (404, {}),
-            (201, {"acknowledged": True}),
+            (200, {}),
             (
                 200,
                 {
@@ -861,3 +861,25 @@ def test_decode_counters_skips_non_numeric_and_non_dict_values() -> None:
     counters = store.record_missing("job-1")
 
     assert counters == {"reindexed": 0, "enqueueComplete": True}
+
+
+def test_reindexer_never_attempts_index_creation() -> None:
+    """The reindexer role holds only WriteDocument; a PUT to an index path would 403."""
+    s3 = FakeS3(json.dumps(_parsed_doc()).encode())
+    transport = _ok_transport(1)
+
+    Reindexer(s3, transport, FakeJobStore()).process_batch(_event(_record()))
+
+    assert all(method != "PUT" for method, _path, _body in transport.calls)
+
+
+def test_missing_index_is_reported_as_a_retryable_failure_not_created() -> None:
+    s3 = FakeS3(json.dumps(_parsed_doc()).encode())
+    transport = FakeTransport([(404, {})])
+    store = FakeJobStore()
+
+    result = Reindexer(s3, transport, store).process_batch(_event(_record()))
+
+    assert result["batchItemFailures"] == [{"itemIdentifier": _record()["messageId"]}]
+    assert [m for m, _p, _b in transport.calls] == ["HEAD"]
+    assert store.reindexed_calls == []
