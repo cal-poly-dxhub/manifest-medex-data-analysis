@@ -70,6 +70,7 @@ DO_VALIDATE="$(cfg validate)"
 
 [[ "$ACCOUNT" != "<account-number>" ]] || die "'account' in $CONFIG_FILE is still the placeholder value. Set it to your AWS account ID."
 [[ "$ACCOUNT" =~ ^[0-9]{12}$ ]] || die "'account' must be a 12-digit AWS account ID (got '${ACCOUNT:-<empty>}')."
+[[ "$REGION" != "<region>" ]] || die "'region' in $CONFIG_FILE is still the placeholder value. Set it to your AWS region (e.g. us-west-2)."
 [[ "$REGION" =~ ^[a-z]{2}(-gov)?-[a-z]+-[0-9]$ ]] || die "'region' looks invalid (got '${REGION:-<empty>}')."
 
 AWS_ARGS=(--region "$REGION")

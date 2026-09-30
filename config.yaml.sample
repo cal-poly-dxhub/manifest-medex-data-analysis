@@ -13,8 +13,8 @@
 # Find it:  aws sts get-caller-identity --query Account --output text
 account: "<account-number>"
 
-# AWS region for the stack (e.g. us-west-2, us-east-1).
-region: us-west-2
+# AWS region for the stack, e.g. us-west-2 or us-east-1. Must match where your credentials are configured to operate.
+region: <region>
 
 # --- Optional -----------------------------------------------------------------------
 

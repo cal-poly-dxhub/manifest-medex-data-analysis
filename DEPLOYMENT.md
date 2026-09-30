@@ -28,7 +28,7 @@ Edit `config.yaml` and set at least:
 | Key | Value |
 | --- | --- |
 | `account` | The twelve-digit account ID from `get-caller-identity` |
-| `region` | The region to deploy into, e.g. `us-west-2` |
+| `region` | The region to deploy into, e.g. `us-west-2` (replaces the `<region>` placeholder) |
 
 The remaining keys are optional and documented inline. Defaults deploy the `dev` environment with OpenSearch Dashboards browser access enabled for the role you deploy with. `config.yaml` is git-ignored.
 
@@ -126,6 +126,7 @@ Sign in with the same AWS credentials you deployed with. Before using Discover, 
 
 ## Notes
 
+- **Deploy once per account.** The stack creates CloudFront resources (origin access control, response headers policy) whose names are global to the account and derived from the stack name. A second deployment of the same stack in another region of the same account fails with `AlreadyExists`. To run two copies in one account, set a different `project_name` in each `config.yaml`; to move regions, delete the first stack before deploying the second.
 - Everything runs in an isolated VPC with no NAT gateway; Lambdas reach AWS services through VPC endpoints. There is no public database or search endpoint.
 - The S3 buckets, Aurora cluster, OpenSearch collection, DynamoDB tables, KMS key, and Cognito pool are set to **RETAIN** on stack deletion. If you are tearing the system down for good, delete them by hand after `cdk destroy`.
 - `enable_public_dashboard` exposes only the Dashboards endpoint (IAM-authenticated) and is refused outside the `dev` environment. For a production posture, reach Dashboards through a VPN or VPC path instead.
