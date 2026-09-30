@@ -56,3 +56,5 @@ web/dist/
 tools/*
 !tools/seed_report.py
 !tools/audit_catalog_vs_export.py
+# Account-specific deployment settings and outputs
+cdk-outputs.json

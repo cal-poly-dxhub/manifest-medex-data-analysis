@@ -457,6 +457,24 @@ uv run cdk synth
 
 ## Bootstrap, review, and deploy
 
+### Recommended: scripted deployment
+
+`deploy.sh` performs the whole sequence — credential check, dependency install, validation, CDK bootstrap (only when the account/region needs it), and deploy — from `config.yaml`, and resolves the OpenSearch Dashboards role from your current credentials so you do not need to construct an ARN by hand.
+
+```bash
+# edit config.yaml: set account and region; review the optional keys
+./deploy.sh --diff      # optional: preview the changes without deploying
+./deploy.sh             # deploy
+```
+
+The config keys map to the CDK context documented below. The script refuses to run while `account` is still the placeholder value, or if the credential's account does not match `account`. On success it prints the frontend URL, Cognito pool identifiers, raw bucket name, and Dashboards URL, followed by first-use steps; the generated `cdk-outputs.json` is git-ignored.
+
+When `enable_public_dashboard` is `true` and `dashboard_principal_arn` is blank, the current credentials must be an assumed role (for example an SSO session); otherwise set `dashboard_principal_arn` explicitly.
+
+### Manual deployment
+
+The remaining subsections document the underlying commands for reference or for CI pipelines.
+
 Bootstrap each target account and region once:
 
 ```bash
