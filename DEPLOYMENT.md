@@ -66,18 +66,23 @@ Self-signup is turned off, so there is no public "sign up" page. An administrato
 ### CLI: create a user with a password they can use right away
 
 ```bash
+EMAIL='reviewer@example.com'
+PASSWORD='<TheirPassword123!>'
+
 aws cognito-idp admin-create-user \
   --user-pool-id <UserPoolId> \
-  --username reviewer@example.com \
-  --user-attributes Name=email,Value=reviewer@example.com Name=email_verified,Value=true \
+  --username "$EMAIL" \
+  --user-attributes Name=email,Value="$EMAIL" Name=email_verified,Value=true \
   --message-action SUPPRESS
 
 aws cognito-idp admin-set-user-password \
   --user-pool-id <UserPoolId> \
-  --username reviewer@example.com \
-  --password '<TheirPassword123!>' \
+  --username "$EMAIL" \
+  --password "$PASSWORD" \
   --permanent
 ```
+
+The pool uses the email address as the username, so the `--username` and the `email` attribute must be identical; setting `EMAIL` once keeps them in sync.
 
 - `--message-action SUPPRESS` skips the invite email; you hand the user their password directly. `--permanent` lets them sign in immediately with no forced reset.
 - Passwords must be at least **14 characters** with upper- and lower-case letters, a number, and a symbol, or Cognito rejects the second command.
