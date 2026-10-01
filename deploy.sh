@@ -32,7 +32,7 @@ cd "$(dirname "$0")"
 die()  { echo "ERROR: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
 
-need() { command -v "$1" >/dev/null 2>&1 || die "'$1' is required but not installed. See README → Prerequisites."; }
+need() { command -v "$1" >/dev/null 2>&1 || die "'$1' is required but not installed. See DEPLOYMENT.md → Prerequisites."; }
 
 # Read one key from the config. Handles: key: value / key: "value" / key: 'value' / key:
 cfg() {
@@ -188,5 +188,5 @@ Next steps (full walkthrough: DEPLOYMENT.md):
          --password '<14+ chars, mixed case, number, symbol>' --permanent
   2. Open https://<FrontendDistributionDomainName> and sign in.
   3. Upload a test file:  aws s3 cp sample.hl7 s3://<RawBucketName>/incoming/hl7/sample.hl7
-  4. Bulk-load layout and verification steps: README.md → "Upload inputs" / "Verify processing".
+  4. Bulk-load layout and verification steps: DEPLOYMENT.md → Reference.
 EOF
