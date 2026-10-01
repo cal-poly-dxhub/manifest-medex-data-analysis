@@ -16,6 +16,7 @@ BULK_COUNT_MISMATCH = "OpenSearch bulk response item count did not match request
 DOCUMENT_REJECTED = "OpenSearch rejected an indexed document"
 INDEX_CREATE_FAILED = "OpenSearch index creation failed"
 INDEX_LOOKUP_FAILED = "OpenSearch index lookup failed"
+INDEX_MISSING = "OpenSearch index does not exist; ingest a document of this format first"
 CREDENTIALS_UNAVAILABLE = "AWS credentials are unavailable for OpenSearch signing"
 INVALID_ENDPOINT = "OpenSearch endpoint must use HTTPS"
 UNSUPPORTED_SOURCE_FORMAT = "Parsed document source format is unsupported"
@@ -65,6 +66,10 @@ HL7_INDEX_MAPPING: dict[str, Any] = {
             "messageControlId": {"type": "keyword"},
             "messageTime": {"type": "date"},
             "ingestTime": {"type": "date"},
+            # Written by the reindexer on reingestion. Declared here so a reingest never
+            # triggers a dynamic mapping update, which the reindexer's role (WriteDocument
+            # only, no UpdateIndex) is not permitted to perform.
+            "originalIngestTime": {"type": "date"},
             "rawObject": {"type": "object", "enabled": False},
         },
     },
@@ -93,6 +98,7 @@ CCDA_INDEX_MAPPING: dict[str, Any] = {
             "participantId": {"type": "keyword"},
             "documentTime": {"type": "date"},
             "ingestTime": {"type": "date"},
+            "originalIngestTime": {"type": "date"},
             "rawObject": {"type": "object", "enabled": False},
         },
     },
@@ -131,14 +137,29 @@ class _IndexedDocument:
     document: dict[str, Any]
 
 
-def index_documents(documents: list[dict[str, Any]], transport: SearchTransport) -> None:
-    """Convergently index one source object's documents using deterministic IDs."""
+def index_documents(
+    documents: list[dict[str, Any]],
+    transport: SearchTransport,
+    *,
+    create_index: bool = True,
+) -> None:
+    """Convergently index one source object's documents using deterministic IDs.
+
+    ``create_index=False`` requires the target index to already exist and raises a
+    sanitized ``IndexingError`` otherwise. Use it for callers that hold only
+    ``aoss:WriteDocument`` (the reindexer): a parsed document can only exist if the
+    ingestion path already created its index, so a missing index is a real fault to
+    surface, not something to repair with a possibly-stale mapping.
+    """
     if not documents:
         raise IndexingError(BULK_COUNT_MISMATCH)
     # A source batch is homogeneous; validate every document against the first format.
     index_name, mapping = _index_configuration(documents[0])
     indexed = [_indexed_document(document, documents[0]["sourceFormat"]) for document in documents]
-    _ensure_index(transport, index_name, mapping)
+    if create_index:
+        _ensure_index(transport, index_name, mapping)
+    else:
+        _require_index(transport, index_name)
     max_bulk_bytes = int(os.getenv("MAX_BULK_BYTES", str(MAX_BULK_BYTES_DEFAULT)))
     for chunk in _bulk_chunks(index_name, indexed, max_bulk_bytes):
         status, response = transport.request("POST", "/_bulk", _bulk_body(index_name, chunk))
@@ -193,6 +214,20 @@ def _ensure_index(
                 backend_error_type=error_type,
             )
     elif status < 200 or status >= 300:
+        raise IndexingError(
+            INDEX_LOOKUP_FAILED,
+            http_status=status,
+            backend_error_type=_response_error_type(response),
+        )
+
+
+def _require_index(transport: SearchTransport, index_name: str) -> None:
+    """Fail clearly when the target index does not exist instead of attempting to create it."""
+    index_path = f"/{quote(index_name, safe='')}"
+    status, response = transport.request("HEAD", index_path)
+    if status == 404:
+        raise IndexingError(INDEX_MISSING, http_status=status)
+    if status < 200 or status >= 300:
         raise IndexingError(
             INDEX_LOOKUP_FAILED,
             http_status=status,

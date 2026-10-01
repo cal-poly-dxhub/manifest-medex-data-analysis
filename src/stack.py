@@ -7,6 +7,7 @@ from typing import Any, ClassVar, cast
 
 import jsii
 from aws_cdk import (
+    Aws,
     BundlingOptions,
     CfnDeletionPolicy,
     CfnOutput,
@@ -726,8 +727,8 @@ class DataQualityStack(Stack):
         )
         # The parsed-zone reindexer writes already-parsed documents back into both indexes.
         # It resolves an existing index (DescribeIndex) and bulk-writes documents
-        # (WriteDocument); the bulk response never requires ReadDocument, so this rule stays
-        # strictly narrower than the read-only rule above.
+        # (WriteDocument). UpdateIndex is required because the added originalIngestTime field
+        # updates the dynamic mapping on first write. It never needs ReadDocument or CreateIndex.
         access_rules.append(
             {
                 "Description": "Reindexer parsed-zone document write access",
@@ -735,7 +736,11 @@ class DataQualityStack(Stack):
                     {
                         "ResourceType": "index",
                         "Resource": index_resources,
-                        "Permission": ["aoss:DescribeIndex", "aoss:WriteDocument"],
+                        "Permission": [
+                            "aoss:DescribeIndex",
+                            "aoss:WriteDocument",
+                            "aoss:UpdateIndex",
+                        ],
                     }
                 ],
                 "Principal": [self.reindexer_role.role_arn],
@@ -1824,7 +1829,9 @@ class DataQualityStack(Stack):
         )
         domain = user_pool.add_domain(
             "ExplorerUserPoolDomain",
-            cognito_domain=cognito.CognitoDomainOptions(domain_prefix=self.stack_prefix),
+            cognito_domain=cognito.CognitoDomainOptions(
+                domain_prefix=f"{self.stack_prefix}-{Aws.ACCOUNT_ID}"
+            ),
         )
         callback_url = f"https://{self.distribution.distribution_domain_name}/"
         client = user_pool.add_client(

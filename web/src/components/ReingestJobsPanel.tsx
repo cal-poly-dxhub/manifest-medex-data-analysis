@@ -1,27 +1,42 @@
-import { type ReactNode } from 'react';
-import { ApiError } from '../api/client';
-import { useReingestJobs } from '../api/queries';
-import type { ReingestJob, ReingestJobStatus } from '../api/types';
-import { formatTimestamp } from '../util/format';
-import { EmptyState, ErrorState, LoadingState } from './StateViews';
+import { type ReactNode } from "react";
+import { ApiError } from "../api/client";
+import { useReingestJobs } from "../api/queries";
+import type { ReingestJob, ReingestJobStatus } from "../api/types";
+import { formatTimestamp } from "../util/format";
+import { EmptyState, ErrorState, LoadingState } from "./StateViews";
 
 const STATUS_LABELS: Record<ReingestJobStatus, string> = {
-  queued: 'Queued',
-  running: 'Running',
-  complete: 'Complete',
-  failed: 'Failed',
+  queued: "Queued",
+  running: "Running",
+  complete: "Complete",
+  failed: "Failed",
 };
 
 const ACTIVE_STATUSES: ReadonlySet<ReingestJobStatus> = new Set([
-  'queued',
-  'running',
+  "queued",
+  "running",
 ]);
 
-function jobsErrorMessage(error: unknown): string {
-  if (error instanceof ApiError && (error.status === 401 || error.status === 403)) {
-    return 'You are not authorized to view reingestion jobs.';
+/**
+ * Status to display. A finished job with any permanently failed document is shown as
+ * Failed even if the stored status says complete, so the badge never contradicts the
+ * Failed counter beside it.
+ */
+function displayStatus(job: ReingestJob): ReingestJobStatus {
+  if (!ACTIVE_STATUSES.has(job.status) && job.counters.failed > 0) {
+    return "failed";
   }
-  return 'Unable to load reingestion jobs. Please try again.';
+  return job.status;
+}
+
+function jobsErrorMessage(error: unknown): string {
+  if (
+    error instanceof ApiError &&
+    (error.status === 401 || error.status === 403)
+  ) {
+    return "You are not authorized to view reingestion jobs.";
+  }
+  return "Unable to load reingestion jobs. Please try again.";
 }
 
 /**
@@ -31,8 +46,8 @@ function jobsErrorMessage(error: unknown): string {
  * The SQL text lives only inside the collapsed `details`/`pre`; it is never logged.
  */
 function JobSelectionCell({ job }: { readonly job: ReingestJob }): ReactNode {
-  if (job.mode === 'sql') {
-    if (typeof job.sql === 'string') {
+  if (job.mode === "sql") {
+    if (typeof job.sql === "string") {
       return (
         <details className="reingest-job-sql">
           <summary>View SQL</summary>
@@ -40,7 +55,7 @@ function JobSelectionCell({ job }: { readonly job: ReingestJob }): ReactNode {
         </details>
       );
     }
-    if (typeof job.sqlSha256 === 'string') {
+    if (typeof job.sqlSha256 === "string") {
       return (
         <details className="reingest-job-sql">
           <summary>SQL fingerprint</summary>
@@ -50,7 +65,7 @@ function JobSelectionCell({ job }: { readonly job: ReingestJob }): ReactNode {
     }
     return <span className="reingest-jobs__muted">SQL</span>;
   }
-  const idCount = typeof job.idCount === 'number' ? job.idCount : job.expected;
+  const idCount = typeof job.idCount === "number" ? job.idCount : job.expected;
   return <span className="reingest-jobs__muted">{idCount} document ids</span>;
 }
 
@@ -99,36 +114,39 @@ export function ReingestJobsPanel(): ReactNode {
               </tr>
             </thead>
             <tbody>
-              {jobs.data?.items.map((job) => (
-                <tr key={job.jobId}>
-                  <td>
-                    <span
-                      className={`run-status run-status--${job.status}`}
-                      role="status"
-                    >
-                      {ACTIVE_STATUSES.has(job.status) ? (
-                        <span
-                          className="spinner spinner--button"
-                          aria-hidden="true"
-                        />
-                      ) : null}
-                      {STATUS_LABELS[job.status]}
-                    </span>
-                  </td>
-                  <td>{job.expected}</td>
-                  <td>{job.counters.enqueued}</td>
-                  <td>{job.counters.reindexed}</td>
-                  <td>{job.counters.reindexedStaleParser}</td>
-                  <td>{job.counters.missingParsed}</td>
-                  <td>{job.counters.failed}</td>
-                  <td>{job.requestedBy}</td>
-                  <td>{formatTimestamp(job.createdAt)}</td>
-                  <td>{formatTimestamp(job.finishedAt ?? null)}</td>
-                  <td>
-                    <JobSelectionCell job={job} />
-                  </td>
-                </tr>
-              ))}
+              {jobs.data?.items.map((job) => {
+                const status = displayStatus(job);
+                return (
+                  <tr key={job.jobId}>
+                    <td>
+                      <span
+                        className={`run-status run-status--${status}`}
+                        role="status"
+                      >
+                        {ACTIVE_STATUSES.has(status) ? (
+                          <span
+                            className="spinner spinner--button"
+                            aria-hidden="true"
+                          />
+                        ) : null}
+                        {STATUS_LABELS[status]}
+                      </span>
+                    </td>
+                    <td>{job.expected}</td>
+                    <td>{job.counters.enqueued}</td>
+                    <td>{job.counters.reindexed}</td>
+                    <td>{job.counters.reindexedStaleParser}</td>
+                    <td>{job.counters.missingParsed}</td>
+                    <td>{job.counters.failed}</td>
+                    <td>{job.requestedBy}</td>
+                    <td>{formatTimestamp(job.createdAt)}</td>
+                    <td>{formatTimestamp(job.finishedAt ?? null)}</td>
+                    <td>
+                      <JobSelectionCell job={job} />
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>

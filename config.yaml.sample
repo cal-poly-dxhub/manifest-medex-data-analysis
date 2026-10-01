@@ -1,11 +1,20 @@
+# Deployment configuration template for deploy.sh
+#
+# Copy this file to config.yaml, edit the values (at minimum: account and region), then run:
+#     cp config.yaml.sample config.yaml
+#     ./deploy.sh
+#
+# Format: simple "key: value" lines. Quotes are optional. Lines starting with # are ignored.
+# config.yaml is git-ignored so account-specific values stay out of the repository.
+
 # --- Required -----------------------------------------------------------------------
 
 # Twelve-digit AWS account ID to deploy into.
 # Find it:  aws sts get-caller-identity --query Account --output text
-account: "111122223333"
+account: "<account-number>"
 
-# AWS region for the stack (e.g. us-west-2, us-east-1).
-region: us-west-2
+# AWS region for the stack, e.g. us-west-2 or us-east-1. Must match where your credentials are configured to operate.
+region: <region>
 
 # --- Optional -----------------------------------------------------------------------
 
@@ -24,7 +33,7 @@ enable_public_dashboard: true
 # IAM ROLE ARN that will open Dashboards. Leave blank to auto-detect the role behind the
 # current credentials (the recommended setting when the deployer is also the Dashboards user).
 # Must be a role (not a user) in the same account. Example for an SSO role:
-#   arn:aws:iam::111122223333:role/aws-reserved/sso.amazonaws.com/us-east-1/AWSReservedSSO_AdministratorAccess_0123456789abcdef
+#   arn:aws:iam::<account-number>:role/aws-reserved/sso.amazonaws.com/us-east-1/AWSReservedSSO_AdministratorAccess_0123456789abcdef
 dashboard_principal_arn:
 
 

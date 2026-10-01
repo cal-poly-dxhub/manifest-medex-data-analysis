@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Deploy the Manifest MedEx data-quality stack from a single config file.
 #
-#   edit config.yaml (account, region)   # then:
+#   cp config.yaml.sample config.yaml     # then edit account, region
 #   ./deploy.sh                          # deploy
 #   ./deploy.sh --diff                   # preview changes only
 #   ./deploy.sh --config other.yaml      # alternate config file
@@ -32,7 +32,7 @@ cd "$(dirname "$0")"
 die()  { echo "ERROR: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
 
-need() { command -v "$1" >/dev/null 2>&1 || die "'$1' is required but not installed. See README → Prerequisites."; }
+need() { command -v "$1" >/dev/null 2>&1 || die "'$1' is required but not installed. See DEPLOYMENT.md → Prerequisites."; }
 
 # Read one key from the config. Handles: key: value / key: "value" / key: 'value' / key:
 cfg() {
@@ -55,7 +55,7 @@ is_true() { [[ "$(echo "${1:-}" | tr '[:upper:]' '[:lower:]')" =~ ^(true|yes|1)$
 
 # ---- preflight ---------------------------------------------------------------------
 
-[[ -f "$CONFIG_FILE" ]] || die "Config file '$CONFIG_FILE' not found."
+[[ -f "$CONFIG_FILE" ]] || die "Config file '$CONFIG_FILE' not found. Run: cp config.yaml.sample config.yaml  and edit it."
 need python3; need uv; need node; need npm; need aws
 command -v cdk >/dev/null 2>&1 || info "cdk CLI not on PATH; using 'uv run cdk' (bundled)."
 
@@ -68,8 +68,9 @@ ENABLE_DASH="$(cfg enable_public_dashboard)"
 DASH_ARN="$(cfg dashboard_principal_arn)"
 DO_VALIDATE="$(cfg validate)"
 
-[[ "$ACCOUNT" != "111122223333" ]] || die "'account' in $CONFIG_FILE is still the placeholder value. Set it to your AWS account ID."
+[[ "$ACCOUNT" != "<account-number>" ]] || die "'account' in $CONFIG_FILE is still the placeholder value. Set it to your AWS account ID."
 [[ "$ACCOUNT" =~ ^[0-9]{12}$ ]] || die "'account' must be a 12-digit AWS account ID (got '${ACCOUNT:-<empty>}')."
+[[ "$REGION" != "<region>" ]] || die "'region' in $CONFIG_FILE is still the placeholder value. Set it to your AWS region (e.g. us-west-2)."
 [[ "$REGION" =~ ^[a-z]{2}(-gov)?-[a-z]+-[0-9]$ ]] || die "'region' looks invalid (got '${REGION:-<empty>}')."
 
 AWS_ARGS=(--region "$REGION")
@@ -158,30 +159,65 @@ uv run cdk deploy --require-approval never "${CONTEXT_ARGS[@]}" ${PROFILE_ARGS[@
 
 # ---- summary -----------------------------------------------------------------------
 
-info "Deployment complete. Key outputs:"
-python3 - <<'PY'
-import json
-outputs = next(iter(json.load(open("cdk-outputs.json")).values()), {})
-for key in ("FrontendDistributionDomainName", "UserPoolId", "UserPoolClientId",
-            "UserPoolHostedUiDomain", "RawBucketName", "OpenSearchCollectionName"):
-    if key in outputs:
-        print(f"  {key:32} {outputs[key]}")
-PY
-
+DASH_URL=""
 if is_true "$ENABLE_DASH"; then
   COLLECTION="$(python3 -c 'import json; o=next(iter(json.load(open("cdk-outputs.json")).values()),{}); print(o.get("OpenSearchCollectionName",""))')"
   if [[ -n "$COLLECTION" ]]; then
     DASH_URL="$(aws opensearchserverless batch-get-collection --names "$COLLECTION" "${AWS_ARGS[@]}" \
       --query 'collectionDetails[0].dashboardEndpoint' --output text 2>/dev/null || true)"
-    [[ -n "$DASH_URL" && "$DASH_URL" != "None" ]] && echo "  OpenSearchDashboardsUrl          $DASH_URL"
+    [[ "$DASH_URL" == "None" ]] && DASH_URL=""
   fi
 fi
 
-cat <<EOF
+# Substitute real stack outputs into the next-steps commands so they are copy-pasteable.
+DASH_URL="$DASH_URL" REGION="$REGION" python3 - <<'PYEOF'
+import json, os
 
-Next steps:
-  1. Create a Cognito user in pool above (Console → Cognito → User pools → Users → Create user).
-  2. Open https://<FrontendDistributionDomainName> and sign in.
-  3. Upload a test file:  aws s3 cp sample.hl7 s3://<RawBucketName>/incoming/hl7/sample.hl7
-  4. See README → "Upload inputs" for the bulk-load key layout and → "Verify processing".
-EOF
+outputs = next(iter(json.load(open("cdk-outputs.json")).values()), {})
+frontend = outputs.get("FrontendDistributionDomainName", "<FrontendDistributionDomainName>")
+pool = outputs.get("UserPoolId", "<UserPoolId>")
+raw = outputs.get("RawBucketName", "<RawBucketName>")
+dash = os.environ.get("DASH_URL") or ""
+region = os.environ.get("REGION", "")
+
+print()
+print("Deployment complete.")
+print()
+print(f"  Explorer URL        https://{frontend}")
+print(f"  Cognito user pool   {pool}")
+print(f"  Raw bucket          {raw}")
+if dash:
+    print(f"  Dashboards URL      {dash}")
+print()
+print("Next steps (full walkthrough: DEPLOYMENT.md)")
+print()
+print("1. Create the first user (self-signup is disabled). Set EMAIL and PASSWORD once, then run:")
+print()
+print("   EMAIL='you@example.com'")
+print("   PASSWORD='ChangeMe-14chars!'")
+print()
+print(f"   aws cognito-idp admin-create-user --region {region} \\")
+print(f"     --user-pool-id {pool} \\")
+print('     --username "$EMAIL" \\')
+print('     --user-attributes Name=email,Value="$EMAIL" Name=email_verified,Value=true \\')
+print("     --message-action SUPPRESS")
+print()
+print(f"   aws cognito-idp admin-set-user-password --region {region} \\")
+print(f"     --user-pool-id {pool} \\")
+print('     --username "$EMAIL" --password "$PASSWORD" --permanent')
+print()
+print("   Password policy: 14+ characters, upper and lower case, a number, and a symbol.")
+print()
+print(f"2. Open https://{frontend} and sign in.")
+print()
+print("3. Upload a test file:")
+print()
+print(f"   aws s3 cp sample.hl7 s3://{raw}/incoming/hl7/sample.hl7")
+print(f"   aws s3 cp sample.xml s3://{raw}/incoming/ccda/participant=FACILITY_UID/sample.xml")
+print()
+if dash:
+    print(f"4. Open Dashboards at {dash}")
+    print("   Create index patterns hl7-messages-v1 and ccda-documents-v1 (time field: ingestTime).")
+    print()
+print("Bulk-load layout and verification: DEPLOYMENT.md -> Reference.")
+PYEOF

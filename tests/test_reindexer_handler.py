@@ -92,6 +92,7 @@ class FakeJobStore:
         self.missing_calls: list[str] = []
         self.failed_calls: list[str] = []
         self.finalized: list[str] = []
+        self.finalized_failed: list[tuple[str, bool]] = []
 
     def record_reindexed(self, job_id: str, *, stale: bool) -> dict[str, Any]:
         self.reindexed_calls.append((job_id, stale))
@@ -112,7 +113,8 @@ class FakeJobStore:
         self.counters["failed"] = int(self.counters.get("failed", 0)) + 1
         return dict(self.counters)
 
-    def finalize(self, job_id: str) -> None:
+    def finalize(self, job_id: str, *, failed: bool = False) -> None:
+        self.finalized_failed.append((job_id, failed))
         if self.finalize_error is not None:
             raise self.finalize_error
         self.finalized.append(job_id)
@@ -184,10 +186,10 @@ def _event(*records: dict[str, Any]) -> dict[str, Any]:
 
 
 def _ok_transport(count: int = 1) -> FakeTransport:
+    # The index already exists (HEAD 200); the reindexer never creates indexes.
     return FakeTransport(
         [
-            (404, {}),
-            (201, {"acknowledged": True}),
+            (200, {}),
             (
                 200,
                 {
@@ -861,3 +863,81 @@ def test_decode_counters_skips_non_numeric_and_non_dict_values() -> None:
     counters = store.record_missing("job-1")
 
     assert counters == {"reindexed": 0, "enqueueComplete": True}
+
+
+def test_reindexer_never_attempts_index_creation() -> None:
+    """The reindexer role holds only WriteDocument; a PUT to an index path would 403."""
+    s3 = FakeS3(json.dumps(_parsed_doc()).encode())
+    transport = _ok_transport(1)
+
+    Reindexer(s3, transport, FakeJobStore()).process_batch(_event(_record()))
+
+    assert all(method != "PUT" for method, _path, _body in transport.calls)
+
+
+def test_missing_index_is_reported_as_a_retryable_failure_not_created() -> None:
+    s3 = FakeS3(json.dumps(_parsed_doc()).encode())
+    transport = FakeTransport([(404, {})])
+    store = FakeJobStore()
+
+    result = Reindexer(s3, transport, store).process_batch(_event(_record()))
+
+    assert result["batchItemFailures"] == [{"itemIdentifier": _record()["messageId"]}]
+    assert [m for m, _p, _b in transport.calls] == ["HEAD"]
+    assert store.reindexed_calls == []
+
+
+def test_job_with_a_permanently_failed_document_finalizes_as_failed() -> None:
+    """A terminal document failure must not leave the job marked complete."""
+    s3 = FakeS3(json.dumps(_parsed_doc()).encode())
+    transport = FakeTransport([(403, {"error": {"type": "security_exception"}})])
+    store = FakeJobStore(counters={"enqueueComplete": True, "enqueued": 1})
+    record = _record()
+    record["attributes"] = {"ApproximateReceiveCount": "5"}
+
+    Reindexer(s3, transport, store).process_batch(_event(record))
+
+    assert store.failed_calls == ["job-1"]
+    assert store.finalized_failed == [("job-1", True)]
+
+
+def test_job_with_all_documents_reindexed_finalizes_as_complete() -> None:
+    s3 = FakeS3(json.dumps(_parsed_doc()).encode())
+    transport = _ok_transport(1)
+    store = FakeJobStore(counters={"enqueueComplete": True, "enqueued": 1, "reindexed": 1})
+
+    Reindexer(s3, transport, store).process_batch(_event(_record()))
+
+    assert store.finalized_failed == [("job-1", False)]
+
+
+@pytest.mark.parametrize("source_format", ["hl7-v2", "ccda"])
+def test_every_field_the_reindexer_adds_is_declared_in_the_index_mapping(
+    source_format: str,
+) -> None:
+    """Regression guard for the 2026-09-30 reingest outage.
+
+    The reindexer role holds WriteDocument but not UpdateIndex. A bulk write that
+    introduces a field absent from the index mapping triggers a dynamic mapping update,
+    which OpenSearch Serverless rejects with 403 for that role. Any top-level field the
+    reindexer adds beyond what the parsed document already carries must therefore be
+    declared explicitly in the mapping.
+    """
+    from src.search_store import CCDA_INDEX_MAPPING, HL7_INDEX_MAPPING
+
+    document = _parsed_doc()
+    document["sourceFormat"] = source_format
+    s3 = FakeS3(json.dumps(document).encode())
+    transport = _ok_transport(1)
+    record = _record()
+    record["body"] = json.dumps({**json.loads(record["body"]), "sourceFormat": source_format})
+
+    Reindexer(s3, transport, FakeJobStore()).process_batch(_event(record))
+
+    restored = _indexed_documents(transport)[0]
+    added_fields = set(restored) - set(document)
+    mapping = HL7_INDEX_MAPPING if source_format == "hl7-v2" else CCDA_INDEX_MAPPING
+    declared = set(mapping["mappings"]["properties"])
+    undeclared = added_fields - declared
+    assert not undeclared, f"reindexer adds unmapped fields {sorted(undeclared)}"
+    assert "originalIngestTime" in added_fields

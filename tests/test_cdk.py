@@ -1417,9 +1417,14 @@ def test_reindexer_has_a_separate_write_only_aoss_data_rule() -> None:
         "index/manifest-medex-dev/hl7-messages-v1",
         "index/manifest-medex-dev/ccda-documents-v1",
     ]
-    # Exactly DescribeIndex + WriteDocument for the bulk write path; no ReadDocument and no
-    # CreateIndex/UpdateIndex/DeleteDocument reach the reindexer principal.
-    assert inner["Permission"] == ["aoss:DescribeIndex", "aoss:WriteDocument"]
+    # DescribeIndex + WriteDocument for the bulk write path, plus UpdateIndex because indexing
+    # a new field (originalIngestTime) updates the dynamic mapping; no ReadDocument, CreateIndex,
+    # or DeleteDocument reach the reindexer principal.
+    assert inner["Permission"] == [
+        "aoss:DescribeIndex",
+        "aoss:WriteDocument",
+        "aoss:UpdateIndex",
+    ]
     assert "aoss:ReadDocument" not in inner["Permission"]
     assert "aoss:CreateIndex" not in inner["Permission"]
     assert "aoss:DeleteDocument" not in inner["Permission"]

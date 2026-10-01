@@ -13,6 +13,7 @@ from src.search_store import (
     DOCUMENT_REJECTED,
     INDEX_CREATE_FAILED,
     INDEX_LOOKUP_FAILED,
+    INDEX_MISSING,
     UNSUPPORTED_SOURCE_FORMAT,
     IndexingError,
     SignedOpenSearchTransport,
@@ -381,3 +382,30 @@ def test_signed_transport_rejects_http_and_missing_credentials(
     )
     with pytest.raises(RuntimeError, match="credentials are unavailable"):
         transport.request("GET", "/index")
+
+
+def test_create_index_false_never_issues_put_and_indexes_when_present() -> None:
+    transport = FakeTransport(
+        [
+            (200, {}),  # HEAD: index exists
+            (200, {"items": [{"index": {"status": 201}}]}),
+        ]
+    )
+
+    index_documents([_document()], transport, create_index=False)
+
+    methods = [call[0] for call in transport.calls]
+    assert methods == ["HEAD", "POST"]
+    assert "PUT" not in methods
+
+
+def test_create_index_false_fails_clearly_when_index_is_missing() -> None:
+    transport = FakeTransport([(404, {})])
+
+    with pytest.raises(IndexingError) as captured:
+        index_documents([_document()], transport, create_index=False)
+
+    assert str(captured.value) == INDEX_MISSING
+    assert captured.value.http_status == 404
+    # No creation attempt and no bulk write were made.
+    assert [call[0] for call in transport.calls] == ["HEAD"]
