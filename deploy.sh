@@ -159,34 +159,64 @@ uv run cdk deploy --require-approval never "${CONTEXT_ARGS[@]}" ${PROFILE_ARGS[@
 
 # ---- summary -----------------------------------------------------------------------
 
-info "Deployment complete. Key outputs:"
-python3 - <<'PY'
-import json
-outputs = next(iter(json.load(open("cdk-outputs.json")).values()), {})
-for key in ("FrontendDistributionDomainName", "UserPoolId", "UserPoolClientId",
-            "UserPoolHostedUiDomain", "RawBucketName", "OpenSearchCollectionName"):
-    if key in outputs:
-        print(f"  {key:32} {outputs[key]}")
-PY
-
+DASH_URL=""
 if is_true "$ENABLE_DASH"; then
   COLLECTION="$(python3 -c 'import json; o=next(iter(json.load(open("cdk-outputs.json")).values()),{}); print(o.get("OpenSearchCollectionName",""))')"
   if [[ -n "$COLLECTION" ]]; then
     DASH_URL="$(aws opensearchserverless batch-get-collection --names "$COLLECTION" "${AWS_ARGS[@]}" \
       --query 'collectionDetails[0].dashboardEndpoint' --output text 2>/dev/null || true)"
-    [[ -n "$DASH_URL" && "$DASH_URL" != "None" ]] && echo "  OpenSearchDashboardsUrl          $DASH_URL"
+    [[ "$DASH_URL" == "None" ]] && DASH_URL=""
   fi
 fi
 
-cat <<EOF
+# Substitute real stack outputs into the next-steps commands so they are copy-pasteable.
+DASH_URL="$DASH_URL" REGION="$REGION" python3 - <<'PYEOF'
+import json, os
 
-Next steps (full walkthrough: DEPLOYMENT.md):
-  1. Create the first user (self-signup is disabled):
-       aws cognito-idp admin-create-user --user-pool-id <UserPoolId> --username you@example.com \
-         --user-attributes Name=email,Value=you@example.com Name=email_verified,Value=true --message-action SUPPRESS
-       aws cognito-idp admin-set-user-password --user-pool-id <UserPoolId> --username you@example.com \
-         --password '<14+ chars, mixed case, number, symbol>' --permanent
-  2. Open https://<FrontendDistributionDomainName> and sign in.
-  3. Upload a test file:  aws s3 cp sample.hl7 s3://<RawBucketName>/incoming/hl7/sample.hl7
-  4. Bulk-load layout and verification steps: DEPLOYMENT.md → Reference.
-EOF
+outputs = next(iter(json.load(open("cdk-outputs.json")).values()), {})
+frontend = outputs.get("FrontendDistributionDomainName", "<FrontendDistributionDomainName>")
+pool = outputs.get("UserPoolId", "<UserPoolId>")
+raw = outputs.get("RawBucketName", "<RawBucketName>")
+dash = os.environ.get("DASH_URL") or ""
+region = os.environ.get("REGION", "")
+
+print()
+print("Deployment complete.")
+print()
+print(f"  Explorer URL        https://{frontend}")
+print(f"  Cognito user pool   {pool}")
+print(f"  Raw bucket          {raw}")
+if dash:
+    print(f"  Dashboards URL      {dash}")
+print()
+print("Next steps (full walkthrough: DEPLOYMENT.md)")
+print()
+print("1. Create the first user (self-signup is disabled). Replace the email and password:")
+print()
+print(f"   aws cognito-idp admin-create-user --region {region} \\")
+print(f"     --user-pool-id {pool} \\")
+print("     --username you@example.com \\")
+print("     --user-attributes Name=email,Value=you@example.com Name=email_verified,Value=true \\")
+print("     --message-action SUPPRESS")
+print()
+print(f"   aws cognito-idp admin-set-user-password --region {region} \\")
+print(f"     --user-pool-id {pool} \\")
+print("     --username you@example.com \\")
+print("     --password 'ChangeMe-14chars!' \\")
+print("     --permanent")
+print()
+print("   Password policy: 14+ characters, upper and lower case, a number, and a symbol.")
+print()
+print(f"2. Open https://{frontend} and sign in.")
+print()
+print("3. Upload a test file:")
+print()
+print(f"   aws s3 cp sample.hl7 s3://{raw}/incoming/hl7/sample.hl7")
+print(f"   aws s3 cp sample.xml s3://{raw}/incoming/ccda/participant=FACILITY_UID/sample.xml")
+print()
+if dash:
+    print(f"4. Open Dashboards at {dash}")
+    print("   Create index patterns hl7-messages-v1 and ccda-documents-v1 (time field: ingestTime).")
+    print()
+print("Bulk-load layout and verification: DEPLOYMENT.md -> Reference.")
+PYEOF
