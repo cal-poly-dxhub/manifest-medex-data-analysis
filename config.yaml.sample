@@ -42,3 +42,25 @@ validate: true
 
 # Stack/resource name prefix. Only change this if you deploy more than one copy per account.
 project_name: manifest-medex-data-quality
+
+# --- Optional: deploy into an existing VPC -------------------------------------------
+# Leave all four blank to let the stack create its own isolated VPC (default).
+# To use your own VPC, supply all four. Requirements for the subnets:
+#   - private: no route to an internet gateway (a NAT route is tolerated but unnecessary)
+#   - at least two subnets in two different Availability Zones (Aurora requires this);
+#     three (one per AZ) is typical, e.g. subnet_ids: subnet-aaa,subnet-bbb,subnet-ccc
+#   - free IP space for ~6 endpoint ENIs per subnet plus Lambda ENIs (/24 or larger)
+#   - VPC endpoints: deploy.sh detects any existing S3, DynamoDB, RDS Data API, SQS, or
+#     Lambda endpoints in the VPC and reuses them; missing ones are created by the stack
+# Lists are comma-separated, in matching order (subnet N uses route table N in AZ N).
+# Find route tables:  aws ec2 describe-route-tables --filters Name=association.subnet-id,Values=<subnet-id> --query "RouteTables[0].RouteTableId"
+vpc_id:
+subnet_ids:
+route_table_ids:
+availability_zones:
+
+# Normally left blank: deploy.sh fills this in automatically from the VPC. Set it only to
+# override detection. Gateway services are bare names; interface services need the
+# endpoint id and its security group id, e.g.
+#   existing_endpoints: s3,dynamodb,sqs=vpce-0123456789abcdef0:sg-0123456789abcdef0
+existing_endpoints:

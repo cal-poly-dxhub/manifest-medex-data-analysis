@@ -150,7 +150,16 @@ class DataQualityStack(Stack):
         self.hl7_queue, self.hl7_dead_letter_queue = self._create_queue_pair("Hl7")
         self.ccda_queue, self.ccda_dead_letter_queue = self._create_queue_pair("Ccda")
 
-        self.vpc = self._create_ingestion_vpc()
+        # Security groups of customer-owned endpoints we imported, keyed by service.
+        self._imported_endpoint_security_groups: dict[str, ec2.ISecurityGroup] = {}
+        # Ingress sources granted on our endpoint SGs before the endpoint itself exists, so an
+        # imported endpoint can receive the same rules on its own security group.
+        self._endpoint_ingress_sources: dict[str, list[tuple[ec2.SecurityGroup, str]]] = {}
+        self.vpc = (
+            self._import_customer_vpc()
+            if config.uses_existing_vpc
+            else self._create_ingestion_vpc()
+        )
         self.ingestion_security_group = ec2.SecurityGroup(
             self,
             "IngestionSecurityGroup",
@@ -161,14 +170,17 @@ class DataQualityStack(Stack):
         self.serverless_endpoint_security_group = self._create_endpoint_security_group(
             "ServerlessEndpointSecurityGroup",
             "OpenSearch Serverless",
+            service_key="aoss",
         )
         self.data_api_endpoint_security_group = self._create_endpoint_security_group(
             "DataApiEndpointSecurityGroup",
             "RDS Data API",
+            service_key="rds-data",
         )
         self.sqs_endpoint_security_group = self._create_endpoint_security_group(
             "SqsEndpointSecurityGroup",
             "Amazon SQS",
+            service_key="sqs",
             # Ingestion Lambdas are queue-invoked and never send; only the planner needs SQS.
             allow_ingestion=False,
         )
@@ -500,6 +512,95 @@ class DataQualityStack(Stack):
         )
         return rule
 
+    def _import_customer_vpc(self) -> ec2.IVpc:
+        """Use a customer-provided VPC and private subnets instead of creating a VPC.
+
+        The supplied subnets are registered as the *isolated* subnet group so every
+        ``SubnetSelection(subnet_type=PRIVATE_ISOLATED)`` in this stack resolves to them
+        unchanged. The stack still creates every VPC endpoint it needs inside these subnets;
+        gateway endpoints (S3, DynamoDB) attach to the supplied route tables. Flow logs are
+        not created for a VPC the stack does not own.
+        """
+        config = self.config
+        vpc = ec2.Vpc.from_vpc_attributes(
+            self,
+            "CustomerVpc",
+            vpc_id=cast(str, config.vpc_id),
+            availability_zones=list(config.availability_zones),
+            isolated_subnet_ids=list(config.subnet_ids),
+            isolated_subnet_route_table_ids=list(config.route_table_ids),
+        )
+        existing = config.existing_endpoint_map
+        if "s3" not in existing:
+            vpc.add_gateway_endpoint("S3Endpoint", service=ec2.GatewayVpcEndpointAwsService.S3)
+        if "dynamodb" not in existing:
+            vpc.add_gateway_endpoint(
+                "DynamoDbEndpoint", service=ec2.GatewayVpcEndpointAwsService.DYNAMODB
+            )
+        return vpc
+
+    def _interface_endpoint(
+        self,
+        construct_id: str,
+        service_key: str,
+        service: ec2.InterfaceVpcEndpointAwsService,
+        security_group: ec2.SecurityGroup,
+    ) -> ec2.IInterfaceVpcEndpoint:
+        """Create an interface endpoint, or import a pre-existing one from the customer VPC.
+
+        When the customer VPC already has an endpoint for this service, a second one with
+        private DNS cannot be created, so the existing endpoint is imported by id. Our
+        endpoint security group cannot be attached to an endpoint we do not own, so the
+        imported endpoint's own security group is instead granted HTTPS ingress from every
+        source that our endpoint security group would have admitted. Endpoint policies are
+        not modified on imported endpoints: the customer owns that policy.
+        """
+        existing = self.config.existing_endpoint_map.get(service_key)
+        if existing is None:
+            return self.vpc.add_interface_endpoint(
+                construct_id,
+                service=service,
+                private_dns_enabled=True,
+                open=False,
+                security_groups=[security_group],
+                subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_ISOLATED),
+            )
+        endpoint_id, security_group_id = existing
+        imported_sg = ec2.SecurityGroup.from_security_group_id(
+            self, f"{construct_id}ExistingSecurityGroup", security_group_id, mutable=True
+        )
+        self._imported_endpoint_security_groups[service_key] = imported_sg
+        # Replay ingress granted on our (now unused) endpoint SG onto the customer's SG;
+        # later grants go through _allow_endpoint_ingress, which targets this mirror.
+        for source, description in self._endpoint_ingress_sources.get(service_key, []):
+            imported_sg.add_ingress_rule(source, ec2.Port.tcp(443), description)
+        return ec2.InterfaceVpcEndpoint.from_interface_vpc_endpoint_attributes(
+            self,
+            construct_id,
+            vpc_endpoint_id=endpoint_id,
+            port=443,
+            security_groups=[imported_sg],
+        )
+
+    def _allow_endpoint_ingress(
+        self,
+        service_key: str,
+        endpoint_security_group: ec2.SecurityGroup,
+        source: ec2.SecurityGroup,
+        description: str,
+    ) -> None:
+        """Allow HTTPS from a Lambda SG to a service endpoint, whether ours or imported.
+
+        Grants made before the endpoint is imported are recorded so the import replays
+        them onto the customer's security group; call order does not matter.
+        """
+        imported = self._imported_endpoint_security_groups.get(service_key)
+        if imported is not None:
+            imported.add_ingress_rule(source, ec2.Port.tcp(443), description)
+            return
+        endpoint_security_group.add_ingress_rule(source, ec2.Port.tcp(443), description)
+        self._endpoint_ingress_sources.setdefault(service_key, []).append((source, description))
+
     def _create_ingestion_vpc(self) -> ec2.Vpc:
         availability_zones = 3 if self.config.environment is DeploymentEnvironment.PROD else 2
         # Isolated subnets and zero NAT gateways force service traffic through endpoints.
@@ -537,6 +638,7 @@ class DataQualityStack(Stack):
         construct_id: str,
         service_name: str,
         *,
+        service_key: str,
         allow_ingestion: bool = True,
     ) -> ec2.SecurityGroup:
         security_group = ec2.SecurityGroup(
@@ -547,10 +649,12 @@ class DataQualityStack(Stack):
             description=f"Allows HTTPS to {service_name} only from authorized Lambdas",
         )
         if allow_ingestion:
+            description = f"HTTPS from ingestion Lambdas to {service_name}"
             security_group.add_ingress_rule(
-                self.ingestion_security_group,
-                ec2.Port.tcp(443),
-                f"HTTPS from ingestion Lambdas to {service_name}",
+                self.ingestion_security_group, ec2.Port.tcp(443), description
+            )
+            self._endpoint_ingress_sources.setdefault(service_key, []).append(
+                (self.ingestion_security_group, description)
             )
         return security_group
 
@@ -860,39 +964,43 @@ class DataQualityStack(Stack):
         )
         return cluster
 
-    def _create_data_api_endpoint(self) -> ec2.InterfaceVpcEndpoint:
+    def _create_data_api_endpoint(self) -> ec2.IInterfaceVpcEndpoint:
         # Lambdas use HTTPS Data API calls; no PostgreSQL socket path or port 5432 rule exists.
-        endpoint = self.vpc.add_interface_endpoint(
+        endpoint = self._interface_endpoint(
             "RdsDataEndpoint",
-            service=ec2.InterfaceVpcEndpointAwsService.RDS_DATA,
-            private_dns_enabled=True,
-            open=False,
-            security_groups=[self.data_api_endpoint_security_group],
-            subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_ISOLATED),
+            "rds-data",
+            ec2.InterfaceVpcEndpointAwsService.RDS_DATA,
+            self.data_api_endpoint_security_group,
         )
-        endpoint.add_to_policy(
+        self._endpoint_policy(
+            endpoint,
             iam.PolicyStatement(
                 principals=[self.hl7_role, self.ccda_role],
                 actions=["rds-data:ExecuteStatement", "rds-data:BatchExecuteStatement"],
                 resources=[self.metadata_cluster.cluster_arn],
-            )
+            ),
         )
         return endpoint
 
-    def _create_sqs_endpoint(self) -> ec2.InterfaceVpcEndpoint:
+    def _create_sqs_endpoint(self) -> ec2.IInterfaceVpcEndpoint:
         # The reingestion planner is the only Lambda that *sends* to SQS from inside the
         # isolated subnets (every other function is invoked by a queue, which needs no
         # outbound path). Without this endpoint, SendMessage hangs through boto retries
         # and the job never advances past its expected count. The endpoint policy and
         # security-group ingress are granted where the planner role is defined.
-        return self.vpc.add_interface_endpoint(
+        return self._interface_endpoint(
             "SqsEndpoint",
-            service=ec2.InterfaceVpcEndpointAwsService.SQS,
-            private_dns_enabled=True,
-            open=False,
-            security_groups=[self.sqs_endpoint_security_group],
-            subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_ISOLATED),
+            "sqs",
+            ec2.InterfaceVpcEndpointAwsService.SQS,
+            self.sqs_endpoint_security_group,
         )
+
+    def _endpoint_policy(
+        self, endpoint: ec2.IInterfaceVpcEndpoint, statement: iam.PolicyStatement
+    ) -> None:
+        """Attach an endpoint policy only to endpoints this stack created."""
+        if isinstance(endpoint, ec2.InterfaceVpcEndpoint):
+            endpoint.add_to_policy(statement)
 
     def _grant_metadata_access(self, role: iam.Role) -> None:
         role.add_to_policy(
@@ -1198,17 +1306,19 @@ class DataQualityStack(Stack):
         if self.metadata_cluster.secret is None:
             raise RuntimeError(AURORA_CREDENTIALS_MISSING)
         self.metadata_cluster.secret.grant_read(self.explorer_role)
-        self.data_api_endpoint_security_group.add_ingress_rule(
+        self._allow_endpoint_ingress(
+            "rds-data",
+            self.data_api_endpoint_security_group,
             self.explorer_security_group,
-            ec2.Port.tcp(443),
             "HTTPS from the explorer Lambda to the RDS Data API",
         )
-        self.data_api_endpoint.add_to_policy(
+        self._endpoint_policy(
+            self.data_api_endpoint,
             iam.PolicyStatement(
                 principals=[self.explorer_role],
                 actions=["rds-data:ExecuteStatement"],
                 resources=[self.metadata_cluster.cluster_arn],
-            )
+            ),
         )
 
     def _create_report_runner_security_group(self) -> ec2.SecurityGroup:
@@ -1314,7 +1424,7 @@ class DataQualityStack(Stack):
             vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_ISOLATED),
         )
 
-    def _create_lambda_vpc_endpoint(self) -> ec2.InterfaceVpcEndpoint:
+    def _create_lambda_vpc_endpoint(self) -> ec2.IInterfaceVpcEndpoint:
         # The explorer invokes the runner over a private Lambda endpoint; no NAT path exists.
         security_group = ec2.SecurityGroup(
             self,
@@ -1323,18 +1433,18 @@ class DataQualityStack(Stack):
             allow_all_outbound=False,
             description="Allows HTTPS to the Lambda API only from the explorer",
         )
+        description = "HTTPS from the explorer Lambda to the Lambda API"
         security_group.add_ingress_rule(
-            self.explorer_security_group,
-            ec2.Port.tcp(443),
-            "HTTPS from the explorer Lambda to the Lambda API",
+            self.explorer_security_group, ec2.Port.tcp(443), description
         )
-        return self.vpc.add_interface_endpoint(
+        self._endpoint_ingress_sources.setdefault("lambda", []).append(
+            (self.explorer_security_group, description)
+        )
+        return self._interface_endpoint(
             "LambdaEndpoint",
-            service=ec2.InterfaceVpcEndpointAwsService.LAMBDA_,
-            private_dns_enabled=True,
-            open=False,
-            security_groups=[security_group],
-            subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_ISOLATED),
+            "lambda",
+            ec2.InterfaceVpcEndpointAwsService.LAMBDA_,
+            security_group,
         )
 
     def _authorize_report_network(self) -> None:
@@ -1485,29 +1595,33 @@ class DataQualityStack(Stack):
         if self.metadata_cluster.secret is None:
             raise RuntimeError(AURORA_CREDENTIALS_MISSING)
         self.metadata_cluster.secret.grant_read(self.reingest_planner_role)
-        self.data_api_endpoint_security_group.add_ingress_rule(
+        self._allow_endpoint_ingress(
+            "rds-data",
+            self.data_api_endpoint_security_group,
             self.reingest_planner_security_group,
-            ec2.Port.tcp(443),
             "HTTPS from the reingestion planner Lambda to the RDS Data API",
         )
-        self.data_api_endpoint.add_to_policy(
+        self._endpoint_policy(
+            self.data_api_endpoint,
             iam.PolicyStatement(
                 principals=[self.reingest_planner_role],
                 actions=["rds-data:ExecuteStatement"],
                 resources=[self.metadata_cluster.cluster_arn],
-            )
+            ),
         )
-        self.sqs_endpoint_security_group.add_ingress_rule(
+        self._allow_endpoint_ingress(
+            "sqs",
+            self.sqs_endpoint_security_group,
             self.reingest_planner_security_group,
-            ec2.Port.tcp(443),
             "HTTPS from the reingestion planner Lambda to Amazon SQS",
         )
-        self.sqs_endpoint.add_to_policy(
+        self._endpoint_policy(
+            self.sqs_endpoint,
             iam.PolicyStatement(
                 principals=[self.reingest_planner_role],
                 actions=["sqs:SendMessage"],
                 resources=[self.reindex_queue.queue_arn],
-            )
+            ),
         )
 
     def _authorize_reindexer_network(self) -> None:

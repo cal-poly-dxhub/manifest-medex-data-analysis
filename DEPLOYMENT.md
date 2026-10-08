@@ -30,7 +30,50 @@ Edit `config.yaml` and set at least:
 | `account` | The twelve-digit account ID from `get-caller-identity` |
 | `region` | The region to deploy into, e.g. `us-west-2` (replaces the `<region>` placeholder) |
 
-The remaining keys are optional and documented inline. Defaults deploy the `dev` environment with OpenSearch Dashboards browser access enabled for the role you deploy with. `config.yaml` is git-ignored.
+The remaining keys are optional and documented inline.
+
+### Deploying into an existing VPC
+
+By default the stack creates its own isolated VPC. To deploy into a VPC your network team provides instead, fill in all four of these keys in `config.yaml`:
+
+> **Recommended layout: dedicated subnets.** Create two or three new private subnets for this stack (one per Availability Zone) attached to a **new route table** that no other workload uses, rather than reusing subnets other applications share. A gateway endpoint for S3 or DynamoDB is implemented as a route on a route table, and a route table can hold only one such route per service. With a dedicated route table the stack creates its own S3 and DynamoDB gateway endpoints without conflicting with any that already exist elsewhere in the VPC, this stack's traffic is never subject to another team's endpoint policy, and this stack's endpoints never widen network access for anything else. The route table needs only the default `local` route plus whatever route your VPN or transit gateway users need to reach the explorer; no internet or NAT route is required. Interface endpoints (SQS, RDS Data API, Lambda) are VPC-wide because of private DNS, so those are shared regardless of subnet layout; see the endpoint policy note below.
+
+| Key | Value |
+| --- | --- |
+| `vpc_id` | The VPC ID, e.g. `vpc-0123456789abcdef0` |
+| `subnet_ids` | Comma-separated private subnet IDs, at least two |
+| `route_table_ids` | The route table associated with each subnet, same order |
+| `availability_zones` | The AZ of each subnet, same order |
+
+Requirements for the subnets:
+
+- **Private** — no route to an internet gateway. A NAT route is tolerated but not needed; every AWS call goes through VPC endpoints.
+- **Two or more Availability Zones** — Aurora requires a subnet group spanning at least two AZs; one private subnet per AZ (typically three) is the expected layout. The deploy fails validation otherwise.
+- **Free IP space** — the stack creates about six endpoint network interfaces per subnet plus one per concurrent Lambda execution. `/24` or larger per subnet is comfortable.
+- **VPC endpoints** — the stack needs endpoints for S3, DynamoDB, RDS Data API, SQS, Lambda, and OpenSearch Serverless. `deploy.sh` inspects the VPC before deploying: endpoints that already exist are reused (the stack imports them and adds HTTPS ingress for its Lambdas to the endpoint's security group), and missing ones are created in your subnets. Existing endpoints must have a security group attached, and their endpoint policies must allow the relevant actions from this account (the stack does not modify policies on endpoints it does not own). To override detection, set `existing_endpoints` in `config.yaml`.
+
+  **If an existing endpoint has a restrictive policy.** An endpoint policy is evaluated before IAM, for every request that passes through the endpoint. If an endpoint this stack imports allows only specific resources (for example an S3 gateway policy listing particular buckets, or an SQS endpoint policy listing particular queues), this stack's Lambdas will be denied at runtime even though the deploy succeeds and their IAM roles are correct. The symptom is `AccessDenied` in the ingestion Lambda logs, messages landing in the dead-letter queues, and nothing appearing in OpenSearch. Before deploying, check each existing endpoint's policy:
+
+  ```bash
+  aws ec2 describe-vpc-endpoints --filters Name=vpc-id,Values=<vpc-id> \
+    --query "VpcEndpoints[].{service:ServiceName,id:VpcEndpointId,policy:PolicyDocument}" --output json
+  ```
+
+  A policy of `"Effect":"Allow","Principal":"*","Action":"*","Resource":"*"` (the default) or one scoped to this AWS account needs no change. A resource-scoped policy must be extended with this stack's resources after the first deploy: the four data bucket ARNs (`RawBucketName`, `ParsedBucketName`, `ErrorBucketName`, `ReportsBucketName` outputs, each as the bucket ARN and `<arn>/*`), the three DynamoDB table ARNs, the `ReindexQueueUrl` queue ARN for the SQS endpoint, and the Aurora cluster ARN for the RDS Data API endpoint. The dedicated-subnet layout above removes this concern for S3 and DynamoDB entirely.
+
+  **Scope of the endpoints the stack creates.** The S3 and DynamoDB gateway endpoints are created with the default (service-wide) endpoint policy, and a gateway endpoint adds a route to every subnet that shares the route table. Any other workload in those subnets therefore gains a network path to S3 and DynamoDB as a whole; access to individual buckets and tables remains governed by IAM and resource policies. The interface endpoints (RDS Data API, SQS) carry policies limited to this stack's roles and resources. If your network standards require the gateway endpoints to be limited to specific buckets or tables, apply that policy to the endpoint after deployment or supply your own endpoints via `existing_endpoints`.
+
+To find the route table for a subnet:
+
+```bash
+aws ec2 describe-route-tables \
+  --filters Name=association.subnet-id,Values=<subnet-id> \
+  --query "RouteTables[0].RouteTableId" --output text
+```
+
+If a subnet has no explicit association, it uses the VPC's main route table (`aws ec2 describe-route-tables --filters Name=vpc-id,Values=<vpc-id> Name=association.main,Values=true`).
+
+People on your network reach the PHI Explorer through CloudFront and Cognito, not directly, so no security group changes are needed for it. In this mode the stack does not create VPC flow logs (the VPC is not ours to log). The OpenSearch Serverless endpoint is always created, because it is bound to this stack's collection. Everything else — security groups, any missing endpoints, the Aurora subnet group — is created inside your subnets exactly as in the default mode. Defaults deploy the `dev` environment with OpenSearch Dashboards browser access enabled for the role you deploy with. `config.yaml` is git-ignored.
 
 ## 2. Deploy
 
