@@ -99,6 +99,61 @@ CONTEXT_ARGS=(
   -c "project_name=$PROJECT_NAME"
 )
 
+# Optional existing-VPC deployment: pass all four through when any is set; the stack
+# validates completeness and rejects partial input with a clear message.
+VPC_ID="$(cfg vpc_id)"; SUBNET_IDS="$(cfg subnet_ids)"
+ROUTE_TABLE_IDS="$(cfg route_table_ids)"; AVAILABILITY_ZONES="$(cfg availability_zones)"
+if [[ -n "$VPC_ID$SUBNET_IDS$ROUTE_TABLE_IDS$AVAILABILITY_ZONES" ]]; then
+  info "Deploying into existing VPC $VPC_ID"
+  CONTEXT_ARGS+=(
+    -c "vpc_id=$VPC_ID"
+    -c "subnet_ids=$SUBNET_IDS"
+    -c "route_table_ids=$ROUTE_TABLE_IDS"
+    -c "availability_zones=$AVAILABILITY_ZONES"
+  )
+
+  # Discover VPC endpoints that already exist for the services the stack needs. A second
+  # interface endpoint for a service with private DNS cannot be created, so existing ones
+  # are passed to the stack, which imports them instead of creating duplicates.
+  info "Checking $VPC_ID for existing VPC endpoints"
+  EXISTING_ENDPOINTS="$(aws ec2 describe-vpc-endpoints "${AWS_ARGS[@]}" \
+      --filters "Name=vpc-id,Values=$VPC_ID" \
+      --query 'VpcEndpoints[].{svc:ServiceName,type:VpcEndpointType,id:VpcEndpointId,sgs:Groups[].GroupId}' \
+      --output json | REGION="$REGION" python3 -c '
+import json, os, sys
+region = os.environ["REGION"]
+prefix = "com.amazonaws." + region + "."
+wanted = {prefix + name: name for name in ("s3", "dynamodb", "rds-data", "sqs", "lambda")}
+entries = []
+for ep in json.load(sys.stdin):
+    key = wanted.get(ep["svc"])
+    if key is None:
+        continue
+    if ep["type"] == "Gateway":
+        entries.append(key)
+        continue
+    sgs = ep.get("sgs") or []
+    if not sgs:
+        sys.stderr.write("warning: existing " + key + " endpoint " + ep["id"] + " has no security group; cannot import it\n")
+        continue
+    entries.append(key + "=" + ep["id"] + ":" + sgs[0])
+print(",".join(entries))
+')"
+  MANUAL_ENDPOINTS="$(cfg existing_endpoints)"
+  if [[ -n "$MANUAL_ENDPOINTS" ]]; then
+    info "Using existing_endpoints from config (overrides detection): $MANUAL_ENDPOINTS"
+    EXISTING_ENDPOINTS="$MANUAL_ENDPOINTS"
+  fi
+  if [[ -n "$EXISTING_ENDPOINTS" ]]; then
+    info "Reusing existing endpoints: $EXISTING_ENDPOINTS"
+    CONTEXT_ARGS+=(-c "existing_endpoints=$EXISTING_ENDPOINTS")
+  else
+    info "No existing endpoints for required services; the stack will create all of them"
+  fi
+else
+  info "No vpc_id configured; the stack will create its own isolated VPC"
+fi
+
 if is_true "$ENABLE_DASH"; then
   if [[ -z "$DASH_ARN" ]]; then
     info "Resolving the Dashboards role from current credentials"

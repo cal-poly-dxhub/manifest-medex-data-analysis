@@ -405,6 +405,8 @@ cp config.yaml.sample config.yaml     # set account and region
 
 Then create the first Cognito user and upload a file to `incoming/hl7/` or `incoming/ccda/` as described there.
 
+**Deploying into your own VPC.** Set `vpc_id`, `subnet_ids`, `route_table_ids`, and `availability_zones` in `config.yaml` and the stack uses your private subnets instead of creating a VPC. Give the stack **dedicated subnets on their own route table**: it then creates its own S3 and DynamoDB gateway endpoints without colliding with existing ones, and its traffic is never subject to another workload's endpoint policy. `deploy.sh` detects any interface endpoints (SQS, RDS Data API, Lambda) that already exist in the VPC and reuses them; if those carry restrictive endpoint policies, this stack's resources must be added to them. Details, including the exact ARNs to add, are in DEPLOYMENT.md under "Deploying into an existing VPC".
+
 # Development tools
 
 The `tools/` directory is development-only and excluded from Lambda assets.

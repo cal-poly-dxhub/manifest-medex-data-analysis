@@ -135,3 +135,99 @@ def test_dashboard_principal_must_be_an_iam_role_arn() -> None:
 
     with pytest.raises(ValidationError, match="dashboard_principal_arn"):
         AppConfig.from_context(app.node)
+
+
+_VPC_ID = "vpc-0123456789abcdef0"
+_SUBNETS = ("subnet-0123456789abcdef0", "subnet-0123456789abcdef1")
+_ROUTE_TABLES = ("rtb-0123456789abcdef0", "rtb-0123456789abcdef1")
+_AZS = ("us-west-2a", "us-west-2b")
+
+
+def test_existing_vpc_requires_all_four_settings_together() -> None:
+    with pytest.raises(ValueError, match="together"):
+        AppConfig(
+            project_name="manifest-medex-data-quality",
+            environment=DeploymentEnvironment.DEV,
+            vpc_id=_VPC_ID,
+        )
+
+
+def test_existing_vpc_requires_two_availability_zones() -> None:
+    with pytest.raises(ValueError, match="two Availability Zones"):
+        AppConfig(
+            project_name="manifest-medex-data-quality",
+            environment=DeploymentEnvironment.DEV,
+            vpc_id=_VPC_ID,
+            subnet_ids=_SUBNETS,
+            route_table_ids=_ROUTE_TABLES,
+            availability_zones=("us-west-2a", "us-west-2a"),
+        )
+
+
+def test_existing_vpc_requires_one_route_table_per_subnet() -> None:
+    with pytest.raises(ValueError, match="one route table per subnet"):
+        AppConfig(
+            project_name="manifest-medex-data-quality",
+            environment=DeploymentEnvironment.DEV,
+            vpc_id=_VPC_ID,
+            subnet_ids=_SUBNETS,
+            route_table_ids=("rtb-0123456789abcdef0",),
+            availability_zones=_AZS,
+        )
+
+
+def test_existing_vpc_accepts_complete_settings() -> None:
+    config = AppConfig(
+        project_name="manifest-medex-data-quality",
+        environment=DeploymentEnvironment.DEV,
+        vpc_id=_VPC_ID,
+        subnet_ids=_SUBNETS,
+        route_table_ids=_ROUTE_TABLES,
+        availability_zones=_AZS,
+    )
+    assert config.uses_existing_vpc is True
+
+
+def test_default_config_creates_its_own_vpc() -> None:
+    config = AppConfig(
+        project_name="manifest-medex-data-quality", environment=DeploymentEnvironment.DEV
+    )
+    assert config.uses_existing_vpc is False
+
+
+def test_existing_endpoints_require_existing_vpc() -> None:
+    with pytest.raises(ValueError, match="only valid together with an existing VPC"):
+        AppConfig(
+            project_name="manifest-medex-data-quality",
+            environment=DeploymentEnvironment.DEV,
+            existing_endpoints=("s3",),
+        )
+
+
+def test_existing_interface_endpoint_needs_endpoint_and_security_group_ids() -> None:
+    with pytest.raises(ValueError, match="sqs=vpce-<id>:sg-<id>"):
+        AppConfig(
+            project_name="manifest-medex-data-quality",
+            environment=DeploymentEnvironment.DEV,
+            vpc_id=_VPC_ID,
+            subnet_ids=_SUBNETS,
+            route_table_ids=_ROUTE_TABLES,
+            availability_zones=_AZS,
+            existing_endpoints=("sqs",),
+        )
+
+
+def test_existing_endpoint_map_parses_gateway_and_interface_entries() -> None:
+    config = AppConfig(
+        project_name="manifest-medex-data-quality",
+        environment=DeploymentEnvironment.DEV,
+        vpc_id=_VPC_ID,
+        subnet_ids=_SUBNETS,
+        route_table_ids=_ROUTE_TABLES,
+        availability_zones=_AZS,
+        existing_endpoints=("s3", "lambda=vpce-0123456789abcdef0:sg-0123456789abcdef0"),
+    )
+    assert config.existing_endpoint_map == {
+        "s3": None,
+        "lambda": ("vpce-0123456789abcdef0", "sg-0123456789abcdef0"),
+    }

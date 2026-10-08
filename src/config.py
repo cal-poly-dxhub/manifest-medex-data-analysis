@@ -1,6 +1,7 @@
 """Validate deployment context and enforce environment-specific safety constraints."""
 
 import os
+import re
 from enum import StrEnum
 from typing import Self
 
@@ -21,6 +22,23 @@ def _context_bool(value: object, *, default: bool) -> bool:
         if normalized in {"0", "false", "no"}:
             return False
     msg = f"Invalid boolean context value: {value!r}"
+    raise ValueError(msg)
+
+
+_GATEWAY_SERVICES = frozenset({"s3", "dynamodb"})
+_INTERFACE_SERVICES = frozenset({"rds-data", "sqs", "lambda"})
+_ENDPOINT_SERVICES = _GATEWAY_SERVICES | _INTERFACE_SERVICES
+
+
+def _context_list(value: object) -> tuple[str, ...]:
+    """Parse a CDK context list given as JSON list or comma-separated string."""
+    if value is None:
+        return ()
+    if isinstance(value, (list, tuple)):
+        return tuple(str(item).strip() for item in value if str(item).strip())
+    if isinstance(value, str):
+        return tuple(item.strip() for item in value.split(",") if item.strip())
+    msg = f"Invalid list context value: {value!r}"
     raise ValueError(msg)
 
 
@@ -49,6 +67,39 @@ class AppConfig(BaseModel):
         pattern=r"^arn:(?:aws|aws-us-gov|aws-cn):iam::\d{12}:role/.+$",
     )
     termination_protection: bool = False
+    # Optional: deploy into a customer-provided VPC instead of creating one. All four must
+    # be supplied together. Subnets must be private (no route to an internet gateway), span
+    # at least two Availability Zones, and have free IP space for endpoint and Lambda ENIs.
+    # The stack still creates every VPC endpoint it needs inside these subnets.
+    vpc_id: str | None = Field(default=None, pattern=r"^vpc-[0-9a-f]{8,17}$")
+    subnet_ids: tuple[str, ...] = ()
+    route_table_ids: tuple[str, ...] = ()
+    availability_zones: tuple[str, ...] = ()
+    # Optional: VPC endpoints that already exist in the customer VPC and must not be
+    # created again (a second interface endpoint for a service with private DNS fails).
+    # Gateway services (s3, dynamodb) need no further detail. Interface services need the
+    # endpoint id and its security group id so the stack can import the endpoint and allow
+    # our Lambdas through its security group. Format per entry:
+    #   "s3" | "dynamodb" | "rds-data=vpce-...:sg-..." | "sqs=vpce-...:sg-..."
+    #   | "lambda=vpce-...:sg-..."
+    existing_endpoints: tuple[str, ...] = ()
+
+    @property
+    def uses_existing_vpc(self) -> bool:
+        return self.vpc_id is not None
+
+    @property
+    def existing_endpoint_map(self) -> dict[str, tuple[str, str] | None]:
+        """Parse ``existing_endpoints`` into {service: (endpoint_id, sg_id) | None}."""
+        parsed: dict[str, tuple[str, str] | None] = {}
+        for entry in self.existing_endpoints:
+            service, _, detail = entry.partition("=")
+            if detail:
+                endpoint_id, _, sg_id = detail.partition(":")
+                parsed[service] = (endpoint_id, sg_id)
+            else:
+                parsed[service] = None
+        return parsed
 
     @model_validator(mode="after")
     def require_safe_production_configuration(self) -> Self:
@@ -71,6 +122,58 @@ class AppConfig(BaseModel):
         elif self.dashboard_principal_arn is not None:
             msg = "dashboard_principal_arn requires enable_public_dashboard=true"
             raise ValueError(msg)
+        existing = (self.vpc_id, self.subnet_ids, self.route_table_ids, self.availability_zones)
+        supplied = [bool(value) for value in existing]
+        if any(supplied) and not all(supplied):
+            msg = (
+                "Existing-VPC deployment requires vpc_id, subnet_ids, route_table_ids, and "
+                "availability_zones together"
+            )
+            raise ValueError(msg)
+        if self.uses_existing_vpc:
+            if len(self.subnet_ids) < 2:
+                msg = "Existing-VPC deployment requires at least two subnets (Aurora needs two AZs)"
+                raise ValueError(msg)
+            if len(self.route_table_ids) != len(self.subnet_ids):
+                msg = "route_table_ids must list one route table per subnet, in the same order"
+                raise ValueError(msg)
+            if len(self.availability_zones) != len(self.subnet_ids):
+                msg = "availability_zones must list one AZ per subnet, in the same order"
+                raise ValueError(msg)
+            if len(set(self.availability_zones)) < 2:
+                msg = "Existing-VPC subnets must span at least two Availability Zones"
+                raise ValueError(msg)
+            for subnet_id in self.subnet_ids:
+                if not re.fullmatch(r"subnet-[0-9a-f]{8,17}", subnet_id):
+                    msg = f"Invalid subnet id: {subnet_id!r}"
+                    raise ValueError(msg)
+            for route_table_id in self.route_table_ids:
+                if not re.fullmatch(r"rtb-[0-9a-f]{8,17}", route_table_id):
+                    msg = f"Invalid route table id: {route_table_id!r}"
+                    raise ValueError(msg)
+        if self.existing_endpoints and not self.uses_existing_vpc:
+            msg = "existing_endpoints is only valid together with an existing VPC"
+            raise ValueError(msg)
+        for entry in self.existing_endpoints:
+            service, _, detail = entry.partition("=")
+            if service not in _ENDPOINT_SERVICES:
+                expected = sorted(_ENDPOINT_SERVICES)
+                msg = f"Unknown endpoint service {service!r}; expected one of {expected}"
+                raise ValueError(msg)
+            if service in _GATEWAY_SERVICES:
+                if detail:
+                    msg = f"Gateway endpoint {service!r} takes no endpoint/security-group detail"
+                    raise ValueError(msg)
+            else:
+                endpoint_id, _, sg_id = detail.partition(":")
+                if not re.fullmatch(r"vpce-[0-9a-f]{8,17}", endpoint_id) or not re.fullmatch(
+                    r"sg-[0-9a-f]{8,17}", sg_id
+                ):
+                    msg = (
+                        f"Interface endpoint {service!r} must be given as "
+                        f"{service}=vpce-<id>:sg-<id> (got {entry!r})"
+                    )
+                    raise ValueError(msg)
         if self.account is not None and self.dashboard_principal_arn is not None:
             principal_account = self.dashboard_principal_arn.split(":", maxsplit=5)[4]
             if principal_account != self.account:
@@ -124,4 +227,9 @@ class AppConfig(BaseModel):
                 else None
             ),
             termination_protection=termination_protection,
+            vpc_id=(str(value).strip() if (value := node.try_get_context("vpc_id")) else None),
+            subnet_ids=_context_list(node.try_get_context("subnet_ids")),
+            route_table_ids=_context_list(node.try_get_context("route_table_ids")),
+            availability_zones=_context_list(node.try_get_context("availability_zones")),
+            existing_endpoints=_context_list(node.try_get_context("existing_endpoints")),
         )

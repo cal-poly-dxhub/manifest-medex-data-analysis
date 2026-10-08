@@ -1479,3 +1479,131 @@ def test_stack_outputs_reingest_coordinates() -> None:
         "ReindexerFunctionName",
     ):
         assert output in outputs
+
+
+_CUSTOMER_VPC_ID = "vpc-0123456789abcdef0"
+_CUSTOMER_SUBNET_IDS = ("subnet-0123456789abcdef0", "subnet-0123456789abcdef1")
+_CUSTOMER_ROUTE_TABLE_IDS = ("rtb-0123456789abcdef0", "rtb-0123456789abcdef1")
+_CUSTOMER_AZS = ("us-west-2a", "us-west-2b")
+
+
+def _build_existing_vpc_stack() -> Template:
+    app = App()
+    config = AppConfig(
+        project_name="manifest-medex-data-quality",
+        environment=DeploymentEnvironment.DEV,
+        vpc_id=_CUSTOMER_VPC_ID,
+        subnet_ids=_CUSTOMER_SUBNET_IDS,
+        route_table_ids=_CUSTOMER_ROUTE_TABLE_IDS,
+        availability_zones=_CUSTOMER_AZS,
+    )
+    stack = DataQualityStack(app, "TestStack", config=config)
+    return Template.from_stack(stack)
+
+
+def test_existing_vpc_mode_creates_no_vpc_subnets_or_flow_log() -> None:
+    template = _build_existing_vpc_stack()
+
+    assert template.find_resources("AWS::EC2::VPC") == {}
+    assert template.find_resources("AWS::EC2::Subnet") == {}
+    assert template.find_resources("AWS::EC2::FlowLog") == {}
+    assert template.find_resources("AWS::EC2::NatGateway") == {}
+
+
+def test_existing_vpc_mode_still_creates_every_endpoint_inside_customer_subnets() -> None:
+    template = _build_existing_vpc_stack()
+    rendered = json.dumps(template.to_json())
+
+    # S3, DynamoDB gateways + RDS Data API, SQS, Lambda interfaces + the AOSS endpoint.
+    assert len(template.find_resources("AWS::EC2::VPCEndpoint")) == 5
+    assert len(template.find_resources("AWS::OpenSearchServerless::VpcEndpoint")) == 1
+    for subnet_id in _CUSTOMER_SUBNET_IDS:
+        assert subnet_id in rendered
+    # Gateway endpoints attach to the customer's route tables.
+    for route_table_id in _CUSTOMER_ROUTE_TABLE_IDS:
+        assert route_table_id in rendered
+
+
+def test_existing_vpc_mode_binds_every_security_group_and_aurora_to_customer_vpc() -> None:
+    template = _build_existing_vpc_stack()
+
+    for group in template.find_resources("AWS::EC2::SecurityGroup").values():
+        assert group["Properties"]["VpcId"] == _CUSTOMER_VPC_ID
+    subnet_groups = template.find_resources("AWS::RDS::DBSubnetGroup")
+    assert len(subnet_groups) == 1
+    subnet_group = next(iter(subnet_groups.values()))
+    assert sorted(subnet_group["Properties"]["SubnetIds"]) == sorted(_CUSTOMER_SUBNET_IDS)
+
+
+def test_default_mode_is_unchanged_and_creates_its_own_vpc() -> None:
+    _, _, template = build_stack()
+
+    assert len(template.find_resources("AWS::EC2::VPC")) == 1
+    assert len(template.find_resources("AWS::EC2::FlowLog")) == 1
+
+
+def _build_existing_vpc_stack_with_endpoints(existing: tuple[str, ...]) -> Template:
+    app = App()
+    config = AppConfig(
+        project_name="manifest-medex-data-quality",
+        environment=DeploymentEnvironment.DEV,
+        vpc_id=_CUSTOMER_VPC_ID,
+        subnet_ids=_CUSTOMER_SUBNET_IDS,
+        route_table_ids=_CUSTOMER_ROUTE_TABLE_IDS,
+        availability_zones=_CUSTOMER_AZS,
+        existing_endpoints=existing,
+    )
+    return Template.from_stack(DataQualityStack(app, "TestStack", config=config))
+
+
+def test_existing_gateway_endpoints_are_not_recreated() -> None:
+    template = _build_existing_vpc_stack_with_endpoints(("s3", "dynamodb"))
+    services = [
+        json.dumps(v["Properties"]["ServiceName"])
+        for v in template.find_resources("AWS::EC2::VPCEndpoint").values()
+    ]
+    assert len(services) == 3  # rds-data, sqs, lambda interfaces only
+    assert not any(".s3" in s for s in services)
+    assert not any(".dynamodb" in s for s in services)
+
+
+def test_existing_interface_endpoint_is_imported_and_its_security_group_opened() -> None:
+    template = _build_existing_vpc_stack_with_endpoints(
+        ("sqs=vpce-0aaaaaaaaaaaaaaaa:sg-0bbbbbbbbbbbbbbbb",)
+    )
+    services = [
+        json.dumps(v["Properties"]["ServiceName"])
+        for v in template.find_resources("AWS::EC2::VPCEndpoint").values()
+    ]
+    assert not any(".sqs" in s for s in services)
+    ingress = [
+        rule["Properties"]
+        for rule in template.find_resources("AWS::EC2::SecurityGroupIngress").values()
+        if rule["Properties"].get("GroupId") == "sg-0bbbbbbbbbbbbbbbb"
+    ]
+    assert len(ingress) == 1
+    assert "reingestion planner" in ingress[0]["Description"]
+    assert ingress[0]["FromPort"] == 443
+    # The customer owns the endpoint policy; the stack must not attach one to the imported
+    # endpoint (the planner's IAM role still legitimately holds sqs:SendMessage).
+    endpoint_policies = [
+        json.dumps(v["Properties"].get("PolicyDocument", {}))
+        for v in template.find_resources("AWS::EC2::VPCEndpoint").values()
+    ]
+    assert not any("sqs:SendMessage" in policy for policy in endpoint_policies)
+
+
+def test_ingress_granted_before_import_is_replayed_onto_imported_endpoint() -> None:
+    template = _build_existing_vpc_stack_with_endpoints(
+        ("rds-data=vpce-0cccccccccccccccc:sg-0dddddddddddddddd",)
+    )
+    descriptions = sorted(
+        rule["Properties"]["Description"]
+        for rule in template.find_resources("AWS::EC2::SecurityGroupIngress").values()
+        if rule["Properties"].get("GroupId") == "sg-0dddddddddddddddd"
+    )
+    assert descriptions == [
+        "HTTPS from ingestion Lambdas to RDS Data API",
+        "HTTPS from the explorer Lambda to the RDS Data API",
+        "HTTPS from the reingestion planner Lambda to the RDS Data API",
+    ]
