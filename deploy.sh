@@ -116,18 +116,23 @@ if [[ -n "$VPC_ID$SUBNET_IDS$ROUTE_TABLE_IDS$AVAILABILITY_ZONES" ]]; then
   # interface endpoint for a service with private DNS cannot be created, so existing ones
   # are passed to the stack, which imports them instead of creating duplicates.
   info "Checking $VPC_ID for existing VPC endpoints"
+  # Endpoints this stack created on an earlier deploy carry its CloudFormation stack-name
+  # tag and must be skipped: reporting them as pre-existing would make the stack drop
+  # them from its template, and CloudFormation would delete them.
+  STACK_NAME="$PROJECT_NAME-$ENVIRONMENT"
   EXISTING_ENDPOINTS="$(aws ec2 describe-vpc-endpoints "${AWS_ARGS[@]}" \
       --filters "Name=vpc-id,Values=$VPC_ID" \
-      --query 'VpcEndpoints[].{svc:ServiceName,type:VpcEndpointType,id:VpcEndpointId,sgs:Groups[].GroupId}' \
-      --output json | REGION="$REGION" python3 -c '
+      --query 'VpcEndpoints[].{svc:ServiceName,type:VpcEndpointType,id:VpcEndpointId,sgs:Groups[].GroupId,stack:Tags[?Key==`aws:cloudformation:stack-name`].Value|[0]}' \
+      --output json | REGION="$REGION" STACK_NAME="$STACK_NAME" python3 -c '
 import json, os, sys
 region = os.environ["REGION"]
+stack_name = os.environ["STACK_NAME"]
 prefix = "com.amazonaws." + region + "."
 wanted = {prefix + name: name for name in ("s3", "dynamodb", "rds-data", "sqs", "lambda")}
 entries = []
 for ep in json.load(sys.stdin):
     key = wanted.get(ep["svc"])
-    if key is None:
+    if key is None or ep.get("stack") == stack_name:
         continue
     if ep["type"] == "Gateway":
         entries.append(key)
