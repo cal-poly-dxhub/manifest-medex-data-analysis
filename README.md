@@ -402,6 +402,8 @@ Reports routes include:
 Full steps are in **[DEPLOYMENT.md](DEPLOYMENT.md)** — prerequisites, configuration, first user, loading data, Dashboards, verification, and the underlying CDK commands for reference. `deploy.sh` is the only supported way to deploy. The short version:
 
 ```bash
+git clone https://github.com/cal-poly-dxhub/manifest-medex-data-analysis.git
+cd manifest-medex-data-analysis
 cp config.yaml.sample config.yaml     # set account and region
 ./deploy.sh                           # validate, bootstrap if needed, deploy
 ```

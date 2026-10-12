@@ -4,11 +4,15 @@ This deploys the Manifest MedEx data-quality platform into an AWS account with C
 
 ## Prerequisites
 
-- An AWS account with credentials configured, so that `aws sts get-caller-identity` works. Use an administrator or equivalent deployment role; the stack creates IAM roles, a VPC, KMS keys, and an OpenSearch Serverless collection.
-- **Python 3.12 or 3.13** and [uv](https://docs.astral.sh/uv/) 0.11 or later.
-- **Node.js 22** and npm (`nvm use` reads `.nvmrc`). The frontend is built during deployment.
-- The AWS CDK v2 CLI. The app pins `aws-cdk-lib` 2.263.0; if you see a "Cloud assembly schema version mismatch" error, upgrade with `npm i -g aws-cdk@latest`.
-- The AWS CLI v2.
+Install these first; each links to its official installation guide.
+
+- **Git** — [install](https://git-scm.com/downloads), to clone the repository.
+- **An AWS account with credentials configured**, so that `aws sts get-caller-identity` works ([configure the AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/cli-chap-configure.html); for IAM Identity Center use [`aws configure sso`](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sso.html)). Use an administrator or equivalent deployment role; the stack creates IAM roles, a VPC, KMS keys, and an OpenSearch Serverless collection.
+- **The AWS CLI v2** — [install](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html).
+- **Python 3.12 or 3.13** — [install](https://www.python.org/downloads/), or let uv manage it ([`uv python install`](https://docs.astral.sh/uv/guides/install-python/)).
+- **[uv](https://docs.astral.sh/uv/) 0.11 or later** — [install](https://docs.astral.sh/uv/getting-started/installation/).
+- **Node.js 22 and npm** — [install](https://nodejs.org/en/download), or use [nvm](https://github.com/nvm-sh/nvm#installing-and-updating) (`nvm use` reads `.nvmrc`). The frontend is built during deployment.
+- **The AWS CDK v2 CLI** — [install](https://docs.aws.amazon.com/cdk/v2/guide/getting-started.html#getting-started-install) (`npm install -g aws-cdk`). The app pins `aws-cdk-lib` 2.263.0; if you see a "Cloud assembly schema version mismatch" error, upgrade with `npm i -g aws-cdk@latest`.
 - Docker is **not** required. Lambda code is bundled locally from pure-Python dependencies.
 
 Verify your identity and note the account ID; the config file needs it:
@@ -18,6 +22,15 @@ aws sts get-caller-identity
 ```
 
 ## 1. Configure
+
+Clone the repository and work from its root; every command in this guide assumes that directory:
+
+```bash
+git clone https://github.com/cal-poly-dxhub/manifest-medex-data-analysis.git
+cd manifest-medex-data-analysis
+```
+
+Create your configuration from the template:
 
 ```bash
 cp config.yaml.sample config.yaml
