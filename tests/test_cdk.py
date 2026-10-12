@@ -678,6 +678,7 @@ def test_http_api_exposes_only_the_authenticated_explorer_routes() -> None:
         "GET /messages",
         "GET /messages/{documentId}",
         "POST /messages/{documentId}/body",
+        "POST /messages/{documentId}/download-url",
         "POST /query",
         "POST /query-test",
         "POST /search",
@@ -1130,7 +1131,8 @@ def test_reports_routes_are_jwt_and_never_presign_downloads() -> None:
         if route["Properties"]["RouteKey"] in report_routes
     )
 
-    # No role may mint presigned URLs; downloads stream through the authenticated Lambda.
+    # Report downloads stream through the authenticated Lambda; no role grants presigning
+    # beyond its own object reads (message-body download URLs reuse the explorer's reads).
     stack_policies = json.dumps(template.find_resources("AWS::IAM::Policy"))
     assert "s3:presign" not in stack_policies.lower()
 

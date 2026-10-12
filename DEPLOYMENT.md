@@ -52,6 +52,8 @@ Requirements for the subnets:
 - **Free IP space** — the stack creates about six endpoint network interfaces per subnet plus one per concurrent Lambda execution. `/24` or larger per subnet is comfortable.
 - **VPC endpoints** — the stack needs endpoints for S3, DynamoDB, RDS Data API, SQS, Lambda, and OpenSearch Serverless. `deploy.sh` inspects the VPC before deploying: endpoints that already exist are reused (the stack imports them and adds HTTPS ingress for its Lambdas to the endpoint's security group), and missing ones are created in your subnets. Existing endpoints must have a security group attached, and their endpoint policies must allow the relevant actions from this account (the stack does not modify policies on endpoints it does not own). To override detection, set `existing_endpoints` in `config.yaml`.
 
+  **Detection happens only in `deploy.sh`.** The CDK app makes no AWS calls during synthesis, so it cannot see what is already in the VPC; it creates every endpoint not listed in `existing_endpoints`. Deploying with `cdk deploy` directly into a VPC that already has any of these endpoints therefore fails partway through and rolls back: a second S3 or DynamoDB gateway endpoint conflicts with the existing route on the route table, and a second SQS, Lambda, or RDS Data API interface endpoint is rejected because its private DNS name is already taken. Detection also runs only at deploy time, so if endpoints are added to or removed from the VPC later, run `./deploy.sh` again. If you deploy without the script anyway, pass the existing endpoints yourself (see "Manual deployment" under Reference).
+
   **If an existing endpoint has a restrictive policy.** An endpoint policy is evaluated before IAM, for every request that passes through the endpoint. If an endpoint this stack imports allows only specific resources (for example an S3 gateway policy listing particular buckets, or an SQS endpoint policy listing particular queues), this stack's Lambdas will be denied at runtime even though the deploy succeeds and their IAM roles are correct. The symptom is `AccessDenied` in the ingestion Lambda logs, messages landing in the dead-letter queues, and nothing appearing in OpenSearch. Before deploying, check each existing endpoint's policy:
 
   ```bash
@@ -82,7 +84,7 @@ People on your network reach the PHI Explorer through CloudFront and Cognito, no
 ./deploy.sh
 ```
 
-The script installs dependencies, builds the frontend, runs the validation suite, bootstraps CDK if the account/region has not been bootstrapped before, and deploys. The first deployment takes roughly 15–20 minutes, most of it Aurora and the OpenSearch collection. Later deployments take a few minutes.
+`deploy.sh` is the only supported way to deploy. It installs dependencies, builds the frontend, runs the validation suite, bootstraps CDK if the account/region has not been bootstrapped before, inspects an existing VPC for endpoints the stack should reuse, and deploys. The first deployment takes roughly 15–20 minutes, most of it Aurora and the OpenSearch collection. Later deployments take a few minutes.
 
 It refuses to run if `account` is still the `<account-number>` placeholder or if your credentials belong to a different account than the one configured.
 
@@ -100,7 +102,7 @@ All outputs are also saved to `cdk-outputs.json`.
 
 ### Manual deployment
 
-If you prefer to run the CDK commands directly, or need them for CI, see "Manual deployment" under Reference below.
+Running the CDK commands directly is not supported. They are documented under "Manual deployment" in Reference below so you can see what `deploy.sh` does, or adapt it for CI. Anything you run yourself must repeat every step `deploy.sh` performs, including the endpoint detection described there.
 
 ## 3. Create the first user
 
@@ -180,7 +182,7 @@ Quick checks (the detailed list is under Reference → "Verify processing"):
 - Everything runs in an isolated VPC with no NAT gateway; Lambdas reach AWS services through VPC endpoints. There is no public database or search endpoint.
 - The S3 buckets, Aurora cluster, OpenSearch collection, DynamoDB tables, KMS key, and Cognito pool are set to **RETAIN** on stack deletion. If you are tearing the system down for good, delete them by hand after `cdk destroy`.
 - `enable_public_dashboard` exposes only the Dashboards endpoint (IAM-authenticated) and is refused outside the `dev` environment. For a production posture, reach Dashboards through a VPN or VPC path instead.
-- Context flags passed to `cdk deploy` do not persist between runs; `deploy.sh` re-applies them from `config.yaml` every time, which is why the script is the recommended path.
+- Context flags passed to `cdk deploy` do not persist between runs; `deploy.sh` re-applies them from `config.yaml` every time, and also detects existing VPC endpoints, which is why it is the only supported deployment path.
 
 ## Reference
 
@@ -235,7 +237,32 @@ uv run cdk synth
 
 ### Manual deployment
 
-The remaining subsections document the underlying commands for reference or for CI pipelines.
+The remaining subsections document the underlying commands for reference or for CI pipelines. Deploying this way is not supported; `deploy.sh` is the supported path. Running `cdk` directly skips the steps the script performs: reading `config.yaml`, building `web/dist`, validation, resolving the Dashboards role, and detecting existing VPC endpoints.
+
+**Existing VPC without `deploy.sh`.** Pass the four VPC keys plus `existing_endpoints` on every `cdk diff` and `cdk deploy`. List each service whose endpoint already exists in the VPC, using the same format as `config.yaml` (gateway services by name; interface services with the endpoint ID and its first security group):
+
+```bash
+aws ec2 describe-vpc-endpoints --filters Name=vpc-id,Values=<vpc-id> \
+  --query "VpcEndpoints[].[ServiceName,VpcEndpointType,VpcEndpointId,Groups[0].GroupId]" --output table \
+  --profile <approved-aws-profile>
+```
+
+Only `com.amazonaws.<region>.s3`, `dynamodb`, `rds-data`, `sqs`, and `lambda` matter. For example, a VPC with an S3 gateway endpoint and an SQS interface endpoint becomes:
+
+```bash
+uv run cdk deploy \
+  -c environment=dev \
+  -c account=<account-number> \
+  -c region=us-west-2 \
+  -c vpc_id=vpc-0123456789abcdef0 \
+  -c subnet_ids=subnet-0123456789abcdef0,subnet-0fedcba9876543210 \
+  -c route_table_ids=rtb-0123456789abcdef0,rtb-0fedcba9876543210 \
+  -c availability_zones=us-west-2a,us-west-2b \
+  -c existing_endpoints=s3,sqs=vpce-0123456789abcdef0:sg-0123456789abcdef0 \
+  --profile <approved-aws-profile>
+```
+
+Leave `existing_endpoints` out only if the VPC has none of the five. Any endpoint you omit is created by the stack, and the deploy fails if one already exists.
 
 Bootstrap each target account and region once:
 
@@ -412,7 +439,7 @@ After an approved deployment:
 3. Open `https://<FrontendDistributionDomainName>/`. The app redirects unauthenticated users to Cognito Hosted UI and returns to the distribution after Authorization Code + PKCE completes.
 4. Apply ingestion-time/source-format filters, page using the opaque keyset cursor, select one document, and open only the required raw or parsed body tab.
 5. If SQL access is required, open **SQL query**, enter one statement, and use **Run query**. The loading circle remains visible until execution finishes. Saved queries stay only in that browser's local storage.
-6. Confirm successful body access creates exactly one structured `message_body_fetched` audit event with caller `sub`, document ID, variant, and timestamp, and no body or clinical fields. Confirm successful SQL execution logs metadata only, not SQL text or result values.
+6. Confirm successful body access creates exactly one structured `message_body_fetched` audit event with caller `sub`, document ID, variant, truncation flag, and timestamp, and no body or clinical fields. For a document over 4 MiB, confirm the Raw tab shows a truncated preview with **Download full file**, and that downloading writes one `message_body_download_url_issued` event that does not contain the URL. Confirm successful SQL execution logs metadata only, not SQL text or result values.
 
 Do not share distribution URLs, tokens, audit records, or screenshots containing identifiers outside approved clinical-data handling channels.
 

@@ -17,6 +17,7 @@ import {
   type ImportReportResult,
   type MessageBody,
   type MessageDetailRecord,
+  type MessageDownloadUrl,
   type MessageFilters,
   type MessageListResponse,
   type QueryTestRequest,
@@ -518,6 +519,24 @@ export function useStartReportRun(): UseMutationResult<
         queryKey: queryKeys.reportRuns(variables.reportId),
       });
     },
+  });
+}
+
+export interface MessageDownloadUrlVariables {
+  readonly id: string;
+  readonly variant: BodyVariant;
+}
+
+/** Mint a short-lived presigned URL for one full stored body. Never cached. */
+export function useMessageDownloadUrl(): UseMutationResult<
+  MessageDownloadUrl,
+  Error,
+  MessageDownloadUrlVariables
+> {
+  const client = useApiClient();
+  return useMutation({
+    mutationFn: (variables: MessageDownloadUrlVariables) =>
+      client.createMessageDownloadUrl(variables.id, variables.variant),
   });
 }
 

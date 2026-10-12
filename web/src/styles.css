@@ -327,6 +327,30 @@ select {
   border-radius: var(--radius);
 }
 
+.body-truncated {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.body-truncated__notice {
+  margin: 0;
+  color: var(--color-muted);
+  font-size: 0.85rem;
+}
+
+.body-download {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.body-download__error {
+  margin: 0;
+  color: var(--color-error-text);
+  font-size: 0.85rem;
+}
+
 /* ---- States ---- */
 .state {
   display: flex;

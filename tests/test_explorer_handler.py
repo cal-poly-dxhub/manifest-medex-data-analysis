@@ -47,10 +47,14 @@ class FakeBody:
     def __init__(self, payload: bytes | str) -> None:
         self.payload = payload
         self.amounts: list[int | None] = []
+        self.closed = False
 
     def read(self, amount: int | None = None) -> bytes | str:
         self.amounts.append(amount)
         return self.payload if amount is None else self.payload[:amount]
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class FakeS3:
@@ -61,12 +65,15 @@ class FakeS3:
         content_length: int | None = None,
         error: Exception | None = None,
         body: object | None = None,
+        presign_error: Exception | None = None,
     ) -> None:
         self.payload = payload
         self.content_length = len(payload) if content_length is None else content_length
         self.error = error
         self.body = body
+        self.presign_error = presign_error
         self.calls: list[dict[str, Any]] = []
+        self.presign_calls: list[dict[str, Any]] = []
 
     def get_object(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(kwargs)
@@ -76,6 +83,12 @@ class FakeS3:
             "Body": self.body if self.body is not None else BytesIO(self.payload),
             "ContentLength": self.content_length,
         }
+
+    def generate_presigned_url(self, **kwargs: Any) -> str:
+        self.presign_calls.append(kwargs)
+        if self.presign_error is not None:
+            raise self.presign_error
+        return "https://raw-bucket.s3.example/presigned-signature-must-not-be-logged"
 
 
 def _field(value: Any) -> dict[str, Any]:
@@ -312,7 +325,9 @@ def test_body_fetch_uses_exact_s3_version_and_audits_without_content(
 
     result = _explorer(data_api, s3).get_body(DOCUMENT_A, variant, "caller-subject")
 
-    assert result == BodyResult(content=content, content_type=expected_type)
+    assert result == BodyResult(
+        content=content, content_type=expected_type, total_bytes=len(content)
+    )
     expected_bucket = "raw-bucket" if variant == "raw" else "parsed-bucket"
     assert s3.calls == [{"Bucket": expected_bucket, "Key": uri_key, "VersionId": version_id}]
     audit = json.loads(caplog.messages[-1])
@@ -320,6 +335,7 @@ def test_body_fetch_uses_exact_s3_version_and_audits_without_content(
     assert audit["callerSub"] == "caller-subject"
     assert audit["documentId"] == DOCUMENT_A
     assert audit["variant"] == variant
+    assert audit["truncated"] is False
     assert "clinical-content" not in caplog.text
 
 
@@ -336,8 +352,31 @@ def test_body_fetch_rejects_invalid_variant_storage_reference_and_size() -> None
     too_large = FakeDataApi([{"records": [_detail_record()]}])
     with pytest.raises(RequestError, match="message_body_too_large"):
         _explorer(too_large, FakeS3(content_length=1025), max_body_bytes=1024).get_body(
-            DOCUMENT_A, "raw", "caller"
+            DOCUMENT_A, "parsed", "caller"
         )
+
+
+def test_oversized_raw_body_returns_truncated_preview(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    data_api = FakeDataApi([{"records": [_detail_record(source_format="ccda")]}])
+    body = FakeBody(b"0123456789")
+    caplog.set_level(logging.INFO, logger="src.explorer_handler")
+
+    result = _explorer(data_api, FakeS3(body=body, content_length=10), max_body_bytes=4).get_body(
+        DOCUMENT_A, "raw", "caller"
+    )
+
+    assert result == BodyResult(
+        content=b"0123",
+        content_type="application/xml; charset=utf-8",
+        total_bytes=10,
+        truncated=True,
+    )
+    # A known-oversized object reads only the preview and abandons the rest of the stream.
+    assert body.amounts == [4]
+    assert body.closed is True
+    assert json.loads(caplog.messages[-1])["truncated"] is True
 
 
 def test_body_fetch_bounds_stream_and_sanitizes_s3_failures() -> None:
@@ -345,8 +384,17 @@ def test_body_fetch_bounds_stream_and_sanitizes_s3_failures() -> None:
     body = FakeBody(b"12345")
     with pytest.raises(RequestError, match="message_body_too_large"):
         _explorer(data_api, FakeS3(body=body, content_length=4), max_body_bytes=4).get_body(
-            DOCUMENT_A, "raw", "caller"
+            DOCUMENT_A, "parsed", "caller"
         )
+    assert body.amounts == [5]
+
+    # An understated raw ContentLength is caught by the bounded read and truncated instead.
+    data_api = FakeDataApi([{"records": [_detail_record()]}])
+    body = FakeBody(b"12345")
+    result = _explorer(data_api, FakeS3(body=body, content_length=4), max_body_bytes=4).get_body(
+        DOCUMENT_A, "raw", "caller"
+    )
+    assert (result.content, result.truncated, result.total_bytes) == (b"1234", True, 4)
     assert body.amounts == [5]
 
     data_api = FakeDataApi([{"records": [_detail_record()]}])
@@ -354,6 +402,101 @@ def test_body_fetch_bounds_stream_and_sanitizes_s3_failures() -> None:
         _explorer(data_api, FakeS3(error=RuntimeError(SENSITIVE_FAILURE))).get_body(
             DOCUMENT_A, "raw", "caller"
         )
+    assert captured.value.__cause__ is None
+    assert "sensitive" not in str(captured.value)
+
+
+@pytest.mark.parametrize(
+    ("variant", "source_format", "filename", "content_type", "key", "version_id"),
+    [
+        (
+            "raw",
+            "ccda",
+            f"{DOCUMENT_A}.xml",
+            "application/xml; charset=utf-8",
+            "incoming/hl7/message.hl7",
+            "raw-version",
+        ),
+        (
+            "raw",
+            "hl7-v2",
+            f"{DOCUMENT_A}.hl7",
+            "text/plain; charset=utf-8",
+            "incoming/hl7/message.hl7",
+            "raw-version",
+        ),
+        (
+            "parsed",
+            "ccda",
+            f"{DOCUMENT_A}.json",
+            "application/json",
+            "hl7/document.json",
+            "parsed-version",
+        ),
+    ],
+)
+def test_download_url_signs_exact_version_as_attachment_and_audits_without_url(
+    variant: str,
+    source_format: str,
+    filename: str,
+    content_type: str,
+    key: str,
+    version_id: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    s3 = FakeS3()
+    data_api = FakeDataApi([{"records": [_detail_record(source_format=source_format)]}])
+    caplog.set_level(logging.INFO, logger="src.explorer_handler")
+
+    result = _explorer(data_api, s3).create_download_url(DOCUMENT_A, variant, "caller-subject")
+
+    expected_bucket = "raw-bucket" if variant == "raw" else "parsed-bucket"
+    assert s3.presign_calls == [
+        {
+            "ClientMethod": "get_object",
+            "Params": {
+                "Bucket": expected_bucket,
+                "Key": key,
+                "VersionId": version_id,
+                "ResponseContentDisposition": f'attachment; filename="{filename}"',
+                "ResponseContentType": content_type,
+            },
+            "ExpiresIn": 60,
+        }
+    ]
+    assert s3.calls == []
+    assert result == {
+        "expiresInSeconds": 60,
+        "filename": filename,
+        "url": "https://raw-bucket.s3.example/presigned-signature-must-not-be-logged",
+    }
+    audit = json.loads(caplog.messages[-1])
+    assert audit["event"] == "message_body_download_url_issued"
+    assert audit["callerSub"] == "caller-subject"
+    assert audit["documentId"] == DOCUMENT_A
+    assert audit["variant"] == variant
+    assert audit["expiresInSeconds"] == 60
+    assert "presigned-signature" not in caplog.text
+
+
+def test_download_url_rejects_invalid_requests_and_sanitizes_signing_failures() -> None:
+    with pytest.raises(RequestError, match="invalid_variant"):
+        _explorer(FakeDataApi()).create_download_url(DOCUMENT_A, "other", "caller")
+
+    wrong_bucket = FakeDataApi(
+        [{"records": [_detail_record(raw_uri="s3://other-bucket/message.hl7")]}]
+    )
+    with pytest.raises(ExplorerError, match="storage reference"):
+        _explorer(wrong_bucket).create_download_url(DOCUMENT_A, "raw", "caller")
+
+    missing = FakeDataApi([{"records": []}])
+    with pytest.raises(RequestError, match="message_not_found"):
+        _explorer(missing).create_download_url(DOCUMENT_A, "raw", "caller")
+
+    data_api = FakeDataApi([{"records": [_detail_record()]}])
+    failing = FakeS3(presign_error=RuntimeError(SENSITIVE_FAILURE))
+    with pytest.raises(ExplorerError, match="download URL") as captured:
+        _explorer(data_api, failing).create_download_url(DOCUMENT_A, "raw", "caller")
     assert captured.value.__cause__ is None
     assert "sensitive" not in str(captured.value)
 
@@ -412,7 +555,19 @@ class StubExplorer:
     def get_body(self, document_id: str, variant: str, caller_sub: str) -> BodyResult:
         assert document_id == DOCUMENT_A
         assert caller_sub == "caller-subject"
-        return BodyResult(content=variant.encode(), content_type="text/plain")
+        return BodyResult(
+            content=variant.encode(),
+            content_type="text/plain",
+            total_bytes=50,
+            truncated=variant == "raw",
+        )
+
+    def create_download_url(
+        self, document_id: str, variant: str, caller_sub: str
+    ) -> dict[str, Any]:
+        assert document_id == DOCUMENT_A
+        assert caller_sub == "caller-subject"
+        return {"expiresInSeconds": 60, "filename": f"{document_id}.{variant}", "url": "u"}
 
 
 def test_handler_routes_authenticated_requests(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -448,6 +603,25 @@ def test_handler_routes_authenticated_requests(monkeypatch: pytest.MonkeyPatch) 
     body_response = handler(body_event, None)
     assert body_response["isBase64Encoded"] is True
     assert base64.b64decode(body_response["body"]) == b"raw"
+    assert body_response["headers"]["x-body-total-bytes"] == "50"
+    assert body_response["headers"]["x-body-truncated"] == "true"
+
+    download_event = _authorized_event("POST /messages/{documentId}/download-url")
+    download_event["pathParameters"] = {"documentId": DOCUMENT_A}
+    download_event["body"] = json.dumps({"variant": "raw"})
+    download_response = handler(download_event, None)
+    assert download_response["statusCode"] == 200
+    assert download_response["headers"]["cache-control"] == "no-store"
+    assert json.loads(download_response["body"]) == {
+        "expiresInSeconds": 60,
+        "filename": f"{DOCUMENT_A}.raw",
+        "url": "u",
+    }
+
+    invalid_download = _authorized_event("POST /messages/{documentId}/download-url")
+    invalid_download["pathParameters"] = {"documentId": DOCUMENT_A}
+    invalid_download["body"] = json.dumps({"variant": 7})
+    assert handler(invalid_download, None)["statusCode"] == 400
 
 
 def test_handler_rejects_unauthenticated_invalid_and_unknown_requests(
@@ -498,6 +672,7 @@ def test_runtime_explorer_builds_and_caches_clients(
     clients = {"rds-data": FakeDataApi(), "s3": FakeS3()}
     monkeypatch.setattr(explorer_handler, "_RUNTIME_EXPLORER", None)
     monkeypatch.setattr(explorer_handler, "_aws_client", clients.__getitem__)
+    monkeypatch.setattr(explorer_handler, "_s3_signing_client", lambda: clients["s3"])
     monkeypatch.setenv("METADATA_CLUSTER_ARN", "cluster")
     monkeypatch.setenv("METADATA_SECRET_ARN", "secret")
     monkeypatch.setenv("METADATA_DATABASE", "manifest_medex")

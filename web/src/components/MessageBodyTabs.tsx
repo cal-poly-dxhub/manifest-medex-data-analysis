@@ -1,8 +1,8 @@
 import { useId, useState, type ReactNode } from 'react';
 import { JsonView, allExpanded, defaultStyles } from 'react-json-view-lite';
 import 'react-json-view-lite/dist/index.css';
-import { useMessageBody } from '../api/queries';
-import type { BodyVariant } from '../api/types';
+import { useMessageBody, useMessageDownloadUrl } from '../api/queries';
+import type { BodyVariant, RawMessageBody } from '../api/types';
 import { ApiError } from '../api/client';
 import { EmptyState, ErrorState, LoadingState } from './StateViews';
 
@@ -24,10 +24,71 @@ function errorMessage(error: unknown): string {
       return 'This message body is no longer available.';
     }
     if (error.status === 413) {
-      return 'This message body exceeds the viewer size limit.';
+      return 'This message body is too large to display. Download it to view the full content.';
     }
   }
   return 'Unable to load the message body. Please try again.';
+}
+
+function isTooLarge(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 413;
+}
+
+function isRawBody(data: unknown): data is RawMessageBody {
+  return typeof data === 'object' && data !== null && 'text' in data && 'truncated' in data;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024 * 1024) {
+    return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  }
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * Start a browser download from a presigned URL without rendering the content. The URL
+ * is followed by a hidden link rather than fetched so S3 needs no CORS rule; S3 answers
+ * with `Content-Disposition: attachment`, so the page never navigates away.
+ */
+function startDownload(url: string): void {
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.rel = 'noopener noreferrer';
+  anchor.style.display = 'none';
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+}
+
+interface DownloadFullBodyProps {
+  readonly messageId: string;
+  readonly variant: BodyVariant;
+}
+
+function DownloadFullBody({ messageId, variant }: DownloadFullBodyProps): ReactNode {
+  const download = useMessageDownloadUrl();
+  return (
+    <div className="body-download">
+      <button
+        type="button"
+        className="button button--primary"
+        disabled={download.isPending}
+        onClick={() =>
+          download.mutate(
+            { id: messageId, variant },
+            { onSuccess: (result) => startDownload(result.url) },
+          )
+        }
+      >
+        {download.isPending ? 'Preparing download…' : 'Download full file'}
+      </button>
+      {download.isError ? (
+        <p className="body-download__error" role="alert">
+          Unable to start the download. Please try again.
+        </p>
+      ) : null}
+    </div>
+  );
 }
 
 export function MessageBodyTabs({ messageId }: MessageBodyTabsProps): ReactNode {
@@ -40,6 +101,14 @@ export function MessageBodyTabs({ messageId }: MessageBodyTabsProps): ReactNode 
       return <LoadingState label="Loading message body…" />;
     }
     if (query.isError) {
+      if (isTooLarge(query.error)) {
+        return (
+          <div className="body-truncated">
+            <p className="body-truncated__notice">{errorMessage(query.error)}</p>
+            <DownloadFullBody messageId={messageId} variant={active} />
+          </div>
+        );
+      }
       return (
         <ErrorState
           message={errorMessage(query.error)}
@@ -64,10 +133,23 @@ export function MessageBodyTabs({ messageId }: MessageBodyTabsProps): ReactNode 
         </div>
       );
     }
-    if (typeof data !== 'string' || data.length === 0) {
+    if (!isRawBody(data) || data.text.length === 0) {
       return <EmptyState message="No raw representation available." />;
     }
-    return <pre className="raw-body">{data}</pre>;
+    if (data.truncated) {
+      const shown = formatBytes(new TextEncoder().encode(data.text).length);
+      const total = data.totalBytes === undefined ? 'a larger file' : formatBytes(data.totalBytes);
+      return (
+        <div className="body-truncated">
+          <p className="body-truncated__notice" role="status">
+            Showing the first {shown} of {total}. Download the full file to view all of it.
+          </p>
+          <DownloadFullBody messageId={messageId} variant="raw" />
+          <pre className="raw-body">{data.text}</pre>
+        </div>
+      );
+    }
+    return <pre className="raw-body">{data.text}</pre>;
   };
 
   return (

@@ -8,9 +8,11 @@ import type {
   MessageBody,
   MessageFilters,
   MessageDetailRecord,
+  MessageDownloadUrl,
   MessageListResponse,
   QueryTestRequest,
   QueryTestResult,
+  RawMessageBody,
   ReingestJob,
   ReingestJobListResponse,
   ReingestPreviewResult,
@@ -208,7 +210,10 @@ export class ApiClient {
     return (await response.json()) as MessageDetailRecord;
   }
 
-  /** Fetch a body lazily. The direct response is JSON for parsed or text for raw. */
+  /**
+   * Fetch a body lazily. Parsed bodies are returned as JSON; raw bodies as a
+   * {@link RawMessageBody}, which may be a truncated preview of a large document.
+   */
   async fetchMessageBody(
     id: string,
     variant: BodyVariant,
@@ -226,7 +231,32 @@ export class ApiClient {
       init,
       true,
     );
-    return variant === 'parsed' ? response.json() : response.text();
+    if (variant === 'parsed') {
+      return response.json();
+    }
+    const totalHeader = Number(response.headers.get('x-body-total-bytes'));
+    const raw: RawMessageBody = {
+      text: await response.text(),
+      totalBytes: Number.isFinite(totalHeader) && totalHeader > 0 ? totalHeader : undefined,
+      truncated: response.headers.get('x-body-truncated') === 'true',
+    };
+    return raw;
+  }
+
+  /**
+   * Request a short-lived presigned URL for the full stored body. The backend audits the
+   * request; the URL must be used within `expiresInSeconds` and is never persisted.
+   */
+  async createMessageDownloadUrl(
+    id: string,
+    variant: BodyVariant,
+  ): Promise<MessageDownloadUrl> {
+    const response = await this.fetchResponse(
+      `/messages/${encodeURIComponent(id)}/download-url`,
+      { method: 'POST', body: JSON.stringify({ variant }) },
+      true,
+    );
+    return (await response.json()) as MessageDownloadUrl;
   }
 
   /** Execute one unrestricted SQL statement through the authenticated backend. */

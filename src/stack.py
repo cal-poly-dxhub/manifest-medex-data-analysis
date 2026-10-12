@@ -1983,6 +1983,7 @@ class DataQualityStack(Stack):
             ("/messages", apigwv2.HttpMethod.GET),
             ("/messages/{documentId}", apigwv2.HttpMethod.GET),
             ("/messages/{documentId}/body", apigwv2.HttpMethod.POST),
+            ("/messages/{documentId}/download-url", apigwv2.HttpMethod.POST),
             ("/query", apigwv2.HttpMethod.POST),
             ("/query-test", apigwv2.HttpMethod.POST),
             ("/search", apigwv2.HttpMethod.POST),

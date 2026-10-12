@@ -27,6 +27,9 @@ LOGGER.setLevel(logging.INFO)
 DEFAULT_PAGE_LIMIT = 50
 MAX_PAGE_LIMIT = 200
 DEFAULT_MAX_BODY_BYTES = 4 * 1024 * 1024
+# A download URL only has to be *used* within this window; S3 checks expiry when the
+# request arrives, so a slow transfer that started in time still completes.
+DOWNLOAD_URL_TTL_SECONDS = 60
 MAX_SQL_CHARACTERS = 100_000
 MAX_SQL_RESULT_BYTES = 4 * 1024 * 1024
 DOCUMENT_ID_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -35,6 +38,7 @@ INVALID_DATABASE_CONFIG = "Explorer database configuration is invalid"
 INVALID_STORAGE_CONFIG = "Explorer storage configuration is invalid"
 INVALID_STORAGE_REFERENCE = "Message storage reference is invalid"
 BODY_RETRIEVAL_FAILED = "Message body retrieval failed"
+DOWNLOAD_URL_FAILED = "Message download URL could not be created"
 METADATA_READ_FAILED = "Metadata read failed"
 SQL_EXECUTION_FAILED = "SQL query failed"
 LIST_COLUMNS = ("document_id", "source_format", "document_time", "ingested_time")
@@ -83,6 +87,8 @@ class _ReadableBody(Protocol):
 class _S3Client(Protocol):
     def get_object(self, **kwargs: Any) -> dict[str, Any]: ...
 
+    def generate_presigned_url(self, **kwargs: Any) -> str: ...
+
 
 class ExplorerError(RuntimeError):
     """Sanitized explorer failure that never includes SQL or clinical values."""
@@ -99,10 +105,16 @@ class RequestError(ExplorerError):
 
 @dataclass(frozen=True)
 class BodyResult:
-    """Bounded message content returned through API Gateway."""
+    """Bounded message content returned through API Gateway.
+
+    A raw body larger than the response limit is returned as a leading preview with
+    ``truncated`` set; ``total_bytes`` is the full stored object size.
+    """
 
     content: bytes
     content_type: str
+    total_bytes: int
+    truncated: bool = False
 
 
 class MessageExplorer:
@@ -260,7 +272,102 @@ class MessageExplorer:
         return _public_row(row, include_locations=True)
 
     def get_body(self, document_id: str, variant: str, caller_sub: str) -> BodyResult:
-        """Fetch one exact raw or parsed S3 version and emit a PHI-access audit event."""
+        """Fetch one exact raw or parsed S3 version and emit a PHI-access audit event.
+
+        Raw bodies over the response limit are returned as a truncated leading preview so
+        the viewer can still show them; the full object is available through
+        :meth:`create_download_url`. Parsed JSON cannot be shown partially, so an oversized
+        parsed body is still rejected with 413.
+        """
+        row, request = self._body_request(document_id, variant)
+        try:
+            response = self._s3.get_object(**request)
+        except Exception:
+            raise ExplorerError(BODY_RETRIEVAL_FAILED) from None
+        reported_bytes = int(response.get("ContentLength", 0))
+        if variant == "parsed":
+            if reported_bytes > self._max_body_bytes:
+                raise RequestError(413, "message_body_too_large")
+            content = _read_bounded(response["Body"], self._max_body_bytes)
+            truncated = False
+        else:
+            content, truncated = _read_prefix(
+                response["Body"],
+                self._max_body_bytes,
+                known_oversize=reported_bytes > self._max_body_bytes,
+            )
+        total_bytes = max(reported_bytes, len(content))
+
+        LOGGER.info(
+            json.dumps(
+                {
+                    "callerSub": caller_sub,
+                    "documentId": document_id,
+                    "event": "message_body_fetched",
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    "truncated": truncated,
+                    "variant": variant,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+        return BodyResult(
+            content=content,
+            content_type=_body_content_type(row, variant),
+            total_bytes=total_bytes,
+            truncated=truncated,
+        )
+
+    def create_download_url(
+        self, document_id: str, variant: str, caller_sub: str
+    ) -> dict[str, Any]:
+        """Issue a short-lived presigned GET for one exact body version and audit it.
+
+        The bucket, key, and version come from the metadata row, never from the caller, and
+        are covered by the signature together with the attachment disposition, so the URL
+        cannot be redirected to another object. The URL itself is never logged.
+        """
+        row, request = self._body_request(document_id, variant)
+        filename = f"{document_id}.{_body_extension(row, variant)}"
+        params = {
+            **request,
+            "ResponseContentDisposition": f'attachment; filename="{filename}"',
+            "ResponseContentType": _body_content_type(row, variant),
+        }
+        try:
+            url = self._s3.generate_presigned_url(
+                ClientMethod="get_object",
+                Params=params,
+                ExpiresIn=DOWNLOAD_URL_TTL_SECONDS,
+            )
+        except Exception:
+            raise ExplorerError(DOWNLOAD_URL_FAILED) from None
+
+        LOGGER.info(
+            json.dumps(
+                {
+                    "callerSub": caller_sub,
+                    "documentId": document_id,
+                    "event": "message_body_download_url_issued",
+                    "expiresInSeconds": DOWNLOAD_URL_TTL_SECONDS,
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    "variant": variant,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+        return {
+            "expiresInSeconds": DOWNLOAD_URL_TTL_SECONDS,
+            "filename": filename,
+            "url": url,
+        }
+
+    def _body_request(
+        self, document_id: str, variant: str
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Resolve the metadata row and the exact S3 object request for one body variant."""
         if variant not in {"raw", "parsed"}:
             raise RequestError(400, "invalid_variant")
         row = self._metadata_row(document_id)
@@ -275,34 +382,7 @@ class MessageExplorer:
         version_id = row[version_key]
         if isinstance(version_id, str) and version_id:
             request["VersionId"] = version_id
-        try:
-            response = self._s3.get_object(**request)
-        except Exception:
-            raise ExplorerError(BODY_RETRIEVAL_FAILED) from None
-        if int(response.get("ContentLength", 0)) > self._max_body_bytes:
-            raise RequestError(413, "message_body_too_large")
-        content = _read_bounded(response["Body"], self._max_body_bytes)
-
-        LOGGER.info(
-            json.dumps(
-                {
-                    "callerSub": caller_sub,
-                    "documentId": document_id,
-                    "event": "message_body_fetched",
-                    "timestamp": datetime.now(UTC).isoformat(),
-                    "variant": variant,
-                },
-                separators=(",", ":"),
-                sort_keys=True,
-            )
-        )
-        if variant == "parsed":
-            content_type = "application/json"
-        elif row["source_format"] == "ccda":
-            content_type = "application/xml; charset=utf-8"
-        else:
-            content_type = "text/plain; charset=utf-8"
-        return BodyResult(content=content, content_type=content_type)
+        return row, request
 
     def _metadata_row(self, document_id: str) -> dict[str, Any]:
         _validate_document_id(document_id)
@@ -413,11 +493,20 @@ def _route_request(event: dict[str, Any], route_key: str) -> dict[str, Any]:
             "headers": {
                 "cache-control": "no-store",
                 "content-type": result.content_type,
+                "x-body-total-bytes": str(result.total_bytes),
+                "x-body-truncated": "true" if result.truncated else "false",
                 "x-content-type-options": "nosniff",
             },
             "body": base64.b64encode(result.content).decode("ascii"),
             "isBase64Encoded": True,
         }
+    if route_key == "POST /messages/{documentId}/download-url":
+        document_id = _path_document_id(event)
+        request = _request_json(event)
+        variant = request.get("variant")
+        if not isinstance(variant, str):
+            raise RequestError(400, "invalid_variant")
+        return _json_response(200, explorer.create_download_url(document_id, variant, caller_sub))
     raise RequestError(404, "route_not_found")
 
 
@@ -708,7 +797,7 @@ def _runtime_explorer() -> MessageExplorer:
     if _RUNTIME_EXPLORER is None:
         _RUNTIME_EXPLORER = MessageExplorer(
             _aws_client("rds-data"),
-            _aws_client("s3"),
+            _s3_signing_client(),
             cluster_arn=os.environ["METADATA_CLUSTER_ARN"],
             secret_arn=os.environ["METADATA_SECRET_ARN"],
             database=os.environ["METADATA_DATABASE"],
@@ -1122,10 +1211,46 @@ def _read_bounded(body: Any, max_bytes: int) -> bytes:
     return payload
 
 
+def _read_prefix(body: Any, max_bytes: int, *, known_oversize: bool) -> tuple[bytes, bool]:
+    """Read at most ``max_bytes`` leading bytes, reporting whether the object was longer."""
+    if not hasattr(body, "read"):
+        raise ExplorerError(BODY_RETRIEVAL_FAILED)
+    payload = cast(_ReadableBody, body).read(max_bytes if known_oversize else max_bytes + 1)
+    if not isinstance(payload, bytes):
+        raise ExplorerError(BODY_RETRIEVAL_FAILED)
+    truncated = known_oversize or len(payload) > max_bytes
+    if truncated and hasattr(body, "close"):
+        # Stop the remaining transfer instead of draining a large object we will not use.
+        body.close()
+    return payload[:max_bytes], truncated
+
+
+def _body_content_type(row: dict[str, Any], variant: str) -> str:
+    if variant == "parsed":
+        return "application/json"
+    if row["source_format"] == "ccda":
+        return "application/xml; charset=utf-8"
+    return "text/plain; charset=utf-8"
+
+
+def _body_extension(row: dict[str, Any], variant: str) -> str:
+    if variant == "parsed":
+        return "json"
+    return "xml" if row["source_format"] == "ccda" else "hl7"
+
+
 def _aws_client(service: str) -> Any:
     import boto3  # type: ignore[import-not-found]
 
     return boto3.client(service)
+
+
+def _s3_signing_client() -> Any:
+    """S3 client that signs presigned URLs with SigV4, which SSE-KMS objects require."""
+    import boto3
+    from botocore.config import Config  # type: ignore[import-not-found]
+
+    return boto3.client("s3", config=Config(signature_version="s3v4"))
 
 
 def _json_response(status_code: int, payload: dict[str, Any]) -> dict[str, Any]:

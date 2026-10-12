@@ -45,8 +45,25 @@ export interface MessageFilters {
 /** Which representation of a message body to fetch. */
 export type BodyVariant = 'parsed' | 'raw';
 
-/** Parsed bodies are JSON values; raw bodies are text. */
+/**
+ * A raw body as text. Raw bodies over the viewer limit arrive as a leading preview with
+ * `truncated` set; `totalBytes` is the full stored size (undefined if not reported).
+ */
+export interface RawMessageBody {
+  readonly text: string;
+  readonly totalBytes: number | undefined;
+  readonly truncated: boolean;
+}
+
+/** Parsed bodies are JSON values; raw bodies are {@link RawMessageBody}. */
 export type MessageBody = unknown;
+
+/** Short-lived presigned download for one exact stored body version. */
+export interface MessageDownloadUrl {
+  readonly url: string;
+  readonly filename: string;
+  readonly expiresInSeconds: number;
+}
 
 /** Generic Data API result returned by the unrestricted SQL console. */
 export interface SqlQueryResult {
