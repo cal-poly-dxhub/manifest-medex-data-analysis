@@ -13,7 +13,7 @@ Install these first; each links to its official installation guide.
 - **[uv](https://docs.astral.sh/uv/) 0.11 or later** — [install](https://docs.astral.sh/uv/getting-started/installation/).
 - **Node.js 22 and npm** — [install](https://nodejs.org/en/download), or use [nvm](https://github.com/nvm-sh/nvm#installing-and-updating) (`nvm use` reads `.nvmrc`). The frontend is built during deployment.
 - **The AWS CDK v2 CLI** — [install](https://docs.aws.amazon.com/cdk/v2/guide/getting-started.html#getting-started-install) (`npm install -g aws-cdk`). The app pins `aws-cdk-lib` 2.263.0; if you see a "Cloud assembly schema version mismatch" error, upgrade with `npm i -g aws-cdk@latest`.
-- Docker is **not** required. Lambda code is bundled locally from pure-Python dependencies.
+- Docker is **not** required. Lambda code is bundled locally from pure-Python dependencies, and the ECS ingestion worker image is built in AWS CodeBuild during `deploy.sh`.
 
 Verify your identity and note the account ID; the config file needs it:
 
@@ -49,7 +49,7 @@ The remaining keys are optional and documented inline.
 
 By default the stack creates its own isolated VPC. To deploy into a VPC your network team provides instead, fill in all four of these keys in `config.yaml`:
 
-> **Recommended layout: dedicated subnets.** Create two or three new private subnets for this stack (one per Availability Zone) attached to a **new route table** that no other workload uses, rather than reusing subnets other applications share. A gateway endpoint for S3 or DynamoDB is implemented as a route on a route table, and a route table can hold only one such route per service. With a dedicated route table the stack creates its own S3 and DynamoDB gateway endpoints without conflicting with any that already exist elsewhere in the VPC, this stack's traffic is never subject to another team's endpoint policy, and this stack's endpoints never widen network access for anything else. The route table needs only the default `local` route plus whatever route your VPN or transit gateway users need to reach the explorer; no internet or NAT route is required. Interface endpoints (SQS, RDS Data API, Lambda) are VPC-wide because of private DNS, so those are shared regardless of subnet layout; see the endpoint policy note below.
+> **Recommended layout: dedicated subnets.** Create two or three new private subnets for this stack (one per Availability Zone) attached to a **new route table** that no other workload uses, rather than reusing subnets other applications share. A gateway endpoint for S3 or DynamoDB is implemented as a route on a route table, and a route table can hold only one such route per service. With a dedicated route table the stack creates its own S3 and DynamoDB gateway endpoints without conflicting with any that already exist elsewhere in the VPC, this stack's traffic is never subject to another team's endpoint policy, and this stack's endpoints never widen network access for anything else. The route table needs only the default `local` route plus whatever route your VPN or transit gateway users need to reach the explorer; no internet or NAT route is required. Interface endpoints (SQS, RDS Data API, Lambda, ECR, CloudWatch Logs) are VPC-wide because of private DNS, so those are shared regardless of subnet layout; see the endpoint policy note below.
 
 | Key | Value |
 | --- | --- |
@@ -62,12 +62,12 @@ Requirements for the subnets:
 
 - **Private** — no route to an internet gateway. A NAT route is tolerated but not needed; every AWS call goes through VPC endpoints.
 - **Two or more Availability Zones** — Aurora requires a subnet group spanning at least two AZs; one private subnet per AZ (typically three) is the expected layout. The deploy fails validation otherwise.
-- **Free IP space** — the stack creates about six endpoint network interfaces per subnet plus one per concurrent Lambda execution. `/24` or larger per subnet is comfortable.
-- **VPC endpoints** — the stack needs endpoints for S3, DynamoDB, RDS Data API, SQS, Lambda, and OpenSearch Serverless. `deploy.sh` inspects the VPC before deploying: endpoints that already exist are reused, except ones this stack created on an earlier deploy (identified by their `aws:cloudformation:stack-name` tag), which stay managed by the stack. For reused endpoints the stack adds HTTPS ingress for its Lambdas to the endpoint's security group; missing ones are created in your subnets. Existing endpoints must have a security group attached, and their endpoint policies must allow the relevant actions from this account (the stack does not modify policies on endpoints it does not own). To override detection, set `existing_endpoints` in `config.yaml`.
+- **Free IP space** — the stack creates about six endpoint network interfaces per subnet plus one per running ECS ingestion task (up to 20 at the default maximums) and per Lambda. `/24` or larger per subnet is comfortable.
+- **VPC endpoints** — the stack needs endpoints for S3, DynamoDB, RDS Data API, SQS, Lambda, ECR API (`ecr.api`), ECR Docker (`ecr.dkr`), CloudWatch Logs (`logs`), and OpenSearch Serverless. `deploy.sh` inspects the VPC before deploying: endpoints that already exist are reused, except ones this stack created on an earlier deploy (identified by their `aws:cloudformation:stack-name` tag), which stay managed by the stack. For reused endpoints the stack adds HTTPS ingress for its Lambdas and ingestion workers to the endpoint's security group; missing ones are created in your subnets. Existing endpoints must have a security group attached, and their endpoint policies must allow the relevant actions from this account (the stack does not modify policies on endpoints it does not own). To override detection, set `existing_endpoints` in `config.yaml`.
 
-  **Detection happens only in `deploy.sh`.** The CDK app makes no AWS calls during synthesis, so it cannot see what is already in the VPC; it creates every endpoint not listed in `existing_endpoints`. Deploying with `cdk deploy` directly into a VPC that already has any of these endpoints therefore fails partway through and rolls back: a second S3 or DynamoDB gateway endpoint conflicts with the existing route on the route table, and a second SQS, Lambda, or RDS Data API interface endpoint is rejected because its private DNS name is already taken. Detection also runs only at deploy time, so if endpoints are added to or removed from the VPC later, run `./deploy.sh` again. If you deploy without the script anyway, pass the existing endpoints yourself (see "Manual deployment" under Reference).
+  **Detection happens only in `deploy.sh`.** The CDK app makes no AWS calls during synthesis, so it cannot see what is already in the VPC; it creates every endpoint not listed in `existing_endpoints`. Deploying with `cdk deploy` directly into a VPC that already has any of these endpoints therefore fails partway through and rolls back: a second S3 or DynamoDB gateway endpoint conflicts with the existing route on the route table, and a second SQS, Lambda, RDS Data API, ECR, or Logs interface endpoint is rejected because its private DNS name is already taken. Detection also runs only at deploy time, so if endpoints are added to or removed from the VPC later, run `./deploy.sh` again. If you deploy without the script anyway, pass the existing endpoints yourself (see "Manual deployment" under Reference).
 
-  **If an existing endpoint has a restrictive policy.** An endpoint policy is evaluated before IAM, for every request that passes through the endpoint. If an endpoint this stack imports allows only specific resources (for example an S3 gateway policy listing particular buckets, or an SQS endpoint policy listing particular queues), this stack's Lambdas will be denied at runtime even though the deploy succeeds and their IAM roles are correct. The symptom is `AccessDenied` in the ingestion Lambda logs, messages landing in the dead-letter queues, and nothing appearing in OpenSearch. Before deploying, check each existing endpoint's policy:
+  **If an existing endpoint has a restrictive policy.** An endpoint policy is evaluated before IAM, for every request that passes through the endpoint. If an endpoint this stack imports allows only specific resources (for example an S3 gateway policy listing particular buckets, or an SQS endpoint policy listing particular queues), this stack's Lambdas and ingestion workers will be denied at runtime even though the deploy succeeds and their IAM roles are correct. The symptom is `AccessDenied` (`receive_failed` or `batch_failed`) in the worker logs, messages landing in the dead-letter queues, and nothing appearing in OpenSearch. Before deploying, check each existing endpoint's policy:
 
   ```bash
   aws ec2 describe-vpc-endpoints --filters Name=vpc-id,Values=<vpc-id> \
@@ -75,6 +75,10 @@ Requirements for the subnets:
   ```
 
   A policy of `"Effect":"Allow","Principal":"*","Action":"*","Resource":"*"` (the default) or one scoped to this AWS account needs no change. A resource-scoped policy must be extended with this stack's resources after the first deploy: the four data bucket ARNs (`RawBucketName`, `ParsedBucketName`, `ErrorBucketName`, `ReportsBucketName` outputs, each as the bucket ARN and `<arn>/*`), the three DynamoDB table ARNs, the `ReindexQueueUrl` queue ARN for the SQS endpoint, and the Aurora cluster ARN for the RDS Data API endpoint. The dedicated-subnet layout above removes this concern for S3 and DynamoDB entirely.
+
+  **Customer-owned SQS endpoint.** The ingestion workers poll their queues through the SQS endpoint. If you reuse an SQS endpoint with a restrictive policy, it must also allow the two worker task roles (`Hl7IngestionRole` and `CcdaIngestionRole` in the stack's IAM roles) to call `sqs:ReceiveMessage`, `sqs:DeleteMessage`, `sqs:ChangeMessageVisibility`, and `sqs:GetQueueAttributes` on the `Hl7QueueUrl` and `CcdaQueueUrl` queue ARNs respectively. Without that, the services start but never consume, and the queues grow until the age alarms fire. Endpoints the stack creates already carry exactly these permissions.
+
+  **Image pulls.** ECR stores image layers in S3, so a restrictive S3 gateway endpoint policy must also allow `s3:GetObject` on `arn:aws:s3:::prod-<region>-starport-layer-bucket/*`, or tasks fail with `CannotPullContainerError`.
 
   **Scope of the endpoints the stack creates.** The S3 and DynamoDB gateway endpoints are created with the default (service-wide) endpoint policy, and a gateway endpoint adds a route to every subnet that shares the route table. Any other workload in those subnets therefore gains a network path to S3 and DynamoDB as a whole; access to individual buckets and tables remains governed by IAM and resource policies. The interface endpoints (RDS Data API, SQS) carry policies limited to this stack's roles and resources. If your network standards require the gateway endpoints to be limited to specific buckets or tables, apply that policy to the endpoint after deployment or supply your own endpoints via `existing_endpoints`.
 
@@ -97,7 +101,7 @@ People on your network reach the PHI Explorer through CloudFront and Cognito, no
 ./deploy.sh
 ```
 
-`deploy.sh` is the only supported way to deploy. It installs dependencies, builds the frontend, runs the validation suite, bootstraps CDK if the account/region has not been bootstrapped before, inspects an existing VPC for endpoints the stack should reuse, and deploys. The first deployment takes roughly 15–20 minutes, most of it Aurora and the OpenSearch collection. Later deployments take a few minutes.
+`deploy.sh` is the only supported way to deploy. It installs dependencies, builds the frontend, runs the validation suite, bootstraps CDK if the account/region has not been bootstrapped before, inspects an existing VPC for endpoints the stack should reuse, builds the ingestion worker image in AWS CodeBuild (skipped when the worker source is unchanged), and deploys. The image build adds about 3–5 minutes when it runs. The first deployment takes roughly 15–20 minutes, most of it Aurora and the OpenSearch collection. Later deployments take a few minutes.
 
 It refuses to run if `account` is still the `<account-number>` placeholder or if your credentials belong to a different account than the one configured.
 
@@ -112,6 +116,17 @@ When it succeeds it prints the outputs you need next:
 | `OpenSearchCollectionName` | For finding the Dashboards URL |
 
 All outputs are also saved to `cdk-outputs.json`.
+
+### Upgrading from the Lambda ingestion version
+
+Earlier versions ran ingestion in two Lambda functions. The first deploy of this version replaces them with the ECS services:
+
+- The SQS event source mappings and both ingestion Lambdas are removed, and the ECS services start polling the same queues. **Queued messages are kept**: anything waiting while the switch happens is processed by the workers once they start. Messages a Lambda was processing at that moment return after the visibility timeout and are retried.
+- Aurora is resized to 2–16 ACU and switched to 35-day backups with deletion protection in every environment. These are in-place changes.
+- The old Lambda log groups are retained and still readable.
+- A companion stack, `<project_name>-<environment>-worker-build` (ECR repository and CodeBuild project), is created first.
+
+No manual steps are needed; run `./deploy.sh` as usual. If you reuse a customer-owned SQS endpoint, update its policy first (see "Deploying into an existing VPC").
 
 ### Manual deployment
 
@@ -192,8 +207,8 @@ Quick checks (the detailed list is under Reference → "Verify processing"):
 ## Notes
 
 - **Deploy once per account.** The stack creates CloudFront resources (origin access control, response headers policy) whose names are global to the account and derived from the stack name. A second deployment of the same stack in another region of the same account fails with `AlreadyExists`. To run two copies in one account, set a different `project_name` in each `config.yaml`; to move regions, delete the first stack before deploying the second.
-- Everything runs in an isolated VPC with no NAT gateway; Lambdas reach AWS services through VPC endpoints. There is no public database or search endpoint.
-- The S3 buckets, Aurora cluster, OpenSearch collection, DynamoDB tables, KMS key, and Cognito pool are set to **RETAIN** on stack deletion. If you are tearing the system down for good, delete them by hand after `cdk destroy`.
+- Everything runs in an isolated VPC with no NAT gateway; Lambdas and ECS tasks reach AWS services through VPC endpoints. There is no public database or search endpoint.
+- The S3 buckets, Aurora cluster, OpenSearch collection, DynamoDB tables, KMS key, and Cognito pool are set to **RETAIN** on stack deletion. If you are tearing the system down for good, delete them by hand after `cdk destroy`. Aurora deletion protection is on in every environment, so it must be turned off explicitly before the cluster can be deleted. The `<stack>-worker-build` companion stack is not retained; delete it after the main stack.
 - `enable_public_dashboard` exposes only the Dashboards endpoint (IAM-authenticated) and is refused outside the `dev` environment. For a production posture, reach Dashboards through a VPN or VPC path instead.
 - Context flags passed to `cdk deploy` do not persist between runs; `deploy.sh` re-applies them from `config.yaml` every time, and also detects existing VPC endpoints, which is why it is the only supported deployment path.
 
@@ -226,6 +241,20 @@ Configuration is supplied through CDK context. Defaults are defined in `cdk.json
 | `termination_protection` | Protect the CloudFormation stack; required in production | `true` in production, otherwise `false` |
 | `enable_public_dashboard` | Temporarily allow public network access to Dashboards in development only | `false` |
 | `dashboard_principal_arn` | Exact same-account IAM role receiving read-only dashboard data access | unset |
+| `hl7_task_cpu`, `hl7_task_memory` | HL7 worker Fargate task size (CPU units / MiB) | `1024`, `2048` |
+| `hl7_workers`, `hl7_receive_batch_size` | HL7 worker processes per task; messages per receive (1–10) | `8`, `10` |
+| `hl7_min_tasks`, `hl7_max_tasks` | HL7 service scaling bounds | `2`, `10` |
+| `hl7_backlog_target` | HL7 visible messages per running task that target tracking aims for | `1000` |
+| `ccda_task_cpu`, `ccda_task_memory` | CCDA worker Fargate task size | `1024`, `4096` |
+| `ccda_workers`, `ccda_receive_batch_size` | CCDA worker processes per task; messages per receive | `4`, `1` |
+| `ccda_min_tasks`, `ccda_max_tasks` | CCDA service scaling bounds | `2`, `10` |
+| `ccda_backlog_target` | CCDA visible messages per running task | `200` |
+| `work_hours_min_tasks` | Weekday 07:45–17:30 minimum task count for both services; blank disables scheduled scaling | unset (off) |
+| `work_hours_timezone` | IANA time zone for the work-hours schedule | `America/Los_Angeles` |
+| `aurora_min_acu`, `aurora_max_acu` | Aurora Serverless v2 capacity range, multiples of 0.5 | `2`, `16` |
+| `worker_image_digest` | Worker image digest; set by `deploy.sh`, never by hand | set by `deploy.sh` |
+
+Ingestion and Aurora values are production defaults in every environment. Sizing guidance is in the README under "Ingestion workers" and "Aurora capacity".
 
 If neither `account` nor `region` is supplied, local synthesis is environment-agnostic and does not require AWS credentials. If either is supplied, both are required.
 
@@ -250,7 +279,7 @@ uv run cdk synth
 
 ### Manual deployment
 
-The remaining subsections document the underlying commands for reference or for CI pipelines. Deploying this way is not supported; `deploy.sh` is the supported path. Running `cdk` directly skips the steps the script performs: reading `config.yaml`, building `web/dist`, validation, resolving the Dashboards role, and detecting existing VPC endpoints.
+The remaining subsections document the underlying commands for reference or for CI pipelines. Deploying this way is not supported; `deploy.sh` is the supported path. Running `cdk` directly skips the steps the script performs: reading `config.yaml`, building `web/dist`, validation, resolving the Dashboards role, detecting existing VPC endpoints, and building the worker image. Without `-c worker_image_digest=sha256:...` the ECS services reference a placeholder image and their tasks cannot start.
 
 **Existing VPC without `deploy.sh`.** Pass the four VPC keys plus `existing_endpoints` on every `cdk diff` and `cdk deploy`. List each service whose endpoint already exists in the VPC, using the same format as `config.yaml` (gateway services by name; interface services with the endpoint ID and its first security group):
 
@@ -260,7 +289,7 @@ aws ec2 describe-vpc-endpoints --filters Name=vpc-id,Values=<vpc-id> \
   --profile <approved-aws-profile>
 ```
 
-Only `com.amazonaws.<region>.s3`, `dynamodb`, `rds-data`, `sqs`, and `lambda` matter. For example, a VPC with an S3 gateway endpoint and an SQS interface endpoint becomes:
+Only `com.amazonaws.<region>.s3`, `dynamodb`, `rds-data`, `sqs`, `lambda`, `ecr.api`, `ecr.dkr`, and `logs` matter. For example, a VPC with an S3 gateway endpoint and an SQS interface endpoint becomes:
 
 ```bash
 uv run cdk deploy \
@@ -275,7 +304,7 @@ uv run cdk deploy \
   --profile <approved-aws-profile>
 ```
 
-Leave `existing_endpoints` out only if the VPC has none of the five. Any endpoint you omit is created by the stack, and the deploy fails if one already exists.
+Leave `existing_endpoints` out only if the VPC has none of the eight. Any endpoint you omit is created by the stack, and the deploy fails if one already exists.
 
 Bootstrap each target account and region once:
 
@@ -390,12 +419,14 @@ This stack is not a free-tier architecture. Major recurring cost drivers include
 
 - OpenSearch Serverless OCUs and managed storage; the classic model used here does not scale to zero.
 - Aurora Serverless v2 ACUs, storage, backup retention, and I/O.
-- Two interface VPC endpoints across the configured Availability Zones.
-- Lambda duration and concurrency.
+- Six interface VPC endpoints (plus the OpenSearch Serverless endpoint) across the configured Availability Zones.
+- ECS Fargate ingestion tasks: at least two tasks per format run at all times (at the defaults in us-west-2, about $58/month for HL7 and $68/month for CCDA), scaling with backlog.
+- Lambda duration and concurrency for the explorer, reports, and reingestion.
+- CodeBuild minutes and ECR storage for the worker image.
 - SQS, EventBridge, S3 storage/versioning, KMS requests, and CloudWatch logs.
 - CloudFront requests/data transfer, HTTP API requests, frontend S3 storage/deployment, and Cognito managed-login/Plus feature usage.
 
-Production enables OpenSearch standby replicas and longer Aurora backup retention, increasing cost. Use the [AWS Pricing Calculator](https://calculator.aws/) with the target region, traffic, retention, and data-volume assumptions before deployment.
+Production enables OpenSearch standby replicas, increasing cost. Every environment uses 35-day Aurora backups and a 2-ACU Aurora minimum. Use the [AWS Pricing Calculator](https://calculator.aws/) with the target region, traffic, retention, and data-volume assumptions before deployment.
 
 ### Key layout for bulk and historical loads
 
@@ -440,7 +471,7 @@ After uploading safe synthetic inputs:
 2. Confirm parsed S3 contains `hl7/<document-id>.json` for each unique normalized HL7 message and `ccda/<document-id>.json` for each CCDA document.
 3. Confirm deterministic documents appear in `hl7-messages-v1` and `ccda-documents-v1` after the OpenSearch refresh interval.
 4. Through an approved Data API client, confirm one metadata row per logical document, including raw and parsed S3 version IDs.
-5. Confirm both Lambda `Errors` metrics remain zero.
+5. Confirm both ECS services have running tasks and the worker logs show `batch_processed` events with no `batch_failed`.
 6. Confirm ingestion logs and error objects contain no raw messages, XML bodies, S3 keys, document IDs, patient identifiers, clinical values, SQL parameters, or raw backend responses.
 
 ### Open the authenticated explorer

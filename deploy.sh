@@ -7,9 +7,10 @@
 #   ./deploy.sh --config other.yaml      # alternate config file
 #
 # Reads a simple "key: value" YAML file (no library needed), resolves the Dashboards
-# role from the current credentials when not provided, bootstraps CDK only if the
-# account/region is not already bootstrapped, optionally validates, then runs
-# cdk deploy with the exact -c flags the stack expects.
+# role from the current credentials when not provided, optionally validates, builds the
+# ECS ingestion worker image in AWS CodeBuild (no local Docker needed), bootstraps CDK
+# only if the account/region is not already bootstrapped, then runs cdk deploy with the
+# exact -c flags the stack expects. This script is the only supported deployment path.
 
 set -euo pipefail
 
@@ -92,12 +93,25 @@ info "Deploying as: $CALLER_ARN"
 
 # ---- dashboards principal ----------------------------------------------------------
 
+STACK_NAME="$PROJECT_NAME-$ENVIRONMENT"
+
 CONTEXT_ARGS=(
   -c "environment=$ENVIRONMENT"
   -c "account=$ACCOUNT"
   -c "region=$REGION"
   -c "project_name=$PROJECT_NAME"
 )
+
+# Optional sizing and scaling overrides; unset keys keep the stack's production defaults.
+for key in \
+  hl7_task_cpu hl7_task_memory hl7_workers hl7_receive_batch_size hl7_min_tasks hl7_max_tasks hl7_backlog_target \
+  ccda_task_cpu ccda_task_memory ccda_workers ccda_receive_batch_size ccda_min_tasks ccda_max_tasks ccda_backlog_target \
+  work_hours_min_tasks work_hours_timezone aurora_min_acu aurora_max_acu; do
+  value="$(cfg "$key")"
+  if [[ -n "$value" ]]; then
+    CONTEXT_ARGS+=(-c "$key=$value")
+  fi
+done
 
 # Optional existing-VPC deployment: pass all four through when any is set; the stack
 # validates completeness and rejects partial input with a clear message.
@@ -119,7 +133,6 @@ if [[ -n "$VPC_ID$SUBNET_IDS$ROUTE_TABLE_IDS$AVAILABILITY_ZONES" ]]; then
   # Endpoints this stack created on an earlier deploy carry its CloudFormation stack-name
   # tag and must be skipped: reporting them as pre-existing would make the stack drop
   # them from its template, and CloudFormation would delete them.
-  STACK_NAME="$PROJECT_NAME-$ENVIRONMENT"
   EXISTING_ENDPOINTS="$(aws ec2 describe-vpc-endpoints "${AWS_ARGS[@]}" \
       --filters "Name=vpc-id,Values=$VPC_ID" \
       --query 'VpcEndpoints[].{svc:ServiceName,type:VpcEndpointType,id:VpcEndpointId,sgs:Groups[].GroupId,stack:Tags[?Key==`aws:cloudformation:stack-name`].Value|[0]}' \
@@ -128,7 +141,10 @@ import json, os, sys
 region = os.environ["REGION"]
 stack_name = os.environ["STACK_NAME"]
 prefix = "com.amazonaws." + region + "."
-wanted = {prefix + name: name for name in ("s3", "dynamodb", "rds-data", "sqs", "lambda")}
+wanted = {
+    prefix + name: name
+    for name in ("s3", "dynamodb", "rds-data", "sqs", "lambda", "ecr.api", "ecr.dkr", "logs")
+}
 entries = []
 for ep in json.load(sys.stdin):
     key = wanted.get(ep["svc"])
@@ -195,6 +211,75 @@ else
   info "Skipping validation; building frontend and synthesizing only"
   make synth
 fi
+
+# ---- worker image (AWS CodeBuild) --------------------------------------------------
+
+# The ECS ingestion services run one container image built from src/ and worker/. A small
+# companion stack holds the ECR repository and an ARM64 CodeBuild project; the source bundle
+# is content-hashed so an unchanged image is reused instead of rebuilt.
+BUILD_STACK="$STACK_NAME-worker-build"
+info "Ensuring worker image build resources ($BUILD_STACK)"
+aws cloudformation deploy "${AWS_ARGS[@]}" --stack-name "$BUILD_STACK" \
+  --template-file infra/worker-image-build.yaml --capabilities CAPABILITY_IAM \
+  --parameter-overrides "StackPrefix=$STACK_NAME" --no-fail-on-empty-changeset >/dev/null \
+  || die "Could not create or update $BUILD_STACK. See CloudFormation events for details."
+build_output() {
+  aws cloudformation describe-stacks "${AWS_ARGS[@]}" --stack-name "$BUILD_STACK" \
+    --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue | [0]" --output text
+}
+WORKER_REPOSITORY="$(build_output RepositoryName)"
+WORKER_SOURCE_BUCKET="$(build_output SourceBucketName)"
+WORKER_BUILD_PROJECT="$(build_output BuildProjectName)"
+
+WORKER_BUNDLE="$(mktemp -d)/worker-source.zip"
+WORKER_IMAGE_TAG="$(python3 - "$WORKER_BUNDLE" <<'PY'
+import hashlib, sys, zipfile
+from pathlib import Path
+
+bundle = sys.argv[1]
+files = [Path("lambda-requirements.txt")]
+for root in ("src", "worker"):
+    for path in sorted(Path(root).rglob("*")):
+        if not path.is_file() or "__pycache__" in path.parts or path.suffix == ".pyc":
+            continue
+        if path.as_posix() in ("src/stack.py", "src/config.py"):
+            continue
+        files.append(path)
+digest = hashlib.sha256()
+with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as archive:
+    for path in files:
+        data = path.read_bytes()
+        digest.update(path.as_posix().encode() + b"\0" + data)
+        info = zipfile.ZipInfo(path.as_posix(), date_time=(2026, 1, 1, 0, 0, 0))
+        info.external_attr = 0o644 << 16  # readable files regardless of local umask
+        archive.writestr(info, data, zipfile.ZIP_DEFLATED)
+print("src-" + digest.hexdigest()[:20])
+PY
+)"
+
+if aws ecr describe-images "${AWS_ARGS[@]}" --repository-name "$WORKER_REPOSITORY" \
+    --image-ids "imageTag=$WORKER_IMAGE_TAG" >/dev/null 2>&1; then
+  info "Worker image $WORKER_IMAGE_TAG already built; reusing it"
+else
+  info "Building worker image $WORKER_IMAGE_TAG in CodeBuild (a few minutes)"
+  aws s3 cp "${AWS_ARGS[@]}" "$WORKER_BUNDLE" "s3://$WORKER_SOURCE_BUCKET/worker-source.zip" --only-show-errors
+  BUILD_ID="$(aws codebuild start-build "${AWS_ARGS[@]}" --project-name "$WORKER_BUILD_PROJECT" \
+    --environment-variables-override "name=IMAGE_TAG,value=$WORKER_IMAGE_TAG,type=PLAINTEXT" \
+    --query 'build.id' --output text)"
+  while :; do
+    BUILD_STATUS="$(aws codebuild batch-get-builds "${AWS_ARGS[@]}" --ids "$BUILD_ID" \
+      --query 'builds[0].buildStatus' --output text)"
+    [[ "$BUILD_STATUS" == "IN_PROGRESS" ]] || break
+    sleep 15
+  done
+  [[ "$BUILD_STATUS" == "SUCCEEDED" ]] \
+    || die "Worker image build $BUILD_ID finished with status $BUILD_STATUS. See CodeBuild logs in log group /aws/codebuild/$WORKER_BUILD_PROJECT."
+fi
+WORKER_IMAGE_DIGEST="$(aws ecr describe-images "${AWS_ARGS[@]}" --repository-name "$WORKER_REPOSITORY" \
+  --image-ids "imageTag=$WORKER_IMAGE_TAG" --query 'imageDetails[0].imageDigest' --output text)"
+[[ "$WORKER_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || die "Could not resolve the worker image digest."
+info "Worker image: $WORKER_REPOSITORY@$WORKER_IMAGE_DIGEST"
+CONTEXT_ARGS+=(-c "worker_image_digest=$WORKER_IMAGE_DIGEST")
 
 # CDK bootstrap creates a CloudFormation stack named CDKToolkit; its presence tells us
 # whether this account/region is ready, so the user never has to know or decide.

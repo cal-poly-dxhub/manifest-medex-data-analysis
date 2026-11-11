@@ -18,7 +18,7 @@ A private, serverless AWS ingestion platform for parsing, indexing, and tracking
 
 # Overview
 
-Manifest MedEx Data Quality Platform is an AWS CDK application that creates separate HL7 v2 and CCDA ingestion lanes plus an authenticated, same-origin clinical-message explorer. New objects in a private, versioned Amazon S3 raw-data bucket are routed through Amazon EventBridge and format-specific Amazon SQS queues to two ingestion AWS Lambda functions. Each function parses its input, writes deterministic JSON to parsed S3, indexes a query-oriented projection in Amazon OpenSearch Serverless, and upserts document-location metadata through the Amazon Aurora PostgreSQL Data API. A third isolated Lambda serves Cognito-authorized metadata and bounded body reads to a React frontend hosted in private S3 behind CloudFront Origin Access Control.
+Manifest MedEx Data Quality Platform is an AWS CDK application that creates separate HL7 v2 and CCDA ingestion lanes plus an authenticated, same-origin clinical-message explorer. New objects in a private, versioned Amazon S3 raw-data bucket are routed through Amazon EventBridge and format-specific Amazon SQS queues to two Amazon ECS on AWS Fargate ingestion services, one per format. Each service's workers parse their input, writes deterministic JSON to parsed S3, indexes a query-oriented projection in Amazon OpenSearch Serverless, and upserts document-location metadata through the Amazon Aurora PostgreSQL Data API. An isolated explorer Lambda serves Cognito-authorized metadata and bounded body reads to a React frontend hosted in private S3 behind CloudFront Origin Access Control.
 
 The design keeps the raw object as the complete source of truth while exposing a deliberately bounded search projection for supplied dashboard requirements. It emphasizes private networking, encryption, least-privilege access, deterministic retries, retained storage, and diagnostics that do not reveal clinical content or identifiers.
 
@@ -38,13 +38,15 @@ This repository is an implementation prototype. It does not establish HL7 profil
 | Object storage | [Amazon S3](https://aws.amazon.com/s3/) | Versioned raw, parsed, error, and access-log storage |
 | Routing | [Amazon EventBridge](https://aws.amazon.com/eventbridge/) | Routes new objects by format prefix |
 | Buffering | [Amazon SQS](https://aws.amazon.com/sqs/) | Isolated processing queues and dead-letter queues |
-| Compute | [AWS Lambda](https://aws.amazon.com/lambda/) | Python 3.14 ARM64 ingestion and authenticated explorer API |
+| Ingestion compute | [Amazon ECS on AWS Fargate](https://aws.amazon.com/fargate/) | ARM64 queue workers for HL7 and CCDA, scaled on queue backlog |
+| Compute | [AWS Lambda](https://aws.amazon.com/lambda/) | Python 3.14 ARM64 explorer API, reports, and reingestion |
+| Image build | [AWS CodeBuild](https://aws.amazon.com/codebuild/), Amazon ECR | Builds the worker image during `deploy.sh`; no local Docker needed |
 | Web and API | React, Vite, TypeScript, CloudFront, HTTP API | Same-origin clinical-message explorer and API proxy |
 | Identity | Amazon Cognito | Hosted UI Authorization Code with PKCE and JWT route authorization |
 | Search | [Amazon OpenSearch Serverless](https://aws.amazon.com/opensearch-service/features/serverless/) | Query-oriented HL7 and CCDA indexes |
 | Metadata | [Amazon Aurora PostgreSQL](https://aws.amazon.com/rds/aurora/) 16.8 | Document-location metadata through the Data API |
 | Security | AWS KMS, IAM, VPC endpoints | Encryption, least privilege, and private service access |
-| Monitoring | Amazon CloudWatch | Encrypted logs, queue-age alarms, DLQ alarms, and Lambda-error alarms |
+| Monitoring | Amazon CloudWatch, Container Insights | Encrypted logs, queue-age, DLQ, worker-capacity, and Aurora-capacity alarms |
 | Parsing | `hl7==0.4.5`, `defusedxml==0.7.1` | Lenient HL7 parsing and hardened XML parsing |
 | Development | `uv`, Ruff, mypy, pytest, cdk-nag | Reproducible dependencies and automated validation |
 
@@ -66,11 +68,16 @@ Runtime dependencies are hash-pinned in `lambda-requirements.txt`. CDK dependenc
 │   ├── ccda_parser.py             # Secure CCDA parsing and CD projection
 │   ├── customer_field_catalog.py  # Customer-backed HL7 names and CCDA section aliases
 │   ├── document_handler.py        # Shared S3, parse, search, and metadata workflow
-│   ├── hl7_handler.py             # HL7 Lambda entry point
-│   ├── ccda_handler.py            # CCDA Lambda entry point
+│   ├── hl7_handler.py             # HL7 batch handler (run by the ECS worker)
+│   ├── ccda_handler.py            # CCDA batch handler (run by the ECS worker)
 │   ├── explorer_handler.py        # Authenticated list, detail, and bounded body API
 │   ├── search_store.py            # OpenSearch mappings, bulk writes, and SigV4 transport
 │   └── metadata_store.py          # Aurora schema, indexes, and Data API upserts
+├── worker/
+│   ├── worker.py                  # SQS polling supervisor with graceful SIGTERM shutdown
+│   ├── Dockerfile                 # ARM64 worker image (built by CodeBuild)
+│   └── requirements.txt           # Exact worker-only dependencies (boto3)
+├── infra/worker-image-build.yaml  # ECR repository + CodeBuild project, deployed by deploy.sh
 ├── web/                           # React/Vite/TypeScript authenticated explorer
 │   ├── src/                       # OIDC, API client, query, and UI source
 │   ├── public/config.json         # Non-secret local runtime-config placeholder
@@ -84,7 +91,7 @@ Runtime dependencies are hash-pinned in `lambda-requirements.txt`. CDK dependenc
                                       # Delivered query-path parity check
 ```
 
-The Lambda artifact contains the runtime `src` modules and exact runtime dependencies. Tests, tools, caches, all of `web/`, `src/stack.py`, and `src/config.py` are excluded from both local and Docker fallback bundles.
+The Lambda artifact and the worker image contain the runtime `src` modules and exact runtime dependencies. Tests, tools, caches, all of `web/`, `src/stack.py`, and `src/config.py` are excluded from both local and Docker fallback bundles.
 
 ## HL7 v2 processing
 
@@ -154,19 +161,54 @@ The stack creates:
 - A private, versioned frontend S3 bucket served only through CloudFront Origin Access Control.
 - A separate access-log bucket.
 - Separate KMS-encrypted HL7 and CCDA queues, each with a 14-day DLQ and a maximum receive count of five.
-- Two Python 3.14 ARM64 ingestion Lambda functions with 2 GiB memory, 10-minute timeouts, encrypted 30-day logs, and bounded concurrency.
+- One ECS cluster with Container Insights and two Fargate ARM64 ingestion services in isolated subnets, with no public IP, KMS-encrypted 30-day logs, and deployment circuit-breaker rollback. See [Ingestion workers](#ingestion-workers).
 - One Python 3.14 ARM64 explorer Lambda in isolated subnets with read-only object access, Data API `ExecuteStatement`, and 4 MiB response caps.
 - Cognito Hosted UI, one public PKCE app client, and a Cognito-authorized HTTP API with no default stage.
 - One CloudFront distribution using private S3 OAC for static assets and an uncached `/api/*` behavior for HTTP API.
 - An isolated, no-NAT VPC with rejected-traffic flow logs.
-- An S3 gateway endpoint plus private OpenSearch Serverless and RDS Data API interface endpoints.
-- One private Aurora PostgreSQL 16.8 Serverless v2 writer with 0.5–2 ACU, Data API, IAM database authentication, KMS encryption, and retained storage.
+- S3 and DynamoDB gateway endpoints plus private OpenSearch Serverless, RDS Data API, Lambda, SQS, ECR (API and Docker), and CloudWatch Logs interface endpoints.
+- One private Aurora PostgreSQL 16.8 Serverless v2 writer with 2–16 ACU (configurable), 35-day backups, deletion protection, Data API, IAM database authentication, KMS encryption, and retained storage.
 - One private OpenSearch Serverless `SEARCH` collection with `hl7-messages-v1` and `ccda-documents-v1`.
-- Queue-age, dead-letter-queue, and Lambda-error alarms for both formats.
+- Queue-age, dead-letter-queue, and worker-at-maximum-tasks alarms for both formats, plus an Aurora capacity alarm.
 
-There is no public Aurora instance, RDS Proxy, reader instance, NAT gateway, direct Lambda PostgreSQL connection, or port 5432 ingress rule.
+There is no public Aurora instance, RDS Proxy, reader instance, NAT gateway, direct PostgreSQL connection, or port 5432 ingress rule.
 
-Production enables stack termination protection, Aurora deletion protection, 35-day Aurora backups, and OpenSearch standby replicas. Non-production uses seven-day Aurora backups. Stored data and the OpenSearch collection remain retained when the stack is deleted; plan an explicitly approved retention or disposal process.
+Every environment uses Aurora deletion protection and 35-day Aurora backups. Production also enables stack termination protection and OpenSearch standby replicas. Stored data and the OpenSearch collection remain retained when the stack is deleted; plan an explicitly approved retention or disposal process. Because deletion protection is on everywhere, tearing down even a dev stack requires first turning it off on the Aurora cluster (`aws rds modify-db-cluster --db-cluster-identifier <id> --no-deletion-protection --apply-immediately`), which is a deliberate, reviewed step.
+
+**OpenSearch standby replicas.** `prod` creates the collection with standby replicas enabled (a second copy in another Availability Zone, roughly double the OCU floor); every other environment creates it without them. This is fixed when the collection is created: OpenSearch Serverless does not support changing it on an existing collection, so switching later means creating a new collection and reindexing. Decide before the first production deploy.
+
+**OpenSearch capacity limits.** OpenSearch Serverless scales OCUs automatically up to the account's maximum indexing and search capacity setting. Under a heavy ingestion backlog that cap, not the worker count, can become the throughput limit. Check it with `aws opensearchserverless get-account-settings` and raise it in the OpenSearch Serverless console (**Capacity limits**) if needed; see [Managing capacity limits](https://docs.aws.amazon.com/opensearch-service/latest/developerguide/serverless-scaling.html).
+
+## Ingestion workers
+
+Each format has its own ECS service. A task runs a small supervisor (`worker/worker.py`) that starts `workers` processes; each long-polls its queue (20 s), hands the received messages to the existing format handler in the same `{"Records": [...]}` shape SQS gives Lambda, and deletes only the messages the handler reports as processed. Failed messages return to the queue after the 15-minute visibility timeout and move to the DLQ after five receives.
+
+| Setting | HL7 | CCDA | Why |
+| --- | --- | --- | --- |
+| Task size | 1 vCPU / 2 GB | 1 vCPU / 4 GB | Measured peak memory: HL7 ~420 MB, large CCDA ~1.2 GB |
+| Worker processes per task | 8 | 4 | HL7 is I/O-bound; CCDA parsing is CPU-bound at 4 |
+| Messages per receive | 10 | 1 | CCDA documents are large; one at a time bounds memory |
+| Tasks (min / max) | 2 / 10 | 2 / 10 | Two tasks across AZs for availability |
+| Backlog target per task | 1,000 | 200 | Roughly 1–2 minutes of work per task at measured throughput |
+
+All values are production defaults in every environment and can be overridden in `config.yaml` (`hl7_*`, `ccda_*`).
+
+**Scaling.** Target tracking keeps *visible messages ÷ running tasks* (SQS `ApproximateNumberOfMessagesVisible` ÷ Container Insights `RunningTaskCount`) near the backlog target, scaling out after 60 s and in after 300 s. The service template has no desired count, so a deploy never resets a scaled-out service. Optional work-hours scaling (`work_hours_min_tasks`, off by default) raises the minimum on weekdays 07:45–17:30 in `work_hours_timezone`. A `WorkerAtMaxTasks` alarm fires when a service has been at its maximum for 15 minutes; raise `*_max_tasks` if that happens regularly, after checking Aurora and OpenSearch headroom.
+
+**Graceful shutdown.** On scale-in or deployment, ECS sends SIGTERM. Every worker stops polling, finishes the batch it holds, deletes what succeeded, and exits. The container stop timeout is 120 seconds (the Fargate maximum); a batch still running after that is killed and its messages are retried after the visibility timeout, so nothing is lost.
+
+**Image.** `deploy.sh` deploys a small companion stack (`<stack>-worker-build`: a private ECR repository and an ARM64 CodeBuild project), uploads the worker source, builds the image in CodeBuild, and pins the ECS task definitions to the image digest. The image tag is a hash of the source, so an unchanged worker is not rebuilt. Plain `cdk deploy` without a digest produces a placeholder image that cannot start; use `deploy.sh`.
+
+## Aurora capacity
+
+Aurora Serverless v2 runs between `aurora_min_acu` (default 2) and `aurora_max_acu` (default 16). The minimum keeps the writer warm, so ingestion never waits for a scale-up from idle. The maximum is a cost and safety ceiling, not a target: you pay only for the ACUs actually used. Sizing guidance:
+
+1. Start at 16 ACU.
+2. Load-test with production-like volume, including a backlog drain, and watch `ServerlessDatabaseCapacity` and `ACUUtilization`.
+3. Review after one to three months of real traffic.
+4. Set the maximum to about twice the observed peak.
+
+The `MetadataClusterCapacityAlarm` fires when capacity stays above 80% of the maximum for 15 minutes. That is the signal to raise `aurora_max_acu` (an in-place change with no downtime) or reduce worker concurrency.
 
 ## Authenticated message explorer
 
@@ -410,7 +452,7 @@ cp config.yaml.sample config.yaml     # set account and region
 
 Then create the first Cognito user and upload a file to `incoming/hl7/` or `incoming/ccda/` as described there.
 
-**Deploying into your own VPC.** Set `vpc_id`, `subnet_ids`, `route_table_ids`, and `availability_zones` in `config.yaml` and the stack uses your private subnets instead of creating a VPC. Give the stack **dedicated subnets on their own route table**: it then creates its own S3 and DynamoDB gateway endpoints without colliding with existing ones, and its traffic is never subject to another workload's endpoint policy. `deploy.sh` detects any endpoints (S3, DynamoDB, SQS, RDS Data API, Lambda) that already exist in the VPC and reuses them; if those carry restrictive endpoint policies, this stack's resources must be added to them. Detection happens only in `deploy.sh`: running `cdk deploy` directly into a VPC that already has any of these endpoints fails partway through and rolls back, unless you pass `existing_endpoints` yourself. Details, including the exact ARNs to add, are in DEPLOYMENT.md under "Deploying into an existing VPC".
+**Deploying into your own VPC.** Set `vpc_id`, `subnet_ids`, `route_table_ids`, and `availability_zones` in `config.yaml` and the stack uses your private subnets instead of creating a VPC. Give the stack **dedicated subnets on their own route table**: it then creates its own S3 and DynamoDB gateway endpoints without colliding with existing ones, and its traffic is never subject to another workload's endpoint policy. `deploy.sh` detects any endpoints (S3, DynamoDB, SQS, RDS Data API, Lambda, ECR API, ECR Docker, CloudWatch Logs) that already exist in the VPC and reuses them; if those carry restrictive endpoint policies, this stack's resources must be added to them. Detection happens only in `deploy.sh`: running `cdk deploy` directly into a VPC that already has any of these endpoints fails partway through and rolls back, unless you pass `existing_endpoints` yourself. Details, including the exact ARNs to add, are in DEPLOYMENT.md under "Deploying into an existing VPC".
 
 # Development tools
 
@@ -458,7 +500,7 @@ These query artifacts may be customer-sensitive and are intentionally outside th
 
 ## Retry and failure behavior
 
-Each format queue uses partial batch failure reporting and a batch size of one. Malformed or oversized input, permanent OpenSearch rejection, and Aurora failures are retried by SQS. After five receives, the record moves to its format-specific DLQ.
+The ingestion workers delete only the messages their handler reports as processed (HL7 receives up to ten per batch, CCDA one). Malformed or oversized input, permanent OpenSearch rejection, and Aurora failures are retried by SQS. After five receives, the record moves to its format-specific DLQ.
 
 A sanitized error object is attempted for every failure, but failure reporting is not allowed to expose raw content, keys, document IDs, identifiers, clinical values, SQL parameters, or raw OpenSearch responses.
 
@@ -466,15 +508,16 @@ A sanitized error object is attempted for every failure, but failure reporting i
 
 Review these signals together:
 
-- HL7 and CCDA Lambda `Errors` metrics.
+- HL7 and CCDA worker logs (`/ecs/<stack>-hl7-worker`, `/ecs/<stack>-ccda-worker`): `batch_failed` and `receive_failed` events.
+- ECS running task counts (Container Insights) and Aurora `ServerlessDatabaseCapacity`.
 - Queue age and visible-message counts.
 - DLQ visible-message counts.
-- KMS-encrypted Lambda and VPC flow logs.
+- KMS-encrypted worker, Lambda, and VPC flow logs.
 - Parsed S3 object versions.
 - OpenSearch indexing results.
 - Aurora Data API errors and metadata rows.
 
-The stack creates six CloudWatch alarms: queue age, DLQ content, and Lambda errors for each format. Alarm notification actions are not configured; connect them to an approved notification or incident-management path before production use.
+The stack creates CloudWatch alarms for queue age, DLQ content, and workers at maximum tasks for each format, plus the reindex queue and Aurora capacity. Alarm notification actions are not configured; connect them to an approved notification or incident-management path before production use.
 
 ## Common problems
 
@@ -500,6 +543,7 @@ Confirm that:
 - The key starts with `incoming/hl7/` or `incoming/ccda/`.
 - HL7 uses `.hl7` or `.txt`; CCDA uses `.xml`.
 - The EventBridge rule target and corresponding SQS queue are healthy.
+- The format's ECS service has running tasks. If tasks keep stopping, check the service events: `CannotPullContainerError` means the ECR or S3 endpoint path is blocked, and a placeholder image means the stack was deployed without `deploy.sh`.
 
 ### OpenSearch indexing fails for one large document
 
@@ -514,6 +558,7 @@ The application limits raw objects to 50 MiB and bulk requests to approximately 
 - Public Dashboards outside development.
 - Public Dashboards without an explicit role.
 - A Dashboard role from a different account.
+- Invalid Fargate CPU/memory pairs, `min_tasks` above `max_tasks`, or Aurora ACU values that are out of order or not multiples of 0.5.
 
 Correct the context values rather than bypassing validation.
 

@@ -36,8 +36,13 @@ def test_stack_contains_only_the_two_combined_ingestion_lanes() -> None:
     template.resource_count_is("AWS::S3::Bucket", 6)
     template.resource_count_is("AWS::SQS::Queue", 6)
     template.resource_count_is("AWS::Events::Rule", 2)
-    template.resource_count_is("AWS::Lambda::Function", 7)
-    template.resource_count_is("AWS::Lambda::EventSourceMapping", 3)
+    # Ingestion runs on ECS; the five Lambdas are the explorer, report runner, reingestion
+    # planner, reindexer, and the CDK frontend BucketDeployment helper.
+    template.resource_count_is("AWS::Lambda::Function", 5)
+    template.resource_count_is("AWS::Lambda::EventSourceMapping", 1)
+    template.resource_count_is("AWS::ECS::Cluster", 1)
+    template.resource_count_is("AWS::ECS::Service", 2)
+    template.resource_count_is("AWS::ECS::TaskDefinition", 2)
     template.resource_count_is("AWS::EC2::VPC", 1)
     template.resource_count_is("AWS::DynamoDB::Table", 3)
     template.resource_count_is("AWS::RDS::DBCluster", 1)
@@ -46,15 +51,15 @@ def test_stack_contains_only_the_two_combined_ingestion_lanes() -> None:
     template.resource_count_is("AWS::SecretsManager::Secret", 1)
     template.resource_count_is("AWS::OpenSearchServerless::Collection", 1)
     template.resource_count_is("AWS::OpenSearchServerless::VpcEndpoint", 1)
-    template.resource_count_is("AWS::CloudWatch::Alarm", 8)
+    template.resource_count_is("AWS::CloudWatch::Alarm", 9)
     template.resource_count_is("AWS::OpenSearchService::Domain", 0)
 
     handlers = {
         function["Properties"]["Handler"]
         for function in template.find_resources("AWS::Lambda::Function").values()
     }
-    assert "src.hl7_handler.handler" in handlers
-    assert "src.ccda_handler.handler" in handlers
+    assert "src.hl7_handler.handler" not in handlers
+    assert "src.ccda_handler.handler" not in handlers
     assert "src.explorer_handler.handler" in handlers
     assert "src.report_runner.handler" in handlers
     assert "src.reingest_planner.handler" in handlers
@@ -172,62 +177,220 @@ def test_buckets_are_private_encrypted_versioned_logged_and_retained() -> None:
     assert all('"s3:TlsVersion": 1.2' in json.dumps(policy) for policy in bucket_policies.values())
 
 
-def test_format_lambdas_are_private_bounded_and_have_combined_dependencies() -> None:
-    _, _, template = build_stack()
-    ingestion_handlers = {"src.hl7_handler.handler", "src.ccda_handler.handler"}
-    functions = {
-        logical_id: function
-        for logical_id, function in template.find_resources("AWS::Lambda::Function").items()
-        if function["Properties"]["Handler"] in ingestion_handlers
+def _task_definitions(template: Template) -> dict[str, dict[str, Any]]:
+    return {
+        name: cast(dict[str, Any], definition)
+        for name, definition in template.find_resources("AWS::ECS::TaskDefinition").items()
     }
 
-    assert len(functions) == 2
-    assert all(function["Properties"]["Runtime"] == "python3.14" for function in functions.values())
-    assert all(
-        function["Properties"]["Architectures"] == ["arm64"] for function in functions.values()
-    )
-    assert all(function["Properties"]["Timeout"] == 600 for function in functions.values())
-    assert all(function["Properties"]["MemorySize"] == 2048 for function in functions.values())
-    assert all("VpcConfig" in function["Properties"] for function in functions.values())
-    assert all("KmsKeyArn" in function["Properties"] for function in functions.values())
-    assert sorted(
-        function["Properties"]["ReservedConcurrentExecutions"] for function in functions.values()
-    ) == [5, 10]
 
-    formats: set[str] = set()
-    for function in functions.values():
-        environment = function["Properties"]["Environment"]["Variables"]
-        formats.add(environment["SOURCE_FORMAT"])
+def test_ingestion_workers_are_private_arm_fargate_tasks_with_lane_settings() -> None:
+    _, _, template = build_stack()
+    definitions = _task_definitions(template)
+    assert len(definitions) == 2
+
+    by_format: dict[str, dict[str, Any]] = {}
+    for definition in definitions.values():
+        properties = definition["Properties"]
+        assert properties["RequiresCompatibilities"] == ["FARGATE"]
+        assert properties["NetworkMode"] == "awsvpc"
+        assert properties["RuntimePlatform"] == {
+            "CpuArchitecture": "ARM64",
+            "OperatingSystemFamily": "LINUX",
+        }
+        assert "TaskRoleArn" in properties
+        (container,) = properties["ContainerDefinitions"]
+        assert container["StopTimeout"] == 120
+        assert container["LinuxParameters"]["InitProcessEnabled"] is True
+        assert container["LogConfiguration"]["LogDriver"] == "awslogs"
+        environment = {item["Name"]: item["Value"] for item in container["Environment"]}
         assert environment["METADATA_DATABASE"] == "manifest_medex"
         assert environment["METADATA_TABLE"] == "document_metadata"
         assert environment["OPENSEARCH_SERVICE"] == "aoss"
         assert environment["OPENSEARCH_HL7_INDEX"] == "hl7-messages-v1"
         assert environment["OPENSEARCH_CCDA_INDEX"] == "ccda-documents-v1"
+        assert "QUEUE_URL" in environment
         assert "METADATA_CLUSTER_ARN" in environment
         assert "METADATA_SECRET_ARN" in environment
         assert not any("PASSWORD" in key for key in environment)
-    assert formats == {"hl7-v2", "ccda"}
+        by_format[environment["FORMAT"]] = {**properties, "environment": environment}
 
-    mappings = {
-        logical_id: mapping
-        for logical_id, mapping in template.find_resources(
-            "AWS::Lambda::EventSourceMapping"
-        ).items()
-        if any(
-            name in json.dumps(mapping["Properties"].get("EventSourceArn", {}))
-            for name in ("Hl7Queue", "CcdaQueue")
-        )
-    }
-    assert len(mappings) == 2
-    assert all(mapping["Properties"]["BatchSize"] == 1 for mapping in mappings.values())
-    assert sorted(
-        mapping["Properties"]["ScalingConfig"]["MaximumConcurrency"]
-        for mapping in mappings.values()
-    ) == [5, 10]
-    assert all(
-        mapping["Properties"]["FunctionResponseTypes"] == ["ReportBatchItemFailures"]
-        for mapping in mappings.values()
+    hl7, ccda = by_format["hl7"], by_format["ccda"]
+    assert (hl7["Cpu"], hl7["Memory"]) == ("1024", "2048")
+    assert (ccda["Cpu"], ccda["Memory"]) == ("1024", "4096")
+    assert hl7["environment"]["SOURCE_FORMAT"] == "hl7-v2"
+    assert ccda["environment"]["SOURCE_FORMAT"] == "ccda"
+    assert (hl7["environment"]["WORKERS"], hl7["environment"]["RECEIVE_BATCH_SIZE"]) == (
+        "8",
+        "10",
     )
+    assert (ccda["environment"]["WORKERS"], ccda["environment"]["RECEIVE_BATCH_SIZE"]) == (
+        "4",
+        "1",
+    )
+    assert "Hl7Queue" in json.dumps(hl7["environment"]["QUEUE_URL"])
+    assert "CcdaQueue" in json.dumps(ccda["environment"]["QUEUE_URL"])
+
+    services = template.find_resources("AWS::ECS::Service")
+    assert len(services) == 2
+    for service in services.values():
+        properties = service["Properties"]
+        # Autoscaling owns the task count; a template value would reset it on every deploy.
+        assert "DesiredCount" not in properties
+        network = properties["NetworkConfiguration"]["AwsvpcConfiguration"]
+        assert network["AssignPublicIp"] == "DISABLED"
+        assert "IngestionSecurityGroup" in json.dumps(network["SecurityGroups"])
+        assert len(network["Subnets"]) == 2
+        deployment = properties["DeploymentConfiguration"]
+        assert deployment["DeploymentCircuitBreaker"] == {"Enable": True, "Rollback": True}
+        assert deployment["MinimumHealthyPercent"] == 100
+        assert properties["CapacityProviderStrategy"][0]["CapacityProvider"] == "FARGATE"
+    assert "FARGATE_SPOT" not in json.dumps(services)
+
+    cluster = next(iter(template.find_resources("AWS::ECS::Cluster").values()))
+    assert {"Name": "containerInsights", "Value": "enabled"} in cluster["Properties"][
+        "ClusterSettings"
+    ]
+
+    log_groups = {
+        json.dumps(group["Properties"].get("LogGroupName")): group
+        for group in template.find_resources("AWS::Logs::LogGroup").values()
+    }
+    for fmt in ("hl7", "ccda"):
+        group = next(
+            group for name, group in log_groups.items() if "/ecs/" in name and f"-{fmt}-" in name
+        )
+        assert "KmsKeyId" in group["Properties"]
+        assert group["Properties"]["RetentionInDays"] == 30
+
+
+def test_worker_image_is_a_placeholder_until_deploy_sh_supplies_a_digest() -> None:
+    _, _, template = build_stack()
+    images = {
+        json.dumps(definition["Properties"]["ContainerDefinitions"][0]["Image"])
+        for definition in _task_definitions(template).values()
+    }
+    assert images == {'"worker-image-not-built-run-deploy-sh"'}
+
+    digest = "sha256:" + "a" * 64
+    app = App()
+    config = AppConfig(
+        project_name="manifest-medex-data-quality",
+        environment=DeploymentEnvironment.DEV,
+        worker_image_digest=digest,
+    )
+    pinned = Template.from_stack(DataQualityStack(app, "TestStack", config=config))
+    pinned_images = [
+        json.dumps(definition["Properties"]["ContainerDefinitions"][0]["Image"])
+        for definition in pinned.find_resources("AWS::ECS::TaskDefinition").values()
+    ]
+    assert len(pinned_images) == 2
+    for image in pinned_images:
+        assert f"@{digest}" in image
+        assert "manifest-medex-data-quality-dev-worker" in image
+
+
+def test_worker_scaling_tracks_backlog_per_task_within_lane_bounds() -> None:
+    _, _, template = build_stack()
+    targets = template.find_resources("AWS::ApplicationAutoScaling::ScalableTarget")
+    assert len(targets) == 2
+    for target in targets.values():
+        properties = target["Properties"]
+        assert properties["ScalableDimension"] == "ecs:service:DesiredCount"
+        assert (properties["MinCapacity"], properties["MaxCapacity"]) == (2, 10)
+        # Scheduled work-hours scaling is off by default.
+        assert "ScheduledActions" not in properties
+
+    policies = template.find_resources("AWS::ApplicationAutoScaling::ScalingPolicy")
+    assert len(policies) == 2
+    targets_by_queue: dict[str, float] = {}
+    for policy in policies.values():
+        properties = policy["Properties"]
+        assert properties["PolicyType"] == "TargetTrackingScaling"
+        configuration = properties["TargetTrackingScalingPolicyConfiguration"]
+        assert configuration["ScaleOutCooldown"] == 60
+        assert configuration["ScaleInCooldown"] == 300
+        metrics = configuration["CustomizedMetricSpecification"]["Metrics"]
+        by_id = {metric["Id"]: metric for metric in metrics}
+        assert by_id["backlog_per_task"]["Expression"] == "visible / tasks"
+        assert by_id["backlog_per_task"]["ReturnData"] is True
+        visible = by_id["visible"]["MetricStat"]["Metric"]
+        assert visible["MetricName"] == "ApproximateNumberOfMessagesVisible"
+        tasks = by_id["tasks"]["MetricStat"]["Metric"]
+        assert tasks["Namespace"] == "ECS/ContainerInsights"
+        assert tasks["MetricName"] == "RunningTaskCount"
+        queue = "Hl7Queue" if "Hl7Queue" in json.dumps(visible) else "CcdaQueue"
+        targets_by_queue[queue] = configuration["TargetValue"]
+    assert targets_by_queue == {"Hl7Queue": 1000, "CcdaQueue": 200}
+
+
+def test_work_hours_scaling_adds_weekday_scheduled_minimums() -> None:
+    app = App()
+    config = AppConfig(
+        project_name="manifest-medex-data-quality",
+        environment=DeploymentEnvironment.DEV,
+        work_hours_min_tasks=4,
+    )
+    template = Template.from_stack(DataQualityStack(app, "TestStack", config=config))
+    for target in template.find_resources("AWS::ApplicationAutoScaling::ScalableTarget").values():
+        actions = {
+            action["Schedule"]: action for action in target["Properties"]["ScheduledActions"]
+        }
+        start = actions["cron(45 7 ? * MON-FRI *)"]
+        end = actions["cron(30 17 ? * MON-FRI *)"]
+        assert start["ScalableTargetAction"]["MinCapacity"] == 4
+        assert end["ScalableTargetAction"]["MinCapacity"] == 2
+        assert start["Timezone"] == "America/Los_Angeles"
+
+
+def test_worker_alarms_cover_max_tasks_and_aurora_capacity() -> None:
+    _, _, template = build_stack()
+    alarms = template.find_resources("AWS::CloudWatch::Alarm")
+    at_max = [
+        alarm["Properties"]
+        for alarm in alarms.values()
+        if alarm["Properties"].get("MetricName") == "RunningTaskCount"
+    ]
+    assert len(at_max) == 2
+    for alarm in at_max:
+        assert alarm["Threshold"] == 10
+        assert alarm["ComparisonOperator"] == "GreaterThanOrEqualToThreshold"
+        assert alarm["EvaluationPeriods"] == 3
+
+    capacity = next(
+        alarm["Properties"]
+        for alarm in alarms.values()
+        if alarm["Properties"].get("MetricName") == "ServerlessDatabaseCapacity"
+    )
+    assert capacity["Threshold"] == pytest.approx(12.8)
+    assert capacity["Statistic"] == "Maximum"
+
+
+def test_workers_consume_only_their_own_queue() -> None:
+    _, _, template = build_stack()
+    for role_name, own, other in (
+        ("Hl7IngestionRole", "Hl7Queue", "CcdaQueue"),
+        ("CcdaIngestionRole", "CcdaQueue", "Hl7Queue"),
+    ):
+        role = next(
+            role
+            for name, role in template.find_resources("AWS::IAM::Role").items()
+            if name.startswith(role_name)
+        )
+        assert "ecs-tasks.amazonaws.com" in json.dumps(
+            role["Properties"]["AssumeRolePolicyDocument"]
+        )
+        consume_statements = [
+            statement
+            for policy in template.find_resources("AWS::IAM::Policy").values()
+            if role_name in json.dumps(policy["Properties"]["Roles"])
+            for statement in policy["Properties"]["PolicyDocument"]["Statement"]
+            if "sqs:ReceiveMessage" in json.dumps(statement["Action"])
+        ]
+        assert consume_statements
+        rendered = json.dumps(consume_statements)
+        assert own in rendered
+        assert other not in rendered
 
 
 def test_aurora_is_one_private_serverless_v2_writer_with_data_api_and_retention() -> None:
@@ -241,13 +404,14 @@ def test_aurora_is_one_private_serverless_v2_writer_with_data_api_and_retention(
     assert properties["EnableIAMDatabaseAuthentication"] is True
     assert properties["DatabaseName"] == "manifest_medex"
     assert properties["ServerlessV2ScalingConfiguration"] == {
-        "MinCapacity": 0.5,
-        "MaxCapacity": 2,
+        "MinCapacity": 2,
+        "MaxCapacity": 16,
     }
     assert properties["StorageEncrypted"] is True
     assert "KmsKeyId" in properties
-    assert properties["BackupRetentionPeriod"] == 7
-    assert properties["DeletionProtection"] is False
+    # Production-grade defaults in every environment.
+    assert properties["BackupRetentionPeriod"] == 35
+    assert properties["DeletionProtection"] is True
     assert cluster["DeletionPolicy"] == "Retain"
     assert cluster["UpdateReplacePolicy"] == "Retain"
 
@@ -270,16 +434,16 @@ def test_aurora_is_one_private_serverless_v2_writer_with_data_api_and_retention(
 def test_private_endpoints_allow_https_only_from_ingestion_security_group() -> None:
     _, _, template = build_stack()
     endpoints = template.find_resources("AWS::EC2::VPCEndpoint")
-    # S3 and DynamoDB gateway endpoints plus the RDS Data API, Lambda, and SQS interface
-    # endpoints. SQS is required because the reingestion planner sends to the reindex
-    # queue from the isolated subnets (every other function is queue-invoked).
-    assert len(endpoints) == 5
+    # S3 and DynamoDB gateway endpoints plus the RDS Data API, Lambda, SQS, ECR API, ECR
+    # Docker, and CloudWatch Logs interface endpoints. The ingestion workers poll SQS and pull
+    # their image and ship logs from the isolated subnets.
+    assert len(endpoints) == 8
     interface_endpoints = [
         endpoint
         for endpoint in endpoints.values()
         if endpoint["Properties"]["VpcEndpointType"] == "Interface"
     ]
-    assert len(interface_endpoints) == 3
+    assert len(interface_endpoints) == 6
     interface_endpoint = next(
         endpoint for endpoint in interface_endpoints if ".rds-data" in json.dumps(endpoint)
     )
@@ -304,25 +468,54 @@ def test_private_endpoints_allow_https_only_from_ingestion_security_group() -> N
     sqs_json = json.dumps(sqs_endpoint)
     assert sqs_endpoint["Properties"]["PrivateDnsEnabled"] is True
     assert len(sqs_endpoint["Properties"]["SubnetIds"]) == 2
-    # Least privilege: only the planner may send, and only to the reindex queue.
-    assert "sqs:SendMessage" in sqs_json
-    assert "ReingestPlannerRole" in sqs_json
-    assert "ReindexQueue" in sqs_json
-    assert "Hl7IngestionRole" not in sqs_json
-    assert "sqs:ReceiveMessage" not in sqs_json
+    # Least privilege: only the planner may send (to the reindex queue), and each worker
+    # role may consume only its own queue.
+    sqs_statements = sqs_endpoint["Properties"]["PolicyDocument"]["Statement"]
+    send = [st for st in sqs_statements if "sqs:SendMessage" in json.dumps(st["Action"])]
+    assert len(send) == 1
+    assert "ReingestPlannerRole" in json.dumps(send[0])
+    assert "ReindexQueue" in json.dumps(send[0])
+    assert "Hl7IngestionRole" not in json.dumps(send)
+    receive = [st for st in sqs_statements if "sqs:ReceiveMessage" in json.dumps(st["Action"])]
+    assert len(receive) == 2
+    for role_name, own, other in (
+        ("Hl7IngestionRole", "Hl7Queue", "CcdaQueue"),
+        ("CcdaIngestionRole", "CcdaQueue", "Hl7Queue"),
+    ):
+        statement = next(st for st in receive if role_name in json.dumps(st["Principal"]))
+        assert own in json.dumps(statement["Resource"])
+        assert other not in json.dumps(statement["Resource"])
+        assert "sqs:SendMessage" not in json.dumps(statement["Action"])
+    assert "ReindexQueue" not in json.dumps(receive)
+    assert "sqs:ReceiveMessage" in sqs_json
+
+    for service in (".ecr.api", ".ecr.dkr", ".logs"):
+        endpoint = next(
+            endpoint for endpoint in interface_endpoints if service in json.dumps(endpoint)
+        )
+        assert endpoint["Properties"]["PrivateDnsEnabled"] is True
+        assert len(endpoint["Properties"]["SubnetIds"]) == 2
 
     ingress_rules = template.find_resources("AWS::EC2::SecurityGroupIngress")
-    assert len(ingress_rules) == 9
-    # The SQS endpoint admits only the reingestion planner; ingestion Lambdas are
-    # queue-invoked and must not gain an outbound SQS path they do not need.
-    sqs_ingress = [
-        ingress
+    assert len(ingress_rules) == 11
+    # The SQS endpoint admits the reingestion planner and the ingestion workers only.
+    sqs_ingress = sorted(
+        json.dumps(ingress["Properties"]["SourceSecurityGroupId"])
         for ingress in ingress_rules.values()
         if "SqsEndpointSecurityGroup" in json.dumps(ingress["Properties"]["GroupId"])
+    )
+    assert len(sqs_ingress) == 2
+    assert "IngestionSecurityGroup" in sqs_ingress[0]
+    assert "ReingestPlannerSecurityGroup" in sqs_ingress[1]
+    # ECR and CloudWatch Logs endpoints share one security group open to the workers only.
+    container_ingress = [
+        ingress
+        for ingress in ingress_rules.values()
+        if "ContainerEndpointSecurityGroup" in json.dumps(ingress["Properties"]["GroupId"])
     ]
-    assert len(sqs_ingress) == 1
-    assert "ReingestPlannerSecurityGroup" in json.dumps(
-        sqs_ingress[0]["Properties"]["SourceSecurityGroupId"]
+    assert len(container_ingress) == 1
+    assert "IngestionSecurityGroup" in json.dumps(
+        container_ingress[0]["Properties"]["SourceSecurityGroupId"]
     )
     allowed_sources = {
         "IngestionSecurityGroup",
@@ -436,8 +629,11 @@ def test_kms_key_allows_logs_for_only_stack_log_groups() -> None:
         if statement.get("Sid") == "AllowCloudWatchLogsForStackLogGroups"
     )
     contexts = logs_statement["Condition"]["ArnEquals"]["kms:EncryptionContext:aws:logs:arn"]
-    assert len(contexts) == 7
+    assert len(contexts) == 9
     context_json = json.dumps(contexts)
+    # Worker log groups, plus the former ingestion Lambda log groups kept readable.
+    assert "/ecs/manifest-medex-data-quality-dev-hl7-worker" in context_json
+    assert "/ecs/manifest-medex-data-quality-dev-ccda-worker" in context_json
     assert "/aws/vpc/manifest-medex-data-quality-dev" in context_json
     assert "/aws/lambda/manifest-medex-data-quality-dev-hl7" in context_json
     assert "/aws/lambda/manifest-medex-data-quality-dev-ccda" in context_json
@@ -489,8 +685,9 @@ def test_stack_outputs_both_lanes_and_aurora_metadata_locations() -> None:
     for output in (
         "Hl7QueueUrl",
         "CcdaQueueUrl",
-        "Hl7FunctionName",
-        "CcdaFunctionName",
+        "IngestionClusterName",
+        "Hl7ServiceName",
+        "CcdaServiceName",
         "AuroraClusterArn",
         "AuroraClusterIdentifier",
         "AuroraSecretArn",
@@ -499,6 +696,8 @@ def test_stack_outputs_both_lanes_and_aurora_metadata_locations() -> None:
     ):
         assert output in outputs
     assert outputs["MetadataTableName"]["Value"] == "document_metadata"
+    assert "Hl7FunctionName" not in outputs
+    assert "CcdaFunctionName" not in outputs
 
 
 def _aws_solutions_errors(app: App, artifact_id: str) -> list[str]:
@@ -1194,9 +1393,9 @@ def test_no_report_audit_stream_path_remains_and_only_sqs_mappings_exist() -> No
     assert "StreamViewType" not in template_json
     assert '"audit/' not in template_json
 
-    # Ingestion and reindexing rely on exactly three SQS event source mappings and nothing else.
+    # Ingestion runs on ECS workers; only the reindexer keeps an SQS event source mapping.
     mappings = template.find_resources("AWS::Lambda::EventSourceMapping")
-    assert len(mappings) == 3
+    assert len(mappings) == 1
     for mapping in mappings.values():
         event_source = json.dumps(mapping["Properties"].get("EventSourceArn", {}))
         assert "Queue" in event_source
@@ -1516,8 +1715,9 @@ def test_existing_vpc_mode_still_creates_every_endpoint_inside_customer_subnets(
     template = _build_existing_vpc_stack()
     rendered = json.dumps(template.to_json())
 
-    # S3, DynamoDB gateways + RDS Data API, SQS, Lambda interfaces + the AOSS endpoint.
-    assert len(template.find_resources("AWS::EC2::VPCEndpoint")) == 5
+    # S3, DynamoDB gateways + RDS Data API, SQS, Lambda, ECR API, ECR Docker, and Logs
+    # interfaces + the AOSS endpoint.
+    assert len(template.find_resources("AWS::EC2::VPCEndpoint")) == 8
     assert len(template.find_resources("AWS::OpenSearchServerless::VpcEndpoint")) == 1
     for subnet_id in _CUSTOMER_SUBNET_IDS:
         assert subnet_id in rendered
@@ -1564,7 +1764,7 @@ def test_existing_gateway_endpoints_are_not_recreated() -> None:
         json.dumps(v["Properties"]["ServiceName"])
         for v in template.find_resources("AWS::EC2::VPCEndpoint").values()
     ]
-    assert len(services) == 3  # rds-data, sqs, lambda interfaces only
+    assert len(services) == 6  # rds-data, sqs, lambda, ecr.api, ecr.dkr, logs interfaces
     assert not any(".s3" in s for s in services)
     assert not any(".dynamodb" in s for s in services)
 
@@ -1583,9 +1783,12 @@ def test_existing_interface_endpoint_is_imported_and_its_security_group_opened()
         for rule in template.find_resources("AWS::EC2::SecurityGroupIngress").values()
         if rule["Properties"].get("GroupId") == "sg-0bbbbbbbbbbbbbbbb"
     ]
-    assert len(ingress) == 1
-    assert "reingestion planner" in ingress[0]["Description"]
-    assert ingress[0]["FromPort"] == 443
+    descriptions = sorted(rule["Description"] for rule in ingress)
+    assert descriptions == [
+        "HTTPS from ingestion workers to Amazon SQS",
+        "HTTPS from the reingestion planner Lambda to Amazon SQS",
+    ]
+    assert all(rule["FromPort"] == 443 for rule in ingress)
     # The customer owns the endpoint policy; the stack must not attach one to the imported
     # endpoint (the planner's IAM role still legitimately holds sqs:SendMessage).
     endpoint_policies = [
@@ -1593,6 +1796,7 @@ def test_existing_interface_endpoint_is_imported_and_its_security_group_opened()
         for v in template.find_resources("AWS::EC2::VPCEndpoint").values()
     ]
     assert not any("sqs:SendMessage" in policy for policy in endpoint_policies)
+    assert not any("sqs:ReceiveMessage" in policy for policy in endpoint_policies)
 
 
 def test_ingress_granted_before_import_is_replayed_onto_imported_endpoint() -> None:
@@ -1605,7 +1809,7 @@ def test_ingress_granted_before_import_is_replayed_onto_imported_endpoint() -> N
         if rule["Properties"].get("GroupId") == "sg-0dddddddddddddddd"
     )
     assert descriptions == [
-        "HTTPS from ingestion Lambdas to RDS Data API",
+        "HTTPS from ingestion workers to RDS Data API",
         "HTTPS from the explorer Lambda to the RDS Data API",
         "HTTPS from the reingestion planner Lambda to the RDS Data API",
     ]

@@ -231,3 +231,69 @@ def test_existing_endpoint_map_parses_gateway_and_interface_entries() -> None:
         "s3": None,
         "lambda": ("vpce-0123456789abcdef0", "sg-0123456789abcdef0"),
     }
+
+
+def test_ingestion_and_aurora_defaults_are_production_sized_in_every_environment() -> None:
+    for environment in ("dev", "prod"):
+        config = AppConfig.from_context(App(context={"environment": environment}).node)
+        assert (config.hl7.task_cpu, config.hl7.task_memory) == (1024, 2048)
+        assert (config.hl7.workers, config.hl7.receive_batch_size) == (8, 10)
+        assert (config.hl7.min_tasks, config.hl7.max_tasks) == (2, 10)
+        assert config.hl7.backlog_target == 1000
+        assert (config.ccda.task_cpu, config.ccda.task_memory) == (1024, 4096)
+        assert (config.ccda.workers, config.ccda.receive_batch_size) == (4, 1)
+        assert (config.ccda.min_tasks, config.ccda.max_tasks) == (2, 10)
+        assert config.ccda.backlog_target == 200
+        assert (config.aurora_min_acu, config.aurora_max_acu) == (2.0, 16.0)
+        assert config.work_hours_min_tasks is None
+        assert config.worker_image_digest is None
+
+
+def test_lane_and_aurora_overrides_are_read_from_context() -> None:
+    digest = "sha256:" + "b" * 64
+    app = App(
+        context={
+            "hl7_workers": "12",
+            "hl7_max_tasks": "20",
+            "ccda_task_memory": "8192",
+            "ccda_backlog_target": "100",
+            "work_hours_min_tasks": "4",
+            "work_hours_timezone": "America/New_York",
+            "aurora_min_acu": "1.5",
+            "aurora_max_acu": "32",
+            "worker_image_digest": digest,
+        }
+    )
+    config = AppConfig.from_context(app.node)
+    assert config.hl7.workers == 12
+    assert config.hl7.max_tasks == 20
+    assert config.hl7.task_memory == 2048
+    assert config.ccda.task_memory == 8192
+    assert config.ccda.backlog_target == 100
+    assert config.work_hours_min_tasks == 4
+    assert config.work_hours_timezone == "America/New_York"
+    assert (config.aurora_min_acu, config.aurora_max_acu) == (1.5, 32.0)
+    assert config.worker_image_digest == digest
+
+
+@pytest.mark.parametrize(
+    ("context", "message"),
+    [
+        ({"hl7_task_cpu": "512"}, "task_cpu must be one of"),
+        ({"ccda_task_memory": "1024"}, "is not valid for task_cpu"),
+        ({"hl7_min_tasks": "5", "hl7_max_tasks": "3"}, "min_tasks must not exceed max_tasks"),
+        ({"hl7_receive_batch_size": "11"}, "less than or equal to 10"),
+        ({"ccda_workers": "0"}, "greater than or equal to 1"),
+        ({"hl7_workers": "many"}, "Invalid integer context value"),
+        ({"aurora_min_acu": "8", "aurora_max_acu": "4"}, "must not exceed aurora_max_acu"),
+        ({"aurora_max_acu": "16.3"}, "multiple of 0.5 ACU"),
+        ({"work_hours_min_tasks": "11"}, "work_hours_min_tasks must be between"),
+        ({"work_hours_timezone": "Mars/Olympus"}, "Unknown work_hours_timezone"),
+        ({"worker_image_digest": "latest"}, "String should match pattern"),
+    ],
+)
+def test_invalid_ingestion_settings_are_rejected(context: dict[str, str], message: str) -> None:
+    # Malformed numbers fail while reading context (ValueError); out-of-range values fail model
+    # validation (pydantic's ValidationError, itself a ValueError).
+    with pytest.raises(ValueError, match=message):
+        AppConfig.from_context(App(context=context).node)

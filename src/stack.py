@@ -16,19 +16,22 @@ from aws_cdk import (
     Environment,
     ILocalBundling,
     RemovalPolicy,
-    Size,
     Stack,
     Tags,
+    TimeZone,
 )
 from aws_cdk import aws_apigatewayv2 as apigwv2
 from aws_cdk import aws_apigatewayv2_authorizers as apigwv2_authorizers
 from aws_cdk import aws_apigatewayv2_integrations as apigwv2_integrations
+from aws_cdk import aws_applicationautoscaling as appscaling
 from aws_cdk import aws_cloudfront as cloudfront
 from aws_cdk import aws_cloudfront_origins as cloudfront_origins
 from aws_cdk import aws_cloudwatch as cloudwatch
 from aws_cdk import aws_cognito as cognito
 from aws_cdk import aws_dynamodb as dynamodb
 from aws_cdk import aws_ec2 as ec2
+from aws_cdk import aws_ecr as ecr
+from aws_cdk import aws_ecs as ecs
 from aws_cdk import aws_events as events
 from aws_cdk import aws_events_targets as events_targets
 from aws_cdk import aws_iam as iam
@@ -44,7 +47,7 @@ from aws_cdk import aws_sqs as sqs
 from cdk_nag import NagSuppressions
 from constructs import Construct
 from src.ccda_parser import PARSER_VERSION as CCDA_PARSER_VERSION
-from src.config import AppConfig, DeploymentEnvironment
+from src.config import AppConfig, DeploymentEnvironment, IngestionLaneConfig
 from src.parser import PARSER_VERSION as HL7_PARSER_VERSION
 
 METADATA_DATABASE_NAME = "manifest_medex"
@@ -55,6 +58,10 @@ HL7_INDEX_NAME = "hl7-messages-v1"
 CCDA_INDEX_NAME = "ccda-documents-v1"
 AURORA_CREDENTIALS_MISSING = "Aurora generated credentials did not produce a secret"
 MAX_EXPLORER_BODY_BYTES = 4 * 1024 * 1024
+# Used for local synthesis and tests only; deploy.sh always supplies the built image digest.
+WORKER_IMAGE_PLACEHOLDER = "worker-image-not-built-run-deploy-sh"
+# Fargate's maximum container stop timeout: workers finish their batch within this window.
+WORKER_STOP_TIMEOUT = Duration.seconds(120)
 FRONTEND_DIST_MISSING = (
     "Frontend build output was not found at web/dist; run 'make web-build' before synthesis"
 )
@@ -165,6 +172,8 @@ class DataQualityStack(Stack):
             "IngestionSecurityGroup",
             vpc=self.vpc,
             allow_all_outbound=True,
+            # Used by the ECS ingestion workers. The description predates them and is left
+            # unchanged because editing a security group description replaces the group.
             description="Network access for the format-specific ingestion Lambdas",
         )
         self.serverless_endpoint_security_group = self._create_endpoint_security_group(
@@ -181,9 +190,18 @@ class DataQualityStack(Stack):
             "SqsEndpointSecurityGroup",
             "Amazon SQS",
             service_key="sqs",
-            # Ingestion Lambdas are queue-invoked and never send; only the planner needs SQS.
-            allow_ingestion=False,
         )
+        # ECS ingestion tasks pull their image from ECR and ship logs to CloudWatch Logs
+        # through these endpoints; the isolated subnets have no internet route.
+        self.container_endpoint_security_group = self._create_endpoint_security_group(
+            "ContainerEndpointSecurityGroup",
+            "ECR and CloudWatch Logs",
+            service_key="ecr.api",
+        )
+        for service_key in ("ecr.dkr", "logs"):
+            self._endpoint_ingress_sources[service_key] = list(
+                self._endpoint_ingress_sources["ecr.api"]
+            )
 
         self.hl7_role = self._create_ingestion_role("Hl7", "incoming/hl7/*", "hl7/*")
         self.ccda_role = self._create_ingestion_role("Ccda", "incoming/ccda/*", "ccda/*")
@@ -230,22 +248,30 @@ class DataQualityStack(Stack):
         )
         self.data_api_endpoint = self._create_data_api_endpoint()
         self.sqs_endpoint = self._create_sqs_endpoint()
+        self._create_container_endpoints()
         self._grant_metadata_access(self.hl7_role)
         self._grant_metadata_access(self.ccda_role)
+        self._grant_queue_consumption()
 
-        self.hl7_function = self._create_ingestion_function(
+        # Long-running ECS Fargate workers consume the format queues. Ingestion is I/O-bound
+        # (HL7) or CPU-bound per document (CCDA); packing several worker processes onto each
+        # vCPU and scaling tasks on queue backlog is far cheaper than per-message Lambda.
+        self.ingestion_cluster = self._create_ingestion_cluster()
+        self.hl7_service = self._create_ingestion_service(
             "Hl7",
-            handler="src.hl7_handler.handler",
+            lane=self.config.hl7,
             role=self.hl7_role,
+            queue=self.hl7_queue,
             source_format="hl7-v2",
-            reserved_concurrency=10,
+            worker_format="hl7",
         )
-        self.ccda_function = self._create_ingestion_function(
+        self.ccda_service = self._create_ingestion_service(
             "Ccda",
-            handler="src.ccda_handler.handler",
+            lane=self.config.ccda,
             role=self.ccda_role,
+            queue=self.ccda_queue,
             source_format="ccda",
-            reserved_concurrency=5,
+            worker_format="ccda",
         )
 
         self.hl7_raw_object_rule = self._create_raw_object_rule(
@@ -254,7 +280,6 @@ class DataQualityStack(Stack):
         self.ccda_raw_object_rule = self._create_raw_object_rule(
             "Ccda", "incoming/ccda/", self.ccda_queue, self.ccda_dead_letter_queue
         )
-        self._connect_event_sources()
         self._create_operational_alarms()
 
         # Authenticated read-only explorer API and CloudFront/S3 single-page frontend.
@@ -304,8 +329,11 @@ class DataQualityStack(Stack):
             f"arn:{self.partition}:logs:{self.region}:{self.account}:log-group:{name}"
             for name in (
                 f"/aws/vpc/{self.stack_prefix}",
+                # Retained log groups of the former ingestion Lambdas stay readable.
                 f"/aws/lambda/{self.stack_prefix}-hl7",
                 f"/aws/lambda/{self.stack_prefix}-ccda",
+                f"/ecs/{self.stack_prefix}-hl7-worker",
+                f"/ecs/{self.stack_prefix}-ccda-worker",
                 f"/aws/lambda/{self.stack_prefix}-explorer",
                 f"/aws/lambda/{self.stack_prefix}-report-runner",
                 f"/aws/lambda/{self.stack_prefix}-reingest-planner",
@@ -649,7 +677,7 @@ class DataQualityStack(Stack):
             description=f"Allows HTTPS to {service_name} only from authorized Lambdas",
         )
         if allow_ingestion:
-            description = f"HTTPS from ingestion Lambdas to {service_name}"
+            description = f"HTTPS from ingestion workers to {service_name}"
             security_group.add_ingress_rule(
                 self.ingestion_security_group, ec2.Port.tcp(443), description
             )
@@ -664,23 +692,12 @@ class DataQualityStack(Stack):
         raw_key_pattern: str,
         parsed_key_pattern: str,
     ) -> iam.Role:
+        # Task role of the ECS ingestion worker (the role the worker code runs as).
         role = iam.Role(
             self,
             f"{construct_id}IngestionRole",
-            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
             description=f"Least-privilege execution role for {construct_id.upper()} ingestion",
-        )
-        role.add_to_policy(
-            iam.PolicyStatement(
-                actions=[
-                    "ec2:AssignPrivateIpAddresses",
-                    "ec2:CreateNetworkInterface",
-                    "ec2:DeleteNetworkInterface",
-                    "ec2:DescribeNetworkInterfaces",
-                    "ec2:UnassignPrivateIpAddresses",
-                ],
-                resources=["*"],
-            )
         )
         role.add_to_policy(
             iam.PolicyStatement(
@@ -704,9 +721,8 @@ class DataQualityStack(Stack):
                 {
                     "id": "AwsSolutions-IAM5",
                     "reason": (
-                        "Lambda VPC APIs require wildcard resources; S3 object and log-stream "
-                        "permissions use suffix wildcards within named prefixes; KMS APIs use "
-                        "service-defined wildcards."
+                        "S3 object permissions use suffix wildcards within named prefixes; "
+                        "KMS APIs use service-defined wildcards."
                     ),
                 }
             ],
@@ -927,17 +943,15 @@ class DataQualityStack(Stack):
             default_database_name=METADATA_DATABASE_NAME,
             enable_data_api=True,
             iam_authentication=True,
-            serverless_v2_min_capacity=0.5,
-            serverless_v2_max_capacity=2,
+            serverless_v2_min_capacity=self.config.aurora_min_acu,
+            serverless_v2_max_capacity=self.config.aurora_max_acu,
             storage_encrypted=True,
             storage_encryption_key=self.encryption_key,
-            backup=rds.BackupProps(
-                retention=Duration.days(
-                    35 if self.config.environment is DeploymentEnvironment.PROD else 7
-                )
-            ),
+            # Production-grade protection in every environment: 35-day backups and deletion
+            # protection (disable it explicitly before tearing a stack down).
+            backup=rds.BackupProps(retention=Duration.days(35)),
             copy_tags_to_snapshot=True,
-            deletion_protection=self.config.environment is DeploymentEnvironment.PROD,
+            deletion_protection=True,
             removal_policy=RemovalPolicy.RETAIN,
             vpc=self.vpc,
             vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_ISOLATED),
@@ -950,18 +964,6 @@ class DataQualityStack(Stack):
             raise RuntimeError(AURORA_CREDENTIALS_MISSING)
         secret_resource = cast(CfnResource, credential_secret.node.default_child)
         secret_resource.apply_removal_policy(RemovalPolicy.RETAIN)
-        NagSuppressions.add_resource_suppressions(
-            cluster,
-            [
-                {
-                    "id": "AwsSolutions-RDS10",
-                    "reason": (
-                        "Development and staging retain the cluster on stack deletion but permit "
-                        "explicit replacement; production enables deletion protection."
-                    ),
-                }
-            ],
-        )
         return cluster
 
     def _create_data_api_endpoint(self) -> ec2.IInterfaceVpcEndpoint:
@@ -983,17 +985,47 @@ class DataQualityStack(Stack):
         return endpoint
 
     def _create_sqs_endpoint(self) -> ec2.IInterfaceVpcEndpoint:
-        # The reingestion planner is the only Lambda that *sends* to SQS from inside the
-        # isolated subnets (every other function is invoked by a queue, which needs no
-        # outbound path). Without this endpoint, SendMessage hangs through boto retries
-        # and the job never advances past its expected count. The endpoint policy and
-        # security-group ingress are granted where the planner role is defined.
-        return self._interface_endpoint(
+        # The ECS ingestion workers poll and delete from the format queues, and the
+        # reingestion planner sends to the reindex queue, all from inside the isolated
+        # subnets. Without this endpoint those calls hang through boto retries. The planner's
+        # endpoint policy and security-group ingress are granted where its role is defined.
+        endpoint = self._interface_endpoint(
             "SqsEndpoint",
             "sqs",
             ec2.InterfaceVpcEndpointAwsService.SQS,
             self.sqs_endpoint_security_group,
         )
+        for role, queue in ((self.hl7_role, self.hl7_queue), (self.ccda_role, self.ccda_queue)):
+            self._endpoint_policy(
+                endpoint,
+                iam.PolicyStatement(
+                    principals=[role],
+                    actions=[
+                        "sqs:ReceiveMessage",
+                        "sqs:DeleteMessage",
+                        "sqs:ChangeMessageVisibility",
+                        "sqs:GetQueueAttributes",
+                    ],
+                    resources=[queue.queue_arn],
+                ),
+            )
+        return endpoint
+
+    def _create_container_endpoints(self) -> None:
+        # Image pulls (ECR API and registry) and awslogs delivery. Image layers come from S3
+        # through the existing S3 gateway endpoint.
+        for construct_id, service_key, service in (
+            ("EcrApiEndpoint", "ecr.api", ec2.InterfaceVpcEndpointAwsService.ECR),
+            ("EcrDockerEndpoint", "ecr.dkr", ec2.InterfaceVpcEndpointAwsService.ECR_DOCKER),
+            ("LogsEndpoint", "logs", ec2.InterfaceVpcEndpointAwsService.CLOUDWATCH_LOGS),
+        ):
+            self._interface_endpoint(
+                construct_id, service_key, service, self.container_endpoint_security_group
+            )
+
+    def _grant_queue_consumption(self) -> None:
+        self.hl7_queue.grant_consume_messages(self.hl7_role)
+        self.ccda_queue.grant_consume_messages(self.ccda_role)
 
     def _endpoint_policy(
         self, endpoint: ec2.IInterfaceVpcEndpoint, statement: iam.PolicyStatement
@@ -1013,35 +1045,75 @@ class DataQualityStack(Stack):
             raise RuntimeError(AURORA_CREDENTIALS_MISSING)
         self.metadata_cluster.secret.grant_read(role)
 
-    def _create_ingestion_function(
+    def _worker_image(self) -> ecs.ContainerImage:
+        """Return the worker image shared by both ingestion services (built by deploy.sh)."""
+        cached = getattr(self, "_cached_worker_image", None)
+        if cached is not None:
+            return cast(ecs.ContainerImage, cached)
+        digest = self.config.worker_image_digest
+        image: ecs.ContainerImage
+        if digest is None:
+            # Synthesis without deploy.sh (tests, `make synth`) has no built image yet.
+            image = ecs.ContainerImage.from_registry(WORKER_IMAGE_PLACEHOLDER)
+        else:
+            repository = ecr.Repository.from_repository_name(
+                self, "WorkerRepository", f"{self.stack_prefix}-worker"
+            )
+            image = ecs.ContainerImage.from_ecr_repository(repository, tag=digest)
+        self._cached_worker_image = image
+        return image
+
+    def _create_ingestion_cluster(self) -> ecs.Cluster:
+        # Container Insights supplies RunningTaskCount for backlog-per-task scaling.
+        return ecs.Cluster(
+            self,
+            "IngestionCluster",
+            vpc=self.vpc,
+            container_insights_v2=ecs.ContainerInsights.ENABLED,
+            enable_fargate_capacity_providers=True,
+        )
+
+    def _create_ingestion_service(
         self,
         construct_id: str,
         *,
-        handler: str,
+        lane: IngestionLaneConfig,
         role: iam.Role,
+        queue: sqs.Queue,
         source_format: str,
-        reserved_concurrency: int,
-    ) -> lambda_.Function:
-        function_name = f"{self.stack_prefix}-{construct_id.lower()}"
-        log_group = self._create_log_group(
-            f"{construct_id}LogGroup",
-            f"/aws/lambda/{function_name}",
-        )
-        log_group.grant_write(role)
+        worker_format: str,
+    ) -> ecs.FargateService:
         if self.metadata_cluster.secret is None:
             raise RuntimeError(AURORA_CREDENTIALS_MISSING)
-        return lambda_.Function(
+        log_group = self._create_log_group(
+            f"{construct_id}WorkerLogGroup",
+            f"/ecs/{self.stack_prefix}-{worker_format}-worker",
+        )
+        task_definition = ecs.FargateTaskDefinition(
             self,
-            f"{construct_id}Function",
-            function_name=function_name,
-            runtime=lambda_.Runtime.PYTHON_3_14,
-            architecture=lambda_.Architecture.ARM_64,
-            code=self._lambda_code(),
-            handler=handler,
-            role=role,
-            description=f"Parses, indexes, and persists {source_format} document metadata",
+            f"{construct_id}WorkerTaskDefinition",
+            cpu=lane.task_cpu,
+            memory_limit_mib=lane.task_memory,
+            runtime_platform=ecs.RuntimePlatform(
+                cpu_architecture=ecs.CpuArchitecture.ARM64,
+                operating_system_family=ecs.OperatingSystemFamily.LINUX,
+            ),
+            task_role=role,
+        )
+        task_definition.add_container(
+            "Worker",
+            image=self._worker_image(),
+            essential=True,
+            # An init process forwards SIGTERM to the worker supervisor and reaps children.
+            linux_parameters=ecs.LinuxParameters(
+                self, f"{construct_id}WorkerLinuxParameters", init_process_enabled=True
+            ),
+            stop_timeout=WORKER_STOP_TIMEOUT,
+            logging=ecs.LogDrivers.aws_logs(stream_prefix="worker", log_group=log_group),
             environment={
+                "AWS_REGION": self.region,
                 "ERROR_BUCKET": self.error_bucket.bucket_name,
+                "FORMAT": worker_format,
                 "MAX_BULK_BYTES": str(5 * 1024 * 1024),
                 "MAX_OBJECT_BYTES": str(50 * 1024 * 1024),
                 "METADATA_CLUSTER_ARN": self.metadata_cluster.cluster_arn,
@@ -1050,21 +1122,169 @@ class DataQualityStack(Stack):
                 "METADATA_TABLE": METADATA_TABLE_NAME,
                 "OPENSEARCH_ENDPOINT": self.search_collection.attr_collection_endpoint,
                 "OPENSEARCH_SERVICE": "aoss",
-                "OPENSEARCH_HL7_INDEX": "hl7-messages-v1",
-                "OPENSEARCH_CCDA_INDEX": "ccda-documents-v1",
+                "OPENSEARCH_HL7_INDEX": HL7_INDEX_NAME,
+                "OPENSEARCH_CCDA_INDEX": CCDA_INDEX_NAME,
                 "PARSED_BUCKET": self.parsed_bucket.bucket_name,
+                "QUEUE_URL": queue.queue_url,
+                "RECEIVE_BATCH_SIZE": str(lane.receive_batch_size),
                 "SOURCE_FORMAT": source_format,
+                "WORKERS": str(lane.workers),
             },
-            environment_encryption=self.encryption_key,
-            ephemeral_storage_size=Size.mebibytes(1024),
-            log_group=log_group,
-            memory_size=2048,
-            reserved_concurrent_executions=reserved_concurrency,
+        )
+        service = ecs.FargateService(
+            self,
+            f"{construct_id}WorkerService",
+            cluster=self.ingestion_cluster,
+            task_definition=task_definition,
+            assign_public_ip=False,
             security_groups=[self.ingestion_security_group],
-            timeout=Duration.minutes(10),
-            tracing=lambda_.Tracing.ACTIVE,
-            vpc=self.vpc,
             vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_ISOLATED),
+            capacity_provider_strategies=[
+                ecs.CapacityProviderStrategy(capacity_provider="FARGATE", weight=1)
+            ],
+            circuit_breaker=ecs.DeploymentCircuitBreaker(enable=True, rollback=True),
+            min_healthy_percent=100,
+            max_healthy_percent=200,
+        )
+        self._configure_worker_scaling(construct_id, service, queue, lane)
+        NagSuppressions.add_resource_suppressions(
+            task_definition,
+            [
+                {
+                    "id": "AwsSolutions-ECS2",
+                    "reason": (
+                        "Environment variables carry only non-secret resource names, ARNs, and "
+                        "sizing values; the Aurora credential is read at runtime by ARN."
+                    ),
+                },
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": (
+                        "The CDK-generated execution role needs ecr:GetAuthorizationToken, "
+                        "which supports only Resource '*'."
+                    ),
+                },
+            ],
+            apply_to_children=True,
+        )
+        return service
+
+    def _configure_worker_scaling(
+        self,
+        construct_id: str,
+        service: ecs.FargateService,
+        queue: sqs.Queue,
+        lane: IngestionLaneConfig,
+    ) -> None:
+        target = appscaling.ScalableTarget(
+            self,
+            f"{construct_id}WorkerScalableTarget",
+            service_namespace=appscaling.ServiceNamespace.ECS,
+            resource_id=f"service/{self.ingestion_cluster.cluster_name}/{service.service_name}",
+            scalable_dimension="ecs:service:DesiredCount",
+            min_capacity=lane.min_tasks,
+            max_capacity=lane.max_tasks,
+        )
+        target.node.add_dependency(service)
+        # Target tracking on backlog per task: visible messages divided by running tasks,
+        # kept near backlog_target (per-task throughput x acceptable queue delay).
+        appscaling.CfnScalingPolicy(
+            self,
+            f"{construct_id}WorkerBacklogScalingPolicy",
+            policy_name=f"{self.stack_prefix}-{construct_id.lower()}-backlog-per-task",
+            policy_type="TargetTrackingScaling",
+            scaling_target_id=target.scalable_target_id,
+            target_tracking_scaling_policy_configuration=(
+                appscaling.CfnScalingPolicy.TargetTrackingScalingPolicyConfigurationProperty(
+                    target_value=lane.backlog_target,
+                    scale_out_cooldown=60,
+                    scale_in_cooldown=300,
+                    customized_metric_specification=appscaling.CfnScalingPolicy.CustomizedMetricSpecificationProperty(
+                        metrics=[
+                            appscaling.CfnScalingPolicy.TargetTrackingMetricDataQueryProperty(
+                                id="visible",
+                                return_data=False,
+                                metric_stat=appscaling.CfnScalingPolicy.TargetTrackingMetricStatProperty(
+                                    stat="Sum",
+                                    metric=appscaling.CfnScalingPolicy.TargetTrackingMetricProperty(
+                                        namespace="AWS/SQS",
+                                        metric_name="ApproximateNumberOfMessagesVisible",
+                                        dimensions=[
+                                            appscaling.CfnScalingPolicy.TargetTrackingMetricDimensionProperty(
+                                                name="QueueName", value=queue.queue_name
+                                            )
+                                        ],
+                                    ),
+                                ),
+                            ),
+                            appscaling.CfnScalingPolicy.TargetTrackingMetricDataQueryProperty(
+                                id="tasks",
+                                return_data=False,
+                                metric_stat=appscaling.CfnScalingPolicy.TargetTrackingMetricStatProperty(
+                                    stat="Average",
+                                    metric=appscaling.CfnScalingPolicy.TargetTrackingMetricProperty(
+                                        namespace="ECS/ContainerInsights",
+                                        metric_name="RunningTaskCount",
+                                        dimensions=[
+                                            appscaling.CfnScalingPolicy.TargetTrackingMetricDimensionProperty(
+                                                name="ClusterName",
+                                                value=self.ingestion_cluster.cluster_name,
+                                            ),
+                                            appscaling.CfnScalingPolicy.TargetTrackingMetricDimensionProperty(
+                                                name="ServiceName", value=service.service_name
+                                            ),
+                                        ],
+                                    ),
+                                ),
+                            ),
+                            appscaling.CfnScalingPolicy.TargetTrackingMetricDataQueryProperty(
+                                id="backlog_per_task",
+                                expression="visible / tasks",
+                                label="Visible messages per running task",
+                                return_data=True,
+                            ),
+                        ]
+                    ),
+                )
+            ),
+        )
+        work_hours_min = self.config.work_hours_min_tasks
+        if work_hours_min is not None:
+            time_zone = TimeZone.of(self.config.work_hours_timezone)
+            target.scale_on_schedule(
+                "WorkHoursStart",
+                schedule=appscaling.Schedule.cron(minute="45", hour="7", week_day="MON-FRI"),
+                min_capacity=work_hours_min,
+                time_zone=time_zone,
+            )
+            target.scale_on_schedule(
+                "WorkHoursEnd",
+                schedule=appscaling.Schedule.cron(minute="30", hour="17", week_day="MON-FRI"),
+                min_capacity=lane.min_tasks,
+                time_zone=time_zone,
+            )
+        cloudwatch.Alarm(
+            self,
+            f"{construct_id}WorkerAtMaxTasksAlarm",
+            alarm_description=(
+                f"{construct_id.upper()} ingestion has run at its maximum task count for 15 "
+                "minutes; raise max_tasks or check downstream capacity"
+            ),
+            metric=cloudwatch.Metric(
+                namespace="ECS/ContainerInsights",
+                metric_name="RunningTaskCount",
+                dimensions_map={
+                    "ClusterName": self.ingestion_cluster.cluster_name,
+                    "ServiceName": service.service_name,
+                },
+                period=Duration.minutes(5),
+                statistic="Average",
+            ),
+            threshold=lane.max_tasks,
+            evaluation_periods=3,
+            datapoints_to_alarm=3,
+            comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+            treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
         )
 
     def _lambda_code(self) -> lambda_.Code:
@@ -1118,42 +1338,30 @@ class DataQualityStack(Stack):
             removal_policy=RemovalPolicy.RETAIN,
         )
 
-    def _connect_event_sources(self) -> None:
-        # Batch size one makes each acknowledgement correspond to one source S3 object.
-        for function, queue, concurrency in (
-            (self.hl7_function, self.hl7_queue, 10),
-            (self.ccda_function, self.ccda_queue, 5),
-        ):
-            function.add_event_source(
-                lambda_event_sources.SqsEventSource(
-                    queue,
-                    batch_size=1,
-                    max_concurrency=concurrency,
-                    report_batch_item_failures=True,
-                )
-            )
-
     def _create_operational_alarms(self) -> None:
         self._create_queue_alarms("Hl7", self.hl7_queue, self.hl7_dead_letter_queue)
         self._create_queue_alarms("Ccda", self.ccda_queue, self.ccda_dead_letter_queue)
         self._create_queue_alarms("Reindex", self.reindex_queue, self.reindex_dead_letter_queue)
-        for construct_id, function in (
-            ("Hl7", self.hl7_function),
-            ("Ccda", self.ccda_function),
-        ):
-            cloudwatch.Alarm(
-                self,
-                f"{construct_id}FunctionErrorAlarm",
-                alarm_description=f"{construct_id.upper()} Lambda reported an invocation error",
-                metric=function.metric_errors(period=Duration.minutes(5), statistic="Sum"),
-                threshold=1,
-                evaluation_periods=1,
-                datapoints_to_alarm=1,
-                comparison_operator=(
-                    cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD
-                ),
-                treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
-            )
+        # Sustained capacity near the Aurora ceiling means aurora_max_acu should be raised.
+        cloudwatch.Alarm(
+            self,
+            "MetadataClusterCapacityAlarm",
+            alarm_description=(
+                "Aurora metadata cluster has run above 80% of aurora_max_acu for 15 minutes"
+            ),
+            metric=cloudwatch.Metric(
+                namespace="AWS/RDS",
+                metric_name="ServerlessDatabaseCapacity",
+                dimensions_map={"DBClusterIdentifier": self.metadata_cluster.cluster_identifier},
+                period=Duration.minutes(5),
+                statistic="Maximum",
+            ),
+            threshold=self.config.aurora_max_acu * 0.8,
+            evaluation_periods=3,
+            datapoints_to_alarm=3,
+            comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+            treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+        )
 
     def _create_queue_alarms(
         self,
@@ -2117,8 +2325,9 @@ class DataQualityStack(Stack):
             "ErrorBucketName": self.error_bucket.bucket_name,
             "Hl7QueueUrl": self.hl7_queue.queue_url,
             "CcdaQueueUrl": self.ccda_queue.queue_url,
-            "Hl7FunctionName": self.hl7_function.function_name,
-            "CcdaFunctionName": self.ccda_function.function_name,
+            "IngestionClusterName": self.ingestion_cluster.cluster_name,
+            "Hl7ServiceName": self.hl7_service.service_name,
+            "CcdaServiceName": self.ccda_service.service_name,
             "OpenSearchEndpoint": self.search_collection.attr_collection_endpoint,
             "OpenSearchCollectionArn": self.search_collection.attr_arn,
             "OpenSearchCollectionName": self.search_collection.name,

@@ -49,9 +49,12 @@ project_name: manifest-medex-data-quality
 #   - private: no route to an internet gateway (a NAT route is tolerated but unnecessary)
 #   - at least two subnets in two different Availability Zones (Aurora requires this);
 #     three (one per AZ) is typical, e.g. subnet_ids: subnet-aaa,subnet-bbb,subnet-ccc
-#   - free IP space for ~6 endpoint ENIs per subnet plus Lambda ENIs (/24 or larger)
-#   - VPC endpoints: deploy.sh detects any existing S3, DynamoDB, RDS Data API, SQS, or
-#     Lambda endpoints in the VPC and reuses them; missing ones are created by the stack
+#   - free IP space for ~9 endpoint ENIs per subnet plus one per ECS task and Lambda
+#     (/24 or larger)
+#   - VPC endpoints: deploy.sh detects any existing S3, DynamoDB, RDS Data API, SQS,
+#     Lambda, ECR (ecr.api, ecr.dkr), or CloudWatch Logs endpoints in the VPC and reuses
+#     them; missing ones are created by the stack. A reused SQS endpoint with a
+#     restrictive policy must allow the worker roles (see DEPLOYMENT.md)
 # Lists are comma-separated, in matching order (subnet N uses route table N in AZ N).
 # Find route tables:  aws ec2 describe-route-tables --filters Name=association.subnet-id,Values=<subnet-id> --query "RouteTables[0].RouteTableId"
 vpc_id:
@@ -64,3 +67,35 @@ availability_zones:
 # endpoint id and its security group id, e.g.
 #   existing_endpoints: s3,dynamodb,sqs=vpce-0123456789abcdef0:sg-0123456789abcdef0
 existing_endpoints:
+
+# --- Optional: ingestion workers (ECS on Fargate) -----------------------------------
+# Production-sized defaults apply in every environment; leave blank to use them.
+# See README "Ingestion workers" for how they were measured.
+# Task size: cpu 1024 allows memory 2048-8192; cpu 2048 allows 4096-16384.
+hl7_task_cpu:              # default 1024
+hl7_task_memory:           # default 2048
+hl7_workers:               # worker processes per task, default 8
+hl7_receive_batch_size:    # messages per receive (1-10), default 10
+hl7_min_tasks:             # default 2
+hl7_max_tasks:             # default 10
+hl7_backlog_target:        # visible messages per task to scale toward, default 1000
+
+ccda_task_cpu:             # default 1024
+ccda_task_memory:          # default 4096
+ccda_workers:              # default 4
+ccda_receive_batch_size:   # default 1
+ccda_min_tasks:            # default 2
+ccda_max_tasks:            # default 10
+ccda_backlog_target:       # default 200
+
+# Scheduled work-hours scaling (off by default). When set, both services keep at least
+# this many tasks on weekdays 07:45-17:30 in work_hours_timezone. Must lie within each
+# lane's min/max.
+work_hours_min_tasks:
+work_hours_timezone:       # IANA name, default America/Los_Angeles
+
+# --- Optional: Aurora Serverless v2 capacity ----------------------------------------
+# Start at 16, load test, review after 1-3 months, then set max to ~2x observed peak.
+# Values are multiples of 0.5. Raising max later is an in-place change.
+aurora_min_acu:            # default 2
+aurora_max_acu:            # default 16

@@ -1,0 +1,163 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Build resources for the Manifest MedEx ingestion worker image: a private ECR repository,
+  a source bucket, and an ARM64 CodeBuild project. Deployed by deploy.sh before the main
+  stack so the ECS services can reference an image digest; no local Docker is required.
+
+Parameters:
+  StackPrefix:
+    Type: String
+    AllowedPattern: "^[a-z][a-z0-9-]{2,62}$"
+    Description: Main stack name (project_name-environment); used to name the repository.
+
+Resources:
+  WorkerRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${StackPrefix}-worker"
+      # Images are rebuilt from source on every deploy, so the repository is emptied and
+      # removed with this stack instead of being retained (a retained fixed-name repository
+      # would block redeploying after a teardown).
+      EmptyOnDelete: true
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"Keep the 20 most recent worker images",
+            "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":20},
+            "action":{"type":"expire"}}]}
+
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireSourceBundles
+            Status: Enabled
+            ExpirationInDays: 7
+
+  SourceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SourceBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt SourceBucket.Arn
+              - !Sub "${SourceBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  BuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/codebuild/${StackPrefix}-worker-build"
+      RetentionInDays: 30
+
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Builds and pushes the ingestion worker image
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: worker-image-build
+          PolicyDocument:
+            Statement:
+              - Sid: ReadSourceBundle
+                Effect: Allow
+                Action: ["s3:GetObject", "s3:GetObjectVersion"]
+                Resource: !Sub "${SourceBucket.Arn}/*"
+              - Sid: WriteBuildLogs
+                Effect: Allow
+                Action: ["logs:CreateLogStream", "logs:PutLogEvents"]
+                Resource: !Sub "${BuildLogGroup.Arn}:*"
+              - Sid: EcrLogin
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: PushWorkerImage
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeImages
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !GetAtt WorkerRepository.Arn
+
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${StackPrefix}-worker-build"
+      Description: Builds the ARM64 ingestion worker image and pushes it to ECR
+      ServiceRole: !GetAtt BuildRole.Arn
+      TimeoutInMinutes: 30
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Source:
+        Type: S3
+        Location: !Sub "${SourceBucket}/worker-source.zip"
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - REGISTRY="${REPOSITORY_URI%%/*}"
+                - aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$REGISTRY"
+            build:
+              commands:
+                - docker build --platform linux/arm64 -f worker/Dockerfile -t "$REPOSITORY_URI:$IMAGE_TAG" .
+            post_build:
+              commands:
+                - docker push "$REPOSITORY_URI:$IMAGE_TAG"
+      Environment:
+        Type: ARM_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-aarch64-standard:3.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: REPOSITORY_URI
+            Value: !GetAtt WorkerRepository.RepositoryUri
+          - Name: IMAGE_TAG
+            Value: set-by-deploy-script
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref BuildLogGroup
+
+Outputs:
+  RepositoryName:
+    Value: !Ref WorkerRepository
+  RepositoryUri:
+    Value: !GetAtt WorkerRepository.RepositoryUri
+  SourceBucketName:
+    Value: !Ref SourceBucket
+  BuildProjectName:
+    Value: !Ref BuildProject
