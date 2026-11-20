@@ -1,0 +1,15 @@
+# Store and check out text files with LF on every platform. The repository and
+# `ruff format` (line-ending = "lf") expect LF; without this, Windows checkouts with
+# core.autocrlf=true see every file as needing reformatting.
+* text=auto eol=lf
+
+# Shell scripts must keep LF to run.
+*.sh text eol=lf
+
+# Binary assets.
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.zip binary
