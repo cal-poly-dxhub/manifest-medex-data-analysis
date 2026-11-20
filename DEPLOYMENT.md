@@ -65,7 +65,7 @@ Requirements for the subnets:
 - **Private** — no route to an internet gateway. A NAT route is tolerated but not needed; every AWS call goes through VPC endpoints.
 - **Two or more Availability Zones** — Aurora requires a subnet group spanning at least two AZs; one private subnet per AZ (typically three) is the expected layout. The deploy fails validation otherwise.
 - **Free IP space** — the stack creates about six endpoint network interfaces per subnet plus one per running ECS ingestion task (up to 20 at the default maximums) and per Lambda. `/24` or larger per subnet is comfortable.
-- **VPC endpoints** — the stack needs endpoints for S3, DynamoDB, RDS Data API, SQS, Lambda, ECR API (`ecr.api`), ECR Docker (`ecr.dkr`), CloudWatch Logs (`logs`), and OpenSearch Serverless. `deploy.sh` inspects the VPC before deploying: endpoints that already exist are reused, except ones this stack created on an earlier deploy (identified by their `aws:cloudformation:stack-name` tag), which stay managed by the stack. For reused endpoints the stack adds HTTPS ingress for its Lambdas and ingestion workers to the endpoint's security group; missing ones are created in your subnets. Existing endpoints must have a security group attached, and their endpoint policies must allow the relevant actions from this account (the stack does not modify policies on endpoints it does not own). To override detection, set `existing_endpoints` in `config.yaml`.
+- **VPC endpoints** — the stack needs endpoints for S3, DynamoDB, RDS Data API, SQS, Lambda, ECR API (`ecr.api`), ECR Docker (`ecr.dkr`), CloudWatch Logs (`logs`), and OpenSearch Serverless, plus Secrets Manager (`secretsmanager`) when the intake API is enabled. `deploy.sh` inspects the VPC before deploying: endpoints that already exist are reused, except ones this stack created on an earlier deploy (identified by their `aws:cloudformation:stack-name` tag), which stay managed by the stack. For reused endpoints the stack adds HTTPS ingress for its Lambdas and ingestion workers to the endpoint's security group; missing ones are created in your subnets. Existing endpoints must have a security group attached, and their endpoint policies must allow the relevant actions from this account (the stack does not modify policies on endpoints it does not own). To override detection, set `existing_endpoints` in `config.yaml`.
 
   **Detection happens only in `deploy.sh`.** The CDK app makes no AWS calls during synthesis, so it cannot see what is already in the VPC; it creates every endpoint not listed in `existing_endpoints`. Deploying with `cdk deploy` directly into a VPC that already has any of these endpoints therefore fails partway through and rolls back: a second S3 or DynamoDB gateway endpoint conflicts with the existing route on the route table, and a second SQS, Lambda, RDS Data API, ECR, or Logs interface endpoint is rejected because its private DNS name is already taken. Detection also runs only at deploy time, so if endpoints are added to or removed from the VPC later, run `./deploy.sh` again. If you deploy without the script anyway, pass the existing endpoints yourself (see "Manual deployment" under Reference).
 
@@ -140,6 +140,7 @@ When it succeeds it prints the outputs you need next:
 | `UserPoolClientId`, `UserPoolHostedUiDomain` | Sign-in configuration (informational) |
 | `RawBucketName` | Where to upload HL7 and CCDA files (step 4) |
 | `OpenSearchCollectionName` | For finding the Dashboards URL |
+| `IntakeLoadBalancerDnsName`, `IntakeApiKeySecretArn`, `IntakeArchiveBucketName` | Only with `enable_intake`: where senders post, the API key, and the request archive |
 
 All outputs are also saved to `cdk-outputs.json`.
 
@@ -184,7 +185,11 @@ Senders that today post Prism's **Clinical Message Intake** JSON (`POST /prism/o
    ```
    Add `-k` only when testing with a self-signed certificate.
 
+**Testing.** The load balancer only accepts connections from `intake_source_cidrs`, so test from a host on the sender network or inside the VPC (with a self-signed certificate, skip certificate verification, e.g. `curl -k`). It is not reachable from the internet.
+
 **Behavior to know:**
+- A `200` means the message and envelope are stored in S3. Parsing happens afterwards in the normal pipeline; a message that fails to parse shows up in the error bucket and DLQ, not in the API response.
+- Chunked uploads are accepted; the load balancer forwards them with a `Content-Length`.
 - Required fields (as in Prism's spec): `sourceMessageId`, `messageDate`, `clinicalMessageType` (`HL7V2` or `CCDA`), `sourceFacilityId`, `patientId`, `patientIdAa`, `contents`. Missing or invalid ones get `400`. Requests over `intake_max_request_mb` get `413`. A storage problem returns `503` with `Retry-After`, so the sender retries.
 - If `contents` has both, the `PROCESSED` entry is used (Prism's recommendation), otherwise `RAW`.
 - A re-sent message (same facility, message date, and `sourceMessageId`) **replaces** the earlier one, as in Prism.
@@ -271,6 +276,7 @@ Quick checks (the detailed list is under Reference → "Verify processing"):
 - Everything runs in an isolated VPC with no NAT gateway; Lambdas and ECS tasks reach AWS services through VPC endpoints. There is no public database or search endpoint.
 - The S3 buckets, Aurora cluster, OpenSearch collection, DynamoDB tables, KMS key, and Cognito pool are set to **RETAIN** on stack deletion. If you are tearing the system down for good, delete them by hand after `cdk destroy`. Aurora deletion protection is on in every environment, so it must be turned off explicitly before the cluster can be deleted. The `<stack>-worker-build` companion stack is not retained; delete it after the main stack.
 - `enable_public_dashboard` exposes only the Dashboards endpoint (IAM-authenticated) and is refused outside the `dev` environment. For a production posture, reach Dashboards through a VPN or VPC path instead.
+- **Make changes through `config.yaml` or the CDK code, not the console.** Edits made directly to resources the stack owns (security groups, endpoints, task definitions, and so on) are not tracked: `cdk drift` reports only some resource types, and the next deploy can overwrite them. Resources the stack does not own, such as a customer VPC and its existing endpoints, are referenced rather than modified.
 - Context flags passed to `cdk deploy` do not persist between runs; `deploy.sh` re-applies them from `config.yaml` every time, and also detects existing VPC endpoints, which is why it is the only supported deployment path.
 
 ## Reference
@@ -352,7 +358,7 @@ aws ec2 describe-vpc-endpoints --filters Name=vpc-id,Values=<vpc-id> \
   --profile <approved-aws-profile>
 ```
 
-Only `com.amazonaws.<region>.s3`, `dynamodb`, `rds-data`, `sqs`, `lambda`, `ecr.api`, `ecr.dkr`, and `logs` matter. For example, a VPC with an S3 gateway endpoint and an SQS interface endpoint becomes:
+Only `com.amazonaws.<region>.s3`, `dynamodb`, `rds-data`, `sqs`, `lambda`, `ecr.api`, `ecr.dkr`, `logs`, and (with the intake API) `secretsmanager` matter. For example, a VPC with an S3 gateway endpoint and an SQS interface endpoint becomes:
 
 ```bash
 uv run cdk deploy \
@@ -482,7 +488,7 @@ This stack is not a free-tier architecture. Major recurring cost drivers include
 
 - OpenSearch Serverless OCUs and managed storage; the classic model used here does not scale to zero.
 - Aurora Serverless v2 ACUs, storage, backup retention, and I/O.
-- Six interface VPC endpoints (plus the OpenSearch Serverless endpoint) across the configured Availability Zones.
+- Six interface VPC endpoints (plus the OpenSearch Serverless endpoint, and a Secrets Manager endpoint with the intake API) across the configured Availability Zones, unless reused from an existing VPC.
 - ECS Fargate ingestion tasks: at least two tasks per format run at all times (at the defaults in us-west-2, about $58/month for HL7 and $89/month for CCDA, plus ~$85/month for the intake API if enabled: two 1 vCPU / 4 GB tasks and the internal load balancer), scaling with backlog.
 - Lambda duration and concurrency for the explorer, reports, and reingestion.
 - CodeBuild minutes and ECR storage for the worker image.
@@ -510,7 +516,7 @@ Requirements and behavior to plan around:
 | Facility for CCDA | Taken from the **key**: include a `participant=<facility UID>` path segment (see example). Without it, `sourceFacilityId` is empty and per-facility reports and filters exclude the document. |
 | Filenames | Free-form, but keep them non-identifying. Facility, message type, and MSH-7 date in the name are fine and useful for browsing. |
 | Ordering | Not guaranteed. Objects are processed by parallel consumers from a standard queue, so arrival order is not preserved. This does not affect counts or report results. |
-| Re-uploads | Safe. Document identity is derived from the object (bucket, key, version) so a re-drop of an unchanged object updates rather than duplicates. Note that a *changed* object body under a new version produces a new document. |
+| Re-uploads | Safe under the same key. Document identity is derived from bucket, key, and content, so re-dropping an unchanged file updates rather than duplicates. A *changed* body produces a new document, and the same content under a *different* key is a separate document. |
 | Throughput | Ingestion runs on ECS workers that scale with the queue backlog (2–10 tasks per format by default; see README "Ingestion workers"). For multi-million-object backfills, upload in batches and watch the queue-age and DLQ alarms rather than dropping everything at once; the queue absorbs bursts but end-to-end latency grows with backlog. |
 | Size | Objects over the lane limit (**HL7 512 MiB, CCDA 110 MiB**, configurable) are rejected (`failureCategory: object_too_large`; the error record includes `objectBytes` and `maxObjectBytes`) and reach the DLQ after five attempts. HL7 batches of any message count are processed in 500-message chunks, so there is no need to split them. One file is still handled by one worker, so many medium files finish sooner than one huge file. CCDAs up to ~100 MB, and files with several concatenated CCDAs, are supported. |
 | S3 console folders | Creating a "folder" in the S3 console adds a zero-byte key ending in `/`. Workers recognize these and skip them (logged as `record_skipped`, `reason: folder_marker`); they never reach the DLQ. |

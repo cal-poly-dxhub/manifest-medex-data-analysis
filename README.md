@@ -18,7 +18,7 @@ A private, serverless AWS ingestion platform for parsing, indexing, and tracking
 
 # Overview
 
-Manifest MedEx Data Quality Platform is an AWS CDK application that creates separate HL7 v2 and CCDA ingestion lanes plus an authenticated, same-origin clinical-message explorer. New objects in a private, versioned Amazon S3 raw-data bucket are routed through Amazon EventBridge and format-specific Amazon SQS queues to two Amazon ECS on AWS Fargate ingestion services, one per format. Each service's workers parse their input, writes deterministic JSON to parsed S3, indexes a query-oriented projection in Amazon OpenSearch Serverless, and upserts document-location metadata through the Amazon Aurora PostgreSQL Data API. An isolated explorer Lambda serves Cognito-authorized metadata and bounded body reads to a React frontend hosted in private S3 behind CloudFront Origin Access Control.
+Manifest MedEx Data Quality Platform is an AWS CDK application that creates separate HL7 v2 and CCDA ingestion lanes plus an authenticated, same-origin clinical-message explorer. New objects in a private, versioned Amazon S3 raw-data bucket are routed through Amazon EventBridge and format-specific Amazon SQS queues to two Amazon ECS on AWS Fargate ingestion services, one per format. Each service's workers parse their input, writes deterministic JSON to parsed S3, indexes a query-oriented projection in Amazon OpenSearch Serverless, and upserts document-location metadata through the Amazon Aurora PostgreSQL Data API. An optional, internal Prism-compatible intake API accepts the same JSON senders post to Prism today and feeds it into the same pipeline. An isolated explorer Lambda serves Cognito-authorized metadata and bounded body reads to a React frontend hosted in private S3 behind CloudFront Origin Access Control.
 
 The design keeps the raw object as the complete source of truth while exposing a deliberately bounded search projection for supplied dashboard requirements. It emphasizes private networking, encryption, least-privilege access, deterministic retries, retained storage, and diagnostics that do not reveal clinical content or identifiers.
 
@@ -39,6 +39,7 @@ This repository is an implementation prototype. It does not establish HL7 profil
 | Routing | [Amazon EventBridge](https://aws.amazon.com/eventbridge/) | Routes new objects by format prefix |
 | Buffering | [Amazon SQS](https://aws.amazon.com/sqs/) | Isolated processing queues and dead-letter queues |
 | Ingestion compute | [Amazon ECS on AWS Fargate](https://aws.amazon.com/fargate/) | ARM64 queue workers for HL7 and CCDA, scaled on queue backlog |
+| Message intake (optional) | Application Load Balancer (internal), ECS on Fargate, AWS Secrets Manager | Prism-compatible HTTPS intake API with one API-key sender |
 | Compute | [AWS Lambda](https://aws.amazon.com/lambda/) | Python 3.14 ARM64 explorer API, reports, and reingestion |
 | Image build | [AWS CodeBuild](https://aws.amazon.com/codebuild/), Amazon ECR | Builds the worker image during `deploy.sh`; no local Docker needed |
 | Web and API | React, Vite, TypeScript, CloudFront, HTTP API | Same-origin clinical-message explorer and API proxy |
@@ -77,6 +78,8 @@ Runtime dependencies are hash-pinned in `lambda-requirements.txt`. CDK dependenc
 │   ├── worker.py                  # SQS polling supervisor with graceful SIGTERM shutdown
 │   ├── Dockerfile                 # ARM64 worker image (built by CodeBuild)
 │   └── requirements.txt           # Exact worker-only dependencies (boto3)
+├── intake/
+│   └── server.py                  # Optional Prism-compatible intake API (auth, validation, S3 writes)
 ├── infra/worker-image-build.yaml  # ECR repository + CodeBuild project, deployed by deploy.sh
 ├── web/                           # React/Vite/TypeScript authenticated explorer
 │   ├── src/                       # OIDC, API client, query, and UI source
@@ -91,7 +94,7 @@ Runtime dependencies are hash-pinned in `lambda-requirements.txt`. CDK dependenc
                                       # Delivered query-path parity check
 ```
 
-The Lambda artifact and the worker image contain the runtime `src` modules and exact runtime dependencies. Tests, tools, caches, all of `web/`, `src/stack.py`, and `src/config.py` are excluded from both local and Docker fallback bundles.
+The Lambda artifact and the worker image contain the runtime `src` modules and exact runtime dependencies; the worker image also contains `intake/`, which the optional intake service runs. Tests, tools, caches, all of `web/`, `src/stack.py`, and `src/config.py` are excluded from both local and Docker fallback bundles.
 
 ## HL7 v2 processing
 
@@ -152,7 +155,7 @@ CREATE INDEX IF NOT EXISTS document_metadata_format_ingested_document_idx
 ON document_metadata (source_format, ingested_time DESC, document_id DESC);
 ```
 
-For an existing production table, normal `CREATE INDEX` can block writes. Run the equivalent `CREATE INDEX CONCURRENTLY IF NOT EXISTS` statements as a separately reviewed, one-off maintenance operation instead. `CONCURRENTLY` is intentionally absent from Lambda initialization because PostgreSQL does not permit it inside the Data API's implicit transaction.
+For an existing production table, normal `CREATE INDEX` can block writes. Run the equivalent `CREATE INDEX CONCURRENTLY IF NOT EXISTS` statements as a separately reviewed, one-off maintenance operation instead. `CONCURRENTLY` is intentionally absent from schema initialization (run by the ingestion workers) because PostgreSQL does not permit it inside the Data API's implicit transaction.
 
 ## Infrastructure and security
 
@@ -168,7 +171,8 @@ The stack creates:
 - Cognito Hosted UI, one public PKCE app client, and a Cognito-authorized HTTP API with no default stage.
 - One CloudFront distribution using private S3 OAC for static assets and an uncached `/api/*` behavior for HTTP API.
 - An isolated, no-NAT VPC with rejected-traffic flow logs.
-- S3 and DynamoDB gateway endpoints plus private OpenSearch Serverless, RDS Data API, Lambda, SQS, ECR (API and Docker), and CloudWatch Logs interface endpoints.
+- S3 and DynamoDB gateway endpoints plus private OpenSearch Serverless, RDS Data API, Lambda, SQS, ECR (API and Docker), and CloudWatch Logs interface endpoints (and Secrets Manager when the intake API is enabled).
+- Optional (`enable_intake`): an internal HTTPS Application Load Balancer, a Fargate intake service, a Secrets Manager API key, and a private request-archive bucket. See [Optional message intake API](#optional-message-intake-api).
 - One private Aurora PostgreSQL 16.8 Serverless v2 writer with 2–16 ACU (configurable), 35-day backups, deletion protection, Data API, IAM database authentication, KMS encryption, and retained storage.
 - One private OpenSearch Serverless `SEARCH` collection with `hl7-messages-v1` and `ccda-documents-v1`.
 - Queue-age, dead-letter-queue, and worker-at-maximum-tasks alarms for both formats, plus an Aurora capacity alarm.
@@ -187,7 +191,7 @@ Each format has its own ECS service. A task runs a small supervisor (`worker/wor
 
 | Setting | HL7 | CCDA | Why |
 | --- | --- | --- | --- |
-| Task size | 1 vCPU / 2 GB | 1 vCPU / 8 GB | Measured: HL7 ~420 MB per task; CCDA ~18-20x the file size per document while parsing (16 MB → ~300 MB), so four ~100 MB CCDAs fit in 8 GB |
+| Task size | 1 vCPU / 2 GB | 1 vCPU / 8 GB | Measured: HL7 ~420 MB per task; CCDA ~18-20x the file size per document while parsing (16 MB → ~300 MB, 100 MB → ~2 GB). Typical 20-30 MB CCDAs fit easily; four ~100 MB CCDAs on one task at the same moment can exceed 8 GB (see Known limitations) |
 | Largest file | 512 MiB (streamed in 500-message chunks) | 110 MiB | Per-lane `*_max_object_mb`; MX sends 20-30 MB CCDAs routinely and up to ~100 MB longitudinal CCDAs |
 | Worker processes per task | 8 | 4 | HL7 is I/O-bound; CCDA parsing is CPU-bound at 4 |
 | Messages per receive | 10 | 1 | CCDA documents are large; one at a time bounds memory |
@@ -517,7 +521,8 @@ A sanitized error object is attempted for every failure, but failure reporting i
 
 Review these signals together:
 
-- HL7 and CCDA worker logs (`/ecs/<stack>-hl7-worker`, `/ecs/<stack>-ccda-worker`): `batch_failed` and `receive_failed` events.
+- HL7 and CCDA worker logs (`/ecs/<stack>-hl7-worker`, `/ecs/<stack>-ccda-worker`): `batch_failed` and `receive_failed` events; `visibility_extended` shows a long file still being processed.
+- With the intake API: its log group (`/ecs/<stack>-intake`: `intake_accepted` and `intake_rejected` events with status codes, sizes, and a hashed message reference, never bodies or identifiers), the load balancer's 4xx/5xx and target-health metrics, and the intake service's running task count.
 - ECS running task counts (Container Insights) and Aurora `ServerlessDatabaseCapacity`.
 - Queue age and visible-message counts.
 - DLQ visible-message counts.
@@ -526,7 +531,7 @@ Review these signals together:
 - OpenSearch indexing results.
 - Aurora Data API errors and metadata rows.
 
-The stack creates CloudWatch alarms for queue age, DLQ content, and workers at maximum tasks for each format, plus the reindex queue and Aurora capacity. Alarm notification actions are not configured; connect them to an approved notification or incident-management path before production use.
+The stack creates CloudWatch alarms for queue age, DLQ content, and workers at maximum tasks for each format, plus the reindex queue and Aurora capacity. There are no alarms for the intake API yet. Alarm notification actions are not configured; connect them to an approved notification or incident-management path before production use.
 
 ## Common problems
 
@@ -570,22 +575,55 @@ The application limits raw objects per lane (HL7 512 MiB, CCDA 110 MiB) and bulk
 - Public Dashboards without an explicit role.
 - A Dashboard role from a different account.
 - Invalid Fargate CPU/memory pairs, `min_tasks` above `max_tasks`, or Aurora ACU values that are out of order or not multiples of 0.5.
+- `enable_intake` without `intake_source_cidrs` or `intake_certificate_arn`; a source range that is not private IPv4 or is wider than `/16`; an `intake_sender_id` that is not lowercase letters, digits, and hyphens.
 
 Correct the context values rather than bypassing validation.
 
 ## Known limitations
 
+**Parsing and data**
+
 - The HL7 `ROOT` projection is not a complete HL7 message representation.
 - The CCDA `CD` projection is not a complete clinical-document representation.
 - No HL7 message-profile or conformance validation is implemented.
 - No CCDA XSD, Schematron, or template-conformance validation is implemented.
+- Old versions are not rejected: HL7 below v2.2 and CCDA documents before R2 are parsed like any other input.
 - Matched customer source/output parity testing has not been established.
+- HL7 timestamps without an offset are interpreted as UTC.
+- Duplicates are collapsed only within one file. Document IDs include the S3 key, so the same message in two files, or a file re-uploaded under a different key, becomes two documents.
+- HL7 files and multi-document CCDA files must be UTF-8.
 - Existing raw objects are not backfilled automatically.
+
+**Ingestion and scale**
+
+- One file is processed by one worker. A very large file is not split across workers, so it takes longer than the same messages spread over several files.
+- Visibility is extended for up to 6 hours; a single file that takes longer is redelivered and processed again (with the same document IDs).
+- CCDA memory: a ~100 MB CCDA needs about 2 GB while parsing. Four of them on the same task at the same moment can exceed the 8 GB task and stop it; the messages are retried. If very large CCDAs arrive together often, set `ccda_task_cpu: 2048` with `ccda_task_memory: 12288` (12 GB needs 2 vCPU on Fargate), or `ccda_workers: 3`.
+- One projected document can still exceed an OpenSearch request limit on its own (see Common problems).
+- Throughput is ultimately bounded by the account's OpenSearch Serverless capacity limit and `aurora_max_acu`, not only by worker count.
+- Capacity and cost have not been validated against production traffic.
+
+**Intake API (optional)**
+
+- One sender and one API key. A bearer API key is weaker than mutual TLS (the recommended upgrade). Rotating the key needs the sender to switch at the same time, since only one key is valid.
+- A `200` response means the message was stored, not that it parsed. Parse failures afterwards are not reported back to the sender; they appear in the error bucket, worker logs, and DLQ.
+- Only `POST /prism/ods/clinical-message` (and `/clinical-message`) and an authenticated status check are implemented; other Prism endpoints are not.
+- Requests are capped at `intake_max_request_mb` (150 MB). The load balancer accepts chunked uploads and forwards them with a `Content-Length`; a client connecting to the service directly (bypassing it) must send `Content-Length`. Each request reserves three times its size from a per-task budget of one third of the task memory (about 1.3 GiB at the default 4 GB), so a task handles roughly four 100 MB requests at once; others wait up to 30 seconds, then get `503` ("Busy, retry later").
+- Envelope fields (patient IDs, MPI ID, facility, and the rest) are merged into the parsed JSON and the search index, not into the Aurora `document_metadata` table, so the explorer's SQL console cannot filter on them. Files dropped directly into S3 have no envelope fields.
+- Free-form `otherAttributes` over 200 values or 5 levels are dropped.
+- A re-sent message replaces the earlier one in the order the workers finish them, not the order they were sent. If the first copy fails and its retry finishes after the re-send, the older content wins. Re-send again to correct it.
+- The request archive keeps a full copy of every accepted request, including PHI, for `intake_archive_retention_days` (90).
+- The load balancer is internal: senders need a private network path (VPN, Direct Connect, or transit gateway) and a DNS name for its certificate. A self-signed certificate is for testing only.
+- No intake-specific CloudWatch alarms, WAF, or per-sender rate limiting.
+
+**Security and operations**
+
 - Alarm notification actions are not configured.
 - Aurora credential rotation requires an explicitly approved maintenance process.
 - Explorer authentication does not segment records by tenant or facility; all user-pool members can read all documents.
 - The SQL console intentionally uses the generated Aurora administrative secret; authenticated SQL can modify or destroy database objects and data.
-- Production identity federation, WAF policy, capacity, and cost have not been validated against production requirements or traffic.
+- Production identity federation and WAF policy have not been validated against production requirements.
+- Changes made outside CDK to resources the stack owns are not tracked and can be overwritten on the next deploy. Make changes in `config.yaml` or the CDK code instead.
 
 # Data and security rules
 
