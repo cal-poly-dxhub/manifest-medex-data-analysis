@@ -5,8 +5,11 @@ from __future__ import annotations
 import hashlib
 import re
 from collections import Counter
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
+from io import BytesIO
 from typing import Any
+from xml.etree import ElementTree as StandardElementTree
 from xml.etree.ElementTree import Element
 from xml.etree.ElementTree import ParseError as XmlParseError
 
@@ -21,7 +24,12 @@ PARSER_VERSION = "1.0.0"
 INVALID_XML = "Raw object is not a safe, well-formed XML document"
 INVALID_DOCUMENT = "XML root is not an HL7 ClinicalDocument"
 XML_TOO_COMPLEX = "XML document exceeds the configured structural complexity limit"
-MAX_MARKUP_TOKENS = 2_000_000
+# Markup amplification guard. Real CCDAs carry ~25,000 tags per MB (measured on a 48 MB
+# test document), so the bound scales with the file instead of being a fixed count that a
+# legitimate ~100 MB longitudinal CCDA would exceed. Entities and DTDs stay forbidden.
+MARKUP_TOKENS_PER_BYTE = 60_000 / (1024 * 1024)
+MIN_MARKUP_TOKENS = 2_000_000
+MAX_MARKUP_TOKENS: int | None = None  # fixed override (tests); None scales with size
 MAX_XML_DEPTH = 128
 
 # Standard LOINC section codes map to the legacy keys used by customer queries.
@@ -43,9 +51,7 @@ def parse_ccda_document(
     ingested_at: str | None = None,
 ) -> dict[str, Any]:
     """Parse one CCDA document into the supplied dashboard compatibility shape."""
-    # Bound obvious markup amplification before allocating the XML tree.
-    if payload.count(b"<") > MAX_MARKUP_TOKENS:
-        raise ParseError(XML_TOO_COMPLEX)
+    _require_markup_budget(payload)
     try:
         root = ElementTree.fromstring(
             payload,
@@ -58,10 +64,138 @@ def parse_ccda_document(
     if _local_name(root.tag) != "ClinicalDocument":
         raise ParseError(INVALID_DOCUMENT)
     _require_safe_depth(root)
-
     checksum = hashlib.sha256(payload).hexdigest()
     # The same raw XML bytes under one S3 key always resolve to one logical document.
-    document_id = hashlib.sha256(f"{source.bucket}\0{source.key}\0{checksum}".encode()).hexdigest()
+    return _document_from_root(
+        root, source, identity_checksum=checksum, raw_checksum=checksum, ingested_at=ingested_at
+    )
+
+
+# A top-level ClinicalDocument start tag, with or without a namespace prefix.
+_ROOT_START_TAG = re.compile(rb"<(?:[A-Za-z_][\w.-]*:)?ClinicalDocument[\s/>]")
+_XML_DECLARATION = re.compile(rb"<\?xml\s[^>]*\?>")
+_DECLARED_ENCODING = re.compile(rb"""encoding\s*=\s*["']([^"']+)["']""")
+
+
+def iter_ccda_documents(
+    payload: bytes,
+    source: SourceReference,
+    *,
+    ingested_at: str | None = None,
+) -> Iterator[dict[str, Any]]:
+    """Yield every CCDA document in a file: one for a normal file, several when concatenated.
+
+    A single-document file takes the unchanged parse_ccda_document path (same document ID as
+    before). A file of concatenated documents is split by the XML parser itself, not by text
+    search, so tags inside comments or CDATA cannot split it. Each document is parsed with
+    the same entity/DTD/depth protections and gets its own content-based ID.
+    """
+    if len(_ROOT_START_TAG.findall(payload)) <= 1:
+        yield parse_ccda_document(payload, source, ingested_at=ingested_at)
+        return
+    _require_markup_budget(payload)
+    for declaration in _XML_DECLARATION.findall(payload):
+        encoding = _DECLARED_ENCODING.search(declaration)
+        if encoding and encoding.group(1).decode("ascii", "replace").lower() not in (
+            "utf-8",
+            "utf8",
+        ):
+            # Declarations are dropped to wrap the documents, so only UTF-8 can be honored.
+            raise ParseError(INVALID_XML)
+    body = _XML_DECLARATION.sub(b"", payload.removeprefix(b"\xef\xbb\xbf"))
+    wrapped = BytesIO(b"<ccdaBatch>" + body + b"</ccdaBatch>")
+    raw_checksum = hashlib.sha256(payload).hexdigest()
+    held: list[dict[str, Any]] = []
+    count = 0
+    try:
+        events = ElementTree.iterparse(
+            wrapped,
+            events=("start", "end"),
+            forbid_dtd=True,
+            forbid_entities=True,
+            forbid_external=True,
+        )
+        depth = 0
+        wrapper: Element | None = None
+        for event, element in events:
+            if event == "start":
+                depth += 1
+                if depth == 1:
+                    wrapper = element
+                continue
+            depth -= 1
+            if depth != 1:
+                continue
+            document = _batch_document(
+                element, source, raw_checksum=raw_checksum, ingested_at=ingested_at, ordinal=count
+            )
+            count += 1
+            # Hold the first document until a second proves the file really is a batch.
+            held.append(document)
+            if count >= 2:
+                yield from held
+                held = []
+            if wrapper is not None:
+                wrapper.remove(element)
+            element.clear()
+    except ParseError:
+        raise
+    except (DefusedXmlException, XmlParseError, UnicodeError, ValueError) as error:
+        raise ParseError(INVALID_XML) from error
+    if count == 0:
+        raise ParseError(INVALID_DOCUMENT)
+    if count == 1:
+        # The start-tag count over-estimated (e.g. a tag inside a comment): parse as usual.
+        yield parse_ccda_document(payload, source, ingested_at=ingested_at)
+
+
+def _batch_document(
+    element: Element,
+    source: SourceReference,
+    *,
+    raw_checksum: str,
+    ingested_at: str | None,
+    ordinal: int,
+) -> dict[str, Any]:
+    """Validate and project one top-level document of a multi-document file."""
+    if _local_name(element.tag) != "ClinicalDocument":
+        raise ParseError(INVALID_DOCUMENT)
+    _require_safe_depth(element)
+    # Hash the document itself, not the whitespace that follows it in the file.
+    tail, element.tail = element.tail, None
+    checksum = hashlib.sha256(StandardElementTree.tostring(element)).hexdigest()
+    element.tail = tail
+    document = _document_from_root(
+        element,
+        source,
+        identity_checksum=checksum,
+        raw_checksum=raw_checksum,
+        ingested_at=ingested_at,
+    )
+    document["documentOrdinal"] = ordinal
+    return document
+
+
+def _require_markup_budget(payload: bytes) -> None:
+    # Bound obvious markup amplification before allocating the XML tree.
+    limit = MAX_MARKUP_TOKENS
+    if limit is None:
+        limit = max(MIN_MARKUP_TOKENS, int(len(payload) * MARKUP_TOKENS_PER_BYTE))
+    if payload.count(b"<") > limit:
+        raise ParseError(XML_TOO_COMPLEX)
+
+
+def _document_from_root(
+    root: Element,
+    source: SourceReference,
+    *,
+    identity_checksum: str,
+    raw_checksum: str,
+    ingested_at: str | None,
+) -> dict[str, Any]:
+    document_id = hashlib.sha256(
+        f"{source.bucket}\0{source.key}\0{identity_checksum}".encode()
+    ).hexdigest()
     participant = _participant_from_key(source.key)
     document_time_raw = _attribute(_child(root, "effectiveTime"), "value")
 
@@ -88,7 +222,7 @@ def parse_ccda_document(
             "key": source.key,
             "versionId": source.version_id,
             "etag": source.etag,
-            "sha256": checksum,
+            "sha256": raw_checksum,
         },
     }
     if ingested_at is not None:

@@ -6,13 +6,22 @@ import hashlib
 import json
 import logging
 import os
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol, cast
 
-from src.ccda_parser import parse_ccda_document
+from src.ccda_parser import iter_ccda_documents
 from src.metadata_store import DataApiMetadataStore, MetadataRecord, MetadataStoreError
-from src.parser import ParseError, SourceReference, parse_hl7_file
+from src.parser import (
+    HL7_CHUNK_MESSAGES,
+    ParseError,
+    SourceReference,
+    iter_hl7_document_chunks,
+    parse_hl7_file,
+    scan_hl7_stream,
+)
 from src.search_store import (
     IndexingError,
     SearchTransport,
@@ -21,7 +30,41 @@ from src.search_store import (
 )
 
 MAX_OBJECT_BYTES_DEFAULT = 50 * 1024 * 1024
-OBJECT_TOO_LARGE = "Raw object exceeds the configured Lambda parsing limit"
+OBJECT_TOO_LARGE = "Raw object exceeds the configured parsing limit"
+# A multi-message HL7 file writes one parsed object per message. Writing them concurrently
+# removes most of the time large files spend in this stage. Eight threads fit inside the
+# default botocore connection pool (10), so no request waits for a connection.
+PARSED_WRITE_CONCURRENCY = 8
+# HL7 files above this size are streamed twice (checksum/validation, then parsing) and
+# processed in chunks, so memory is bounded by the chunk instead of the file.
+HL7_STREAM_THRESHOLD_BYTES = 8 * 1024 * 1024
+STREAM_READ_BYTES = 1024 * 1024
+ENVELOPE_READ_FAILED = "Intake envelope sidecar could not be read"
+MAX_ENVELOPE_BYTES = 1024 * 1024
+# otherAttributes is free-form sender JSON. Beyond these bounds it is dropped (and counted)
+# rather than indexed, so one sender cannot exhaust the index field limit.
+MAX_OTHER_ATTRIBUTE_LEAVES = 200
+MAX_OTHER_ATTRIBUTE_DEPTH = 5
+# Envelope field -> indexed top-level field. Names follow Prism's index where Prism had the
+# field (messageEventType, patientMpiId_old, messageReceivedDate), else the envelope name.
+ENVELOPE_FIELDS = (
+    ("sourceFacilityId", "sourceFacilityId"),
+    ("sourceFacility", "sourceFacility"),
+    ("patientId", "patientId"),
+    ("patientIdAa", "patientIdAa"),
+    ("patientMpiId", "patientMpiId"),
+    ("patientMpiIdsOld", "patientMpiId_old"),
+    ("resultType", "resultType"),
+    ("eventType", "messageEventType"),
+    ("sendingApplication", "sendingApplication"),
+    ("receivingApplication", "receivingApplication"),
+    ("sourceMessageId", "sourceMessageId"),
+    ("sourceLastUpdatedTime", "sourceLastUpdatedTime"),
+    ("messageDate", "messageDate"),
+    ("timeZoneId", "timeZoneId"),
+    ("clinicalMessageType", "clinicalMessageType"),
+    ("intakeReceivedAt", "messageReceivedDate"),
+)
 INVALID_EVENT = "SQS record is not an S3 Object Created EventBridge event"
 INVALID_INGESTED_TIME = "S3 event time is missing or invalid"
 INVALID_SOURCE_ROUTE = "Source object does not match the format-specific ingestion route"
@@ -34,8 +77,21 @@ LOGGER = logging.getLogger(__name__)
 _RUNTIME_PROCESSORS: dict[str, DocumentProcessor] = {}
 
 
+class ObjectTooLargeError(ParseError):
+    """Raw object over the parsing limit; carries sizes (never content) for diagnostics."""
+
+    def __init__(self, object_bytes: int, max_bytes: int) -> None:
+        super().__init__(OBJECT_TOO_LARGE)
+        self.object_bytes = object_bytes
+        self.max_bytes = max_bytes
+
+
 class _ReadableBody(Protocol):
     def read(self) -> bytes: ...
+
+
+class _StreamingBody(Protocol):
+    def read(self, amount: int) -> bytes: ...
 
 
 class S3Client(Protocol):
@@ -78,32 +134,37 @@ class DocumentProcessor:
             stage = "event_validation"
             try:
                 source, ingested_time = _source_from_record(record)
+                if source.key.endswith("/"):
+                    # A "folder" created in the S3 console is a zero-byte key ending in "/".
+                    # It matches the routing rule but is not a document: acknowledge it so it
+                    # never retries into the dead-letter queue.
+                    _log_skipped(self.expected_format, "folder_marker")
+                    continue
                 _validate_route(source, self.expected_format)
                 stage = "source_read"
-                documents, effective_source = _parse_source(
+                chunks, effective_source = _open_document_chunks(
                     source,
                     ingested_time,
                     self.expected_format,
                     self.s3_client,
                 )
-                # Destination order is intentional: deterministic writes make every retry converge.
-                stage = "parsed_storage"
-                locations = _write_parsed_documents(
-                    documents,
-                    self.expected_format,
-                    self.s3_client,
-                )
-                stage = "indexing"
-                index_documents(documents, self.search_transport)
-                stage = "metadata"
-                self.metadata_store.upsert(
-                    _metadata_records(
-                        documents,
-                        locations,
-                        effective_source,
-                        ingested_time,
+                # Per chunk: parsed S3, then Aurora, then the search index. Aurora is written
+                # before indexing so a document is never searchable without its metadata row;
+                # if indexing fails the explorer still lists it and the retry completes it.
+                # Every write is deterministic, so a retry of the same file converges.
+                for documents in chunks:
+                    stage = "parsed_storage"
+                    locations = _write_parsed_documents(
+                        documents, self.expected_format, self.s3_client
                     )
-                )
+                    stage = "metadata"
+                    self.metadata_store.upsert(
+                        _metadata_records(documents, locations, effective_source, ingested_time)
+                    )
+                    stage = "indexing"
+                    index_documents(documents, self.search_transport)
+                    # Parsing of the next chunk happens while advancing the iterator.
+                    stage = "source_read"
             except Exception as error:
                 _record_failure(
                     self.s3_client,
@@ -191,12 +252,41 @@ def _validate_route(source: SourceReference, expected_format: str) -> None:
         raise ParseError(INVALID_SOURCE_ROUTE)
 
 
-def _parse_source(
+def _bounded_chunks(body: object, max_bytes: int) -> Iterator[bytes]:
+    """Stream an S3 body in fixed reads, enforcing the size limit on actual bytes."""
+    if not hasattr(body, "read"):
+        raise TypeError(BODY_NOT_READABLE)
+    total = 0
+    while True:
+        chunk = cast(_StreamingBody, body).read(STREAM_READ_BYTES)
+        if not chunk:
+            return
+        if not isinstance(chunk, bytes):
+            raise TypeError(BODY_NOT_READABLE)
+        total += len(chunk)
+        if total > max_bytes:
+            raise ObjectTooLargeError(total, max_bytes)
+        yield chunk
+
+
+def _batched(documents: list[dict[str, Any]], size: int) -> Iterator[list[dict[str, Any]]]:
+    for start in range(0, len(documents), size):
+        yield documents[start : start + size]
+
+
+def _open_document_chunks(
     source: SourceReference,
     ingested_time: str,
     expected_format: str,
     s3_client: S3Client,
-) -> tuple[list[dict[str, Any]], SourceReference]:
+) -> tuple[Iterator[list[dict[str, Any]]], SourceReference]:
+    """Open the source object and return its documents as bounded chunks.
+
+    Small files are read once and parsed whole (unchanged behavior). Large HL7 files are
+    streamed: a first pass computes the file checksum and validates encoding and message
+    boundaries before anything is written, and a second pass over the same object version
+    yields chunks of HL7_CHUNK_MESSAGES documents. Document IDs are identical either way.
+    """
     request: dict[str, Any] = {"Bucket": source.bucket, "Key": source.key}
     if source.version_id:
         request["VersionId"] = source.version_id
@@ -204,27 +294,165 @@ def _parse_source(
     response = s3_client.get_object(**request)
     max_bytes = int(os.getenv("MAX_OBJECT_BYTES", str(MAX_OBJECT_BYTES_DEFAULT)))
     # Check both metadata and actual bytes because ContentLength is an external response value.
-    if int(response.get("ContentLength", 0)) > max_bytes:
-        raise ParseError(OBJECT_TOO_LARGE)
-    payload = _read_body(response["Body"])
-    if len(payload) > max_bytes:
-        raise ParseError(OBJECT_TOO_LARGE)
-
+    content_length = int(response.get("ContentLength", 0))
+    if content_length > max_bytes:
+        raise ObjectTooLargeError(content_length, max_bytes)
     effective_source = SourceReference(
         bucket=source.bucket,
         key=source.key,
         version_id=source.version_id or _optional_string(response.get("VersionId")),
         etag=source.etag or _clean_etag(response.get("ETag")),
     )
-    if expected_format == "hl7-v2":
-        documents = parse_hl7_file(payload, effective_source, ingested_at=ingested_time)
+    envelope = _read_envelope(source, response.get("Metadata") or {}, s3_client)
+
+    raw_chunks: Iterator[list[dict[str, Any]]]
+    if expected_format == "hl7-v2" and content_length > HL7_STREAM_THRESHOLD_BYTES:
+        raw_checksum, _ = scan_hl7_stream(_bounded_chunks(response["Body"], max_bytes))
+        reread = dict(request)
+        if effective_source.version_id:
+            reread["VersionId"] = effective_source.version_id
+
+        def second_pass() -> Iterator[bytes]:
+            yield from _bounded_chunks(s3_client.get_object(**reread)["Body"], max_bytes)
+
+        raw_chunks = iter_hl7_document_chunks(
+            second_pass(),
+            effective_source,
+            raw_checksum=raw_checksum,
+            ingested_at=ingested_time,
+            chunk_messages=HL7_CHUNK_MESSAGES,
+        )
     else:
-        documents = [parse_ccda_document(payload, effective_source, ingested_at=ingested_time)]
-    if not documents or any(
-        document.get("sourceFormat") != expected_format for document in documents
-    ):
+        payload = _read_body(response["Body"])
+        if len(payload) > max_bytes:
+            raise ObjectTooLargeError(len(payload), max_bytes)
+        if expected_format == "hl7-v2":
+            raw_chunks = _batched(
+                parse_hl7_file(payload, effective_source, ingested_at=ingested_time),
+                HL7_CHUNK_MESSAGES,
+            )
+        else:
+            raw_chunks = (
+                [document]
+                for document in iter_ccda_documents(
+                    payload, effective_source, ingested_at=ingested_time
+                )
+            )
+    return _checked_chunks(raw_chunks, expected_format, envelope, source), effective_source
+
+
+def _checked_chunks(
+    chunks: Iterator[list[dict[str, Any]]],
+    expected_format: str,
+    envelope: dict[str, Any] | None,
+    source: SourceReference,
+) -> Iterator[list[dict[str, Any]]]:
+    produced = False
+    for documents in chunks:
+        if any(document.get("sourceFormat") != expected_format for document in documents):
+            raise ParseError(INVALID_SOURCE_ROUTE)
+        if envelope is not None:
+            _apply_envelope(documents, envelope, source)
+        produced = produced or bool(documents)
+        yield documents
+    if not produced:
         raise ParseError(INVALID_SOURCE_ROUTE)
-    return documents, effective_source
+
+
+def envelope_key_for(raw_key: str) -> str | None:
+    """Map incoming/<lane>/...<name>.<ext> to its sidecar envelopes/<lane>/...<name>.json."""
+    if not raw_key.startswith("incoming/") or "." not in raw_key.rsplit("/", 1)[-1]:
+        return None
+    return "envelopes/" + raw_key[len("incoming/") :].rsplit(".", 1)[0] + ".json"
+
+
+def _read_envelope(
+    source: SourceReference, metadata: dict[str, Any], s3_client: S3Client
+) -> dict[str, Any] | None:
+    """Return the intake envelope for an object delivered through the intake API, else None.
+
+    Only objects the intake service wrote carry these metadata markers, so files uploaded
+    straight to S3 cost no extra request and are processed exactly as before.
+    """
+    version_id = metadata.get("envelope-version-id")
+    if version_id is None and metadata.get("envelope-key-only") != "true":
+        return None
+    key = envelope_key_for(source.key)
+    if key is None:
+        return None
+    request: dict[str, Any] = {"Bucket": source.bucket, "Key": key}
+    if version_id:
+        request["VersionId"] = version_id
+    try:
+        response = s3_client.get_object(**request)
+        too_large = int(response.get("ContentLength", 0)) > MAX_ENVELOPE_BYTES
+        envelope = None if too_large else json.loads(_read_body(response["Body"]))
+    except Exception as error:
+        raise ParseError(ENVELOPE_READ_FAILED) from error
+    if not isinstance(envelope, dict):
+        raise ParseError(ENVELOPE_READ_FAILED)
+    return envelope
+
+
+def _attribute_shape(value: Any, depth: int = 0) -> tuple[int, int]:
+    """Return (leaf count, max depth) of a JSON value."""
+    if isinstance(value, dict):
+        shapes = [_attribute_shape(item, depth + 1) for item in value.values()] or [(0, depth)]
+    elif isinstance(value, list):
+        shapes = [_attribute_shape(item, depth + 1) for item in value] or [(0, depth)]
+    else:
+        return 1, depth
+    return sum(leaves for leaves, _ in shapes), max(level for _, level in shapes)
+
+
+def _bounded_attributes(value: Any, name: str, expected_format: str) -> Any | None:
+    if not isinstance(value, dict) or not value:
+        return None
+    leaves, depth = _attribute_shape(value)
+    if leaves > MAX_OTHER_ATTRIBUTE_LEAVES or depth > MAX_OTHER_ATTRIBUTE_DEPTH:
+        _log_skipped(expected_format, f"{name}_too_large")
+        return None
+    return value
+
+
+def _apply_envelope(
+    documents: list[dict[str, Any]], envelope: dict[str, Any], source: SourceReference
+) -> None:
+    """Merge intake envelope fields into each document and give it a stable identity.
+
+    Prism treats a re-sent sourceMessageId as an update, so a message delivered through the
+    intake API is identified by its stable object key and position in the file, not by its
+    content: a corrected message replaces the earlier document instead of adding another.
+    """
+    fields: dict[str, Any] = {}
+    for envelope_name, field_name in ENVELOPE_FIELDS:
+        value = envelope.get(envelope_name)
+        if value not in (None, "", [], {}):
+            fields[field_name] = value
+    contents = envelope.get("contents")
+    selected = envelope.get("selectedContentIndex")
+    if isinstance(contents, list) and isinstance(selected, int) and 0 <= selected < len(contents):
+        chosen = contents[selected] if isinstance(contents[selected], dict) else {}
+        if chosen.get("processedLevel"):
+            fields["messageProcessedLevel"] = chosen["processedLevel"]
+        content_attributes = _bounded_attributes(
+            chosen.get("otherAttributes"),
+            "contentOtherAttributes",
+            str(documents[0]["sourceFormat"]),
+        )
+        if content_attributes is not None:
+            fields["contentOtherAttributes"] = content_attributes
+    attributes = _bounded_attributes(
+        envelope.get("otherAttributes"), "otherAttributes", str(documents[0]["sourceFormat"])
+    )
+    if attributes is not None:
+        fields["otherAttributes"] = attributes
+    for document in documents:
+        ordinal = document.get("messageOrdinal", 0)
+        document["documentId"] = hashlib.sha256(
+            f"{source.bucket}\0{source.key}\0intake\0{ordinal}".encode()
+        ).hexdigest()
+        document.update(fields)
 
 
 def _write_parsed_documents(
@@ -234,21 +462,24 @@ def _write_parsed_documents(
 ) -> list[ParsedLocation]:
     parsed_bucket = os.environ["PARSED_BUCKET"]
     prefix = "hl7" if expected_format == "hl7-v2" else "ccda"
-    locations: list[ParsedLocation] = []
-    for document in documents:
-        document_id = str(document["documentId"])
+
+    def write(document: dict[str, Any]) -> ParsedLocation:
         # Stable keys overwrite the logical document while bucket versioning preserves history.
-        key = f"{prefix}/{document_id}.json"
+        key = f"{prefix}/{document['documentId']}.json"
         response = s3_client.put_object(
             Bucket=parsed_bucket,
             Key=key,
             Body=_json_bytes(document),
             ContentType="application/json",
         )
-        locations.append(
-            ParsedLocation(key=key, version_id=_optional_string(response.get("VersionId")))
-        )
-    return locations
+        return ParsedLocation(key=key, version_id=_optional_string(response.get("VersionId")))
+
+    if len(documents) <= 1:
+        return [write(document) for document in documents]
+    # map() preserves input order, so locations stay paired with their documents; the first
+    # failed write propagates and the whole source object is retried (writes are idempotent).
+    with ThreadPoolExecutor(max_workers=min(PARSED_WRITE_CONCURRENCY, len(documents))) as pool:
+        return list(pool.map(write, documents))
 
 
 def _metadata_records(
@@ -300,6 +531,11 @@ def _record_failure(
         "sourceFormat": expected_format,
         "stage": stage,
     }
+    if isinstance(error, ObjectTooLargeError):
+        # Sizes are not identifying and tell the operator exactly how far over the limit
+        # the file is. The fix is to split the file (HL7: at MSH boundaries); see README.
+        event["objectBytes"] = error.object_bytes
+        event["maxObjectBytes"] = error.max_bytes
     if isinstance(error, IndexingError):
         if error.http_status is not None:
             event["httpStatus"] = error.http_status
@@ -339,9 +575,21 @@ def _record_failure(
         )
 
 
+def _log_skipped(expected_format: str, reason: str) -> None:
+    LOGGER.info(
+        json.dumps(
+            {"event": "record_skipped", "reason": reason, "sourceFormat": expected_format},
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
+
+
 def _failure_category(error: Exception) -> str:
     if str(error) == OBJECT_TOO_LARGE:
         return "object_too_large"
+    if str(error) == ENVELOPE_READ_FAILED:
+        return "envelope_read_failed"
     if str(error) == INVALID_EVENT:
         return "invalid_event"
     if str(error) == INVALID_INGESTED_TIME:

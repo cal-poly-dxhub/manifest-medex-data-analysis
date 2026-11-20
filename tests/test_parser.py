@@ -248,3 +248,47 @@ def test_library_parse_failures_are_sanitized() -> None:
             b"MSH|broken",
             SourceReference(bucket="raw", key="malformed.hl7"),
         )
+
+
+def _batch_payload(count: int) -> bytes:
+    lines = [
+        f"MSH|^~\\&|SYNTH|FAC|DEST|DEST|20260810120000||ADT^A08|MSG-{index}|P|2.5.1\r\n"
+        f"PID|1||{index}^^^KHS||DOE^JANE\r\n"
+        for index in range(count)
+    ]
+    return ("﻿\x0b" + "".join(lines) + lines[0] + "\x1c\r").encode()
+
+
+@pytest.mark.parametrize("read_size", [1, 2, 7, 64, 4096, 10**9])
+def test_streamed_chunks_match_whole_file_parse(read_size: int) -> None:
+    import hashlib
+
+    from src.parser import iter_hl7_document_chunks, scan_hl7_stream
+
+    source = SourceReference("bucket", "incoming/hl7/batch.hl7", "v1", "etag")
+    payload = _batch_payload(23)
+    whole = parse_hl7_file(payload, source)
+    pieces = [payload[i : i + read_size] for i in range(0, len(payload), read_size)]
+    checksum, count = scan_hl7_stream(pieces)
+    chunks = list(iter_hl7_document_chunks(pieces, source, raw_checksum=checksum, chunk_messages=5))
+
+    assert checksum == hashlib.sha256(payload).hexdigest()
+    assert count == 24  # 23 messages plus one exact duplicate
+    assert [len(chunk) for chunk in chunks] == [5, 5, 5, 5, 3]
+    assert [document for chunk in chunks for document in chunk] == whole
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (b"PID|1\rMSH|^~\\&|A|B|C|D|20260810||ADT^A08|1|P|2.5.1\r", "Content appeared before"),
+        (b"\xff\xfe not utf8", "not valid UTF-8"),
+        (b"MSH|^~\\&|A|B|C|D|20260810||ADT^A08|1|P|2.5.1\rMSH|bad\r", "invalid MSH"),
+        (b"\r\n\r\n", "No HL7 MSH"),
+    ],
+)
+def test_first_pass_rejects_bad_files_before_any_write(payload: bytes, message: str) -> None:
+    from src.parser import scan_hl7_stream
+
+    with pytest.raises(ParseError, match=message):
+        scan_hl7_stream([payload])

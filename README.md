@@ -118,7 +118,9 @@ CCDA XML is parsed with `defusedxml`. The parser rejects DTDs, entities, externa
 
 The indexed `CD` projection covers structured fields used by supplied dashboard queries for patient role, custodian, medications, immunizations, problems, procedures, results, vital signs, and social history. Seven canonical sections are resolved by their standard LOINC codes. Other structured sections can be resolved by title or code display name through 108 normalized concepts representing all 116 exact section aliases observed in the August 24 Kibana export. Recognized sections generically project supported `substanceAdministration`, `organizer`, `act`, `observation`, and `procedure` entries. Narrative section bodies remain intentionally excluded.
 
-CCDA parser output identifies the implementation as version `1.0.0`. CCDA document IDs are `SHA-256(bucket + key + SHA-256(exact raw XML bytes))`. Identical XML bytes under one S3 key resolve to the same logical document across source versions; byte-level formatting changes create a new ID. S3 version IDs and ETags remain provenance metadata but do not affect CCDA identity.
+A file may also contain **several concatenated CCDA documents** (each with or without its own `<?xml?>` declaration). The XML parser itself splits them, so text inside comments or CDATA cannot cause a false split. Each document is parsed with the same protections and stored as its own document with a `documentOrdinal`; its ID uses the document's own content, so exact duplicates in one file collapse. Concatenated files must be UTF-8. Single-document files are unchanged.
+
+CCDA parser output identifies the implementation as version `1.0.0`. CCDA document IDs are `SHA-256(bucket + key + SHA-256(exact raw XML bytes))` (for a document within a multi-document file, the SHA-256 of that document's XML). Identical XML bytes under one S3 key resolve to the same logical document across source versions; byte-level formatting changes create a new ID. S3 version IDs and ETags remain provenance metadata but do not affect CCDA identity.
 
 ## Metadata contract
 
@@ -500,7 +502,7 @@ These query artifacts may be customer-sensitive and are intentionally outside th
 
 ## Retry and failure behavior
 
-The ingestion workers delete only the messages their handler reports as processed (HL7 receives up to ten per batch, CCDA one). Malformed or oversized input, permanent OpenSearch rejection, and Aurora failures are retried by SQS. After five receives, the record moves to its format-specific DLQ.
+The ingestion workers delete only the messages their handler reports as processed (HL7 receives up to ten per batch, CCDA one). Malformed or oversized input, permanent OpenSearch rejection, and Aurora failures are retried by SQS. After five receives, the record moves to its format-specific DLQ. Writes happen in a fixed order per chunk: parsed S3, then Aurora, then the search index. A document is therefore never searchable without its Aurora row; if indexing fails, the explorer already lists it and the retry indexes it.
 
 A sanitized error object is attempted for every failure, but failure reporting is not allowed to expose raw content, keys, document IDs, identifiers, clinical values, SQL parameters, or raw OpenSearch responses.
 

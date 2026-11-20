@@ -66,7 +66,9 @@ class FakeS3:
             return {"VersionId": "error-version"}
         self.operations.append("s3:parsed")
         self.parsed_version += 1
-        return {"VersionId": f"parsed-version-{self.parsed_version}"}
+        # Derived from the key so the version stays paired with its document even when
+        # parsed writes run concurrently.
+        return {"VersionId": "parsed-version-" + kwargs["Key"].rsplit("/", 1)[-1].split(".")[0]}
 
 
 class FakeTransport:
@@ -177,14 +179,15 @@ def test_hl7_combined_processor_completes_all_stages_in_order(
     )
 
     assert result == {"batchItemFailures": []}
+    # Aurora is written before indexing so search never holds a document without metadata.
     assert operations == [
         "s3:get",
         "s3:parsed",
         "s3:parsed",
+        "metadata:upsert",
         "search:HEAD",
         "search:PUT",
         "search:POST",
-        "metadata:upsert",
     ]
     assert len(metadata.calls) == 1
     records = metadata.calls[0]
@@ -198,11 +201,13 @@ def test_hl7_combined_processor_completes_all_stages_in_order(
     assert all(record.ingested_time == "2026-08-10T19:00:00Z" for record in records)
     assert all(record.raw_s3_uri == "s3://raw-bucket/incoming/hl7/batch.hl7" for record in records)
     assert all(record.raw_version_id == "raw-event-version" for record in records)
-    assert [record.parsed_version_id for record in records] == [
-        "parsed-version-1",
-        "parsed-version-2",
-    ]
-    assert all(record.parsed_s3_uri.startswith("s3://parsed-bucket/hl7/") for record in records)
+    assert all(
+        record.parsed_version_id == f"parsed-version-{record.document_id}" for record in records
+    )
+    assert all(
+        record.parsed_s3_uri == f"s3://parsed-bucket/hl7/{record.document_id}.json"
+        for record in records
+    )
     assert all(call["Key"].startswith("hl7/") for call in s3.put_calls)
     bulk_body = transport.calls[-1][2]
     assert bulk_body is not None
@@ -249,13 +254,13 @@ def test_ccda_combined_processor_persists_one_document(monkeypatch: pytest.Monke
     assert record.source_format == "ccda"
     assert record.document_time == "2026-08-10T12:00:00Z"
     assert record.raw_version_id == "raw-response-version"
-    assert record.parsed_version_id == "parsed-version-1"
+    assert record.parsed_version_id == f"parsed-version-{record.document_id}"
     assert record.parsed_s3_uri.startswith("s3://parsed-bucket/ccda/")
     assert s3.get_calls == [{"Bucket": "raw-bucket", "Key": "incoming/ccda/document.xml"}]
     assert transport.calls[0][:2] == ("HEAD", "/ccda-documents-v1")
 
 
-def test_permanent_ccda_index_rejection_retries_without_aurora(
+def test_permanent_ccda_index_rejection_retries_after_aurora(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -292,7 +297,8 @@ def test_permanent_ccda_index_rejection_retries_without_aurora(
         result = _processor("ccda", s3, transport, metadata).process_batch(_event(sensitive_key))
 
     assert result == {"batchItemFailures": [{"itemIdentifier": "sqs-message-1"}]}
-    assert metadata.calls == []
+    # Aurora already holds the row (explorer lists it); the retry completes indexing.
+    assert len(metadata.calls) == 1
     error_record = json.loads(s3.put_calls[-1]["Body"])
     assert error_record["stage"] == "indexing"
     assert error_record["failureCategory"] == "document_indexing_failed"
@@ -323,12 +329,14 @@ def test_oversized_ccda_is_retried_for_dlq_redrive(monkeypatch: pytest.MonkeyPat
     assert metadata.calls == []
     error_record = json.loads(s3.put_calls[0]["Body"])
     assert error_record["failureCategory"] == "object_too_large"
+    assert error_record["objectBytes"] == len(SYNTHETIC_CCDA)
+    assert error_record["maxObjectBytes"] == 1
     assert error_record["stage"] == "source_read"
     assert error_record["retryable"] is True
     assert error_record["final"] is False
 
 
-def test_aurora_failure_retries_after_successful_s3_and_index(
+def test_aurora_failure_retries_before_anything_is_indexed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("PARSED_BUCKET", "parsed-bucket")
@@ -347,6 +355,8 @@ def test_aurora_failure_retries_after_successful_s3_and_index(
 
     assert result == {"batchItemFailures": [{"itemIdentifier": "sqs-message-1"}]}
     assert operations[-2:] == ["metadata:upsert", "s3:error"]
+    # Nothing reached the search index, so a failed Aurora write leaves no orphan.
+    assert not any(operation.startswith("search:") for operation in operations)
     error_record = json.loads(s3.put_calls[-1]["Body"])
     assert error_record["stage"] == "metadata"
     assert error_record["failureCategory"] == "metadata_persistence_failed"
@@ -435,3 +445,312 @@ def test_thin_handlers_select_their_fixed_format(monkeypatch: pytest.MonkeyPatch
     assert hl7_handler({}, context) == {"batchItemFailures": []}
     assert ccda_handler({}, context) == {"batchItemFailures": []}
     assert [call[2] for call in calls] == ["hl7-v2", "ccda"]
+
+
+def test_s3_console_folder_marker_is_acknowledged_without_retry(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("PARSED_BUCKET", "parsed-bucket")
+    monkeypatch.setenv("ERROR_BUCKET", "error-bucket")
+    s3 = FakeS3(b"")
+    metadata = FakeMetadataStore()
+    transport = FakeTransport([])
+
+    with caplog.at_level("INFO"):
+        result = _processor("hl7-v2", s3, transport, metadata).process_batch(
+            _event("incoming/hl7/")
+        )
+
+    assert result == {"batchItemFailures": []}
+    assert s3.get_calls == []
+    assert s3.put_calls == []
+    assert transport.calls == []
+    assert metadata.calls == []
+    assert '"reason":"folder_marker"' in caplog.text
+
+
+def test_many_messages_are_written_concurrently_and_stay_paired(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PARSED_BUCKET", "parsed-bucket")
+    monkeypatch.setenv("ERROR_BUCKET", "error-bucket")
+    messages = b"".join(
+        SYNTHETIC_HL7.replace(b"MSG-1", f"MSG-{index}".encode()) for index in range(25)
+    )
+    operations: list[str] = []
+    s3 = FakeS3(messages, operations)
+    metadata = FakeMetadataStore(operations)
+    transport = _successful_transport(25, operations)
+
+    result = _processor("hl7-v2", s3, transport, metadata).process_batch(
+        _event("incoming/hl7/many.hl7")
+    )
+
+    assert result == {"batchItemFailures": []}
+    assert operations.count("s3:parsed") == 25
+    # Every parsed write finishes before indexing starts.
+    assert operations.index("search:HEAD") > max(
+        index for index, op in enumerate(operations) if op == "s3:parsed"
+    )
+    records = metadata.calls[0]
+    assert len({record.document_id for record in records}) == 25
+    assert all(
+        record.parsed_s3_uri == f"s3://parsed-bucket/hl7/{record.document_id}.json"
+        and record.parsed_version_id == f"parsed-version-{record.document_id}"
+        for record in records
+    )
+
+
+class EnvelopeS3(FakeS3):
+    """Serves a raw object written by the intake API plus its envelope sidecar."""
+
+    def __init__(self, payload: bytes, envelope: dict[str, Any] | Exception, **kwargs: Any) -> None:
+        super().__init__(payload, **kwargs)
+        self.envelope = envelope
+
+    def get_object(self, **kwargs: Any) -> dict[str, Any]:
+        if kwargs["Key"].startswith("envelopes/"):
+            self.get_calls.append(kwargs)
+            if isinstance(self.envelope, Exception):
+                raise self.envelope
+            body = json.dumps(self.envelope).encode()
+            return {"Body": BytesIO(body), "ContentLength": len(body)}
+        response = super().get_object(**kwargs)
+        response["Metadata"] = {"intake-sender": "rhapsody", "envelope-version-id": "env-v1"}
+        return response
+
+
+INTAKE_KEY = "incoming/hl7/participant=ARR_CA_ARMC_H/2026/11/18/MSG-1.hl7"
+ENVELOPE = {
+    "sourceMessageId": "MSG-1",
+    "messageDate": "2026-11-18T09:30:00-08:00",
+    "clinicalMessageType": "HL7V2",
+    "eventType": "ADT_A08",
+    "sourceFacilityId": "ARR_CA_ARMC_H",
+    "sourceFacility": "Synthetic Facility",
+    "patientId": "12345",
+    "patientIdAa": "KHS",
+    "patientMpiId": "MPI-1",
+    "patientMpiIdsOld": "MPI-0",
+    "sendingApplication": "Rhapsody",
+    "otherAttributes": {"isPartTwo": True, "testFlag": 1},
+    "contents": [{"processedLevel": "PROCESSED", "otherAttributes": {"lane": "a"}}],
+    "selectedContentIndex": 0,
+    "intakeReceivedAt": "2026-11-18T17:00:00Z",
+}
+
+
+def test_intake_envelope_fields_are_merged_and_identity_is_stable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PARSED_BUCKET", "parsed-bucket")
+    monkeypatch.setenv("ERROR_BUCKET", "error-bucket")
+    s3 = EnvelopeS3(SYNTHETIC_HL7, ENVELOPE)
+    transport = _successful_transport(1, [])
+    metadata = FakeMetadataStore()
+
+    result = _processor("hl7-v2", s3, transport, metadata).process_batch(_event(INTAKE_KEY))
+
+    assert result == {"batchItemFailures": []}
+    envelope_get = next(call for call in s3.get_calls if call["Key"].startswith("envelopes/"))
+    assert envelope_get == {
+        "Bucket": "raw-bucket",
+        "Key": "envelopes/hl7/participant=ARR_CA_ARMC_H/2026/11/18/MSG-1.json",
+        "VersionId": "env-v1",
+    }
+    parsed = json.loads(next(c for c in s3.put_calls if c["Bucket"] == "parsed-bucket")["Body"])
+    assert parsed["patientId"] == "12345"
+    assert parsed["patientIdAa"] == "KHS"
+    assert parsed["patientMpiId"] == "MPI-1"
+    assert parsed["patientMpiId_old"] == "MPI-0"
+    assert parsed["messageEventType"] == "ADT_A08"
+    assert parsed["sourceFacility"] == "Synthetic Facility"
+    assert parsed["sourceFacilityId"] == "ARR_CA_ARMC_H"
+    assert parsed["messageReceivedDate"] == "2026-11-18T17:00:00Z"
+    assert parsed["messageProcessedLevel"] == "PROCESSED"
+    assert parsed["otherAttributes"] == {"isPartTwo": True, "testFlag": 1}
+    assert parsed["contentOtherAttributes"] == {"lane": "a"}
+
+    # A corrected re-send (same key, different content) keeps the same document identity.
+    corrected = EnvelopeS3(SYNTHETIC_HL7.replace(b"MSG-1", b"MSG-1-FIX"), ENVELOPE)
+    _processor(
+        "hl7-v2", corrected, _successful_transport(1, []), FakeMetadataStore()
+    ).process_batch(_event(INTAKE_KEY))
+    corrected_doc = json.loads(
+        next(c for c in corrected.put_calls if c["Bucket"] == "parsed-bucket")["Body"]
+    )
+    assert corrected_doc["documentId"] == parsed["documentId"]
+
+
+def test_envelope_overrides_message_facility(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PARSED_BUCKET", "parsed-bucket")
+    monkeypatch.setenv("ERROR_BUCKET", "error-bucket")
+    s3 = EnvelopeS3(SYNTHETIC_HL7, {**ENVELOPE, "sourceFacilityId": "PRISM_FACILITY"})
+    _processor("hl7-v2", s3, _successful_transport(1, []), FakeMetadataStore()).process_batch(
+        _event(INTAKE_KEY)
+    )
+    parsed = json.loads(next(c for c in s3.put_calls if c["Bucket"] == "parsed-bucket")["Body"])
+    assert parsed["sourceFacilityId"] == "PRISM_FACILITY"
+
+
+def test_oversized_other_attributes_are_dropped_not_indexed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PARSED_BUCKET", "parsed-bucket")
+    monkeypatch.setenv("ERROR_BUCKET", "error-bucket")
+    flood = {f"k{index}": index for index in range(500)}
+    s3 = EnvelopeS3(SYNTHETIC_HL7, {**ENVELOPE, "otherAttributes": flood})
+    _processor("hl7-v2", s3, _successful_transport(1, []), FakeMetadataStore()).process_batch(
+        _event(INTAKE_KEY)
+    )
+    parsed = json.loads(next(c for c in s3.put_calls if c["Bucket"] == "parsed-bucket")["Body"])
+    assert "otherAttributes" not in parsed
+    assert parsed["patientId"] == "12345"
+
+
+def test_unreadable_envelope_fails_the_record_for_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PARSED_BUCKET", "parsed-bucket")
+    monkeypatch.setenv("ERROR_BUCKET", "error-bucket")
+    s3 = EnvelopeS3(SYNTHETIC_HL7, ConnectionError("sidecar unavailable"))
+    metadata = FakeMetadataStore()
+
+    result = _processor("hl7-v2", s3, FakeTransport([]), metadata).process_batch(_event(INTAKE_KEY))
+
+    assert result == {"batchItemFailures": [{"itemIdentifier": "sqs-message-1"}]}
+    assert metadata.calls == []
+    error_record = json.loads(
+        next(c for c in s3.put_calls if c["Bucket"] == "error-bucket")["Body"]
+    )
+    assert error_record["failureCategory"] == "envelope_read_failed"
+
+
+def test_files_uploaded_directly_never_look_for_an_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PARSED_BUCKET", "parsed-bucket")
+    monkeypatch.setenv("ERROR_BUCKET", "error-bucket")
+    s3 = FakeS3(SYNTHETIC_HL7)
+    _processor("hl7-v2", s3, _successful_transport(1, []), FakeMetadataStore()).process_batch(
+        _event("incoming/hl7/direct.hl7")
+    )
+    assert all(not call["Key"].startswith("envelopes/") for call in s3.get_calls)
+    parsed = json.loads(next(c for c in s3.put_calls if c["Bucket"] == "parsed-bucket")["Body"])
+    assert "patientId" not in parsed
+
+
+def test_envelope_key_mapping() -> None:
+    from src.document_handler import envelope_key_for
+
+    assert (
+        envelope_key_for(INTAKE_KEY)
+        == "envelopes/hl7/participant=ARR_CA_ARMC_H/2026/11/18/MSG-1.json"
+    )
+    assert (
+        envelope_key_for("incoming/ccda/participant=X/a.b.xml")
+        == "envelopes/ccda/participant=X/a.b.json"
+    )
+    assert envelope_key_for("other/x.hl7") is None
+    assert envelope_key_for("incoming/hl7/noextension") is None
+
+
+def _hl7_batch(count: int, *, broken_last: bool = False) -> bytes:
+    messages = [SYNTHETIC_HL7.replace(b"MSG-1", f"MSG-{index}".encode()) for index in range(count)]
+    if broken_last:
+        messages[-1] = b"MSH|bad\r"
+    return b"".join(messages)
+
+
+def test_large_hl7_file_is_streamed_in_chunks_with_identical_documents(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src import document_handler
+
+    monkeypatch.setenv("PARSED_BUCKET", "parsed-bucket")
+    monkeypatch.setenv("ERROR_BUCKET", "error-bucket")
+    payload = _hl7_batch(12)
+    # Small-file path for reference output.
+    reference_metadata = FakeMetadataStore()
+    _processor(
+        "hl7-v2", FakeS3(payload), _successful_transport(12, []), reference_metadata
+    ).process_batch(_event("incoming/hl7/big.hl7"))
+    reference_ids = [record.document_id for record in reference_metadata.calls[0]]
+
+    monkeypatch.setattr(document_handler, "HL7_STREAM_THRESHOLD_BYTES", 10)
+    monkeypatch.setattr(document_handler, "HL7_CHUNK_MESSAGES", 5)
+    monkeypatch.setattr(document_handler, "STREAM_READ_BYTES", 37)
+    operations: list[str] = []
+    s3 = FakeS3(payload, operations)
+    metadata = FakeMetadataStore(operations)
+    transport = FakeTransport(
+        [
+            (404, {}),
+            (201, {"acknowledged": True}),
+            (200, {"errors": False, "items": [{"index": {"status": 201}}] * 5}),
+            (200, {}),
+            (200, {"errors": False, "items": [{"index": {"status": 201}}] * 5}),
+            (200, {}),
+            (200, {"errors": False, "items": [{"index": {"status": 201}}] * 2}),
+        ],
+        operations,
+    )
+
+    result = _processor("hl7-v2", s3, transport, metadata).process_batch(
+        _event("incoming/hl7/big.hl7")
+    )
+
+    assert result == {"batchItemFailures": []}
+    # Two reads of the same pinned version: checksum/validation pass, then parsing pass.
+    assert [call.get("VersionId") for call in s3.get_calls] == ["raw-event-version"] * 2
+    assert [len(call) for call in metadata.calls] == [5, 5, 2]
+    assert [record.document_id for call in metadata.calls for record in call] == reference_ids
+    # Each chunk is stored, then recorded in Aurora, then indexed, before the next begins.
+    upserts = [index for index, op in enumerate(operations) if op == "metadata:upsert"]
+    bulks = [index for index, op in enumerate(operations) if op == "search:POST"]
+    assert all(upsert < bulk for upsert, bulk in zip(upserts, bulks, strict=True))
+    assert upserts[1] > bulks[0]
+
+
+def test_bad_message_late_in_large_file_fails_before_any_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src import document_handler
+
+    monkeypatch.setenv("PARSED_BUCKET", "parsed-bucket")
+    monkeypatch.setenv("ERROR_BUCKET", "error-bucket")
+    monkeypatch.setattr(document_handler, "HL7_STREAM_THRESHOLD_BYTES", 10)
+    s3 = FakeS3(_hl7_batch(8, broken_last=True))
+    metadata = FakeMetadataStore()
+
+    result = _processor("hl7-v2", s3, FakeTransport([]), metadata).process_batch(
+        _event("incoming/hl7/big.hl7")
+    )
+
+    assert result == {"batchItemFailures": [{"itemIdentifier": "sqs-message-1"}]}
+    assert metadata.calls == []
+    assert [call["Bucket"] for call in s3.put_calls] == ["error-bucket"]
+
+
+def test_multi_document_ccda_file_stores_each_document(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PARSED_BUCKET", "parsed-bucket")
+    monkeypatch.setenv("ERROR_BUCKET", "error-bucket")
+    second = SYNTHETIC_CCDA.replace(b"synthetic-vital", b"synthetic-vital-2")
+    s3 = FakeS3(SYNTHETIC_CCDA + b"\n" + second)
+    metadata = FakeMetadataStore()
+    transport = FakeTransport(
+        [
+            (404, {}),
+            (201, {"acknowledged": True}),
+            (200, {"errors": False, "items": [{"index": {"status": 201}}]}),
+            (200, {}),
+            (200, {"errors": False, "items": [{"index": {"status": 201}}]}),
+        ]
+    )
+
+    result = _processor("ccda", s3, transport, metadata).process_batch(
+        _event("incoming/ccda/batch.xml")
+    )
+
+    assert result == {"batchItemFailures": []}
+    records = [record for call in metadata.calls for record in call]
+    assert len(records) == 2
+    assert len({record.document_id for record in records}) == 2

@@ -186,3 +186,61 @@ def test_ccda_parser_handles_sparse_document_and_unknown_section() -> None:
     assert document["participantId"] is None
     assert document["CD"] == {}
     assert document["sectionCounts"] == {"unknown-section": 1}
+
+
+def test_markup_limit_scales_with_document_size() -> None:
+    from src.ccda_parser import MARKUP_TOKENS_PER_BYTE, MIN_MARKUP_TOKENS
+
+    # A realistic ~100 MB longitudinal CCDA (~25k tags per MB) stays under the scaled limit.
+    size = 100 * 1024 * 1024
+    assert max(MIN_MARKUP_TOKENS, int(size * MARKUP_TOKENS_PER_BYTE)) > 25_000 * 100
+    # Small files keep the original floor.
+    assert max(MIN_MARKUP_TOKENS, int(1024 * MARKUP_TOKENS_PER_BYTE)) == MIN_MARKUP_TOKENS
+
+
+def _doc(marker: str) -> bytes:
+    return (
+        b'<?xml version="1.0" encoding="UTF-8"?>\n'
+        b'<ClinicalDocument xmlns="urn:hl7-org:v3"><id root="' + marker.encode() + b'"/>'
+        b'<effectiveTime value="20260810120000"/></ClinicalDocument>\n'
+    )
+
+
+def test_concatenated_ccdas_become_separate_documents() -> None:
+    from src.ccda_parser import iter_ccda_documents, parse_ccda_document
+
+    source = SourceReference("bucket", "incoming/ccda/participant=F1/batch.xml", "v1", "etag")
+    documents = list(iter_ccda_documents(_doc("a") + _doc("b") + _doc("a"), source))
+
+    assert [document["documentOrdinal"] for document in documents] == [0, 1, 2]
+    # Identity is content-based like HL7: an exact duplicate collapses to the same ID.
+    assert documents[0]["documentId"] == documents[2]["documentId"] != documents[1]["documentId"]
+    assert documents[0]["CD"] == parse_ccda_document(_doc("a"), source)["CD"]
+    assert all(document["sourceFacilityId"] == "F1" for document in documents)
+
+
+def test_single_ccda_keeps_its_existing_identity() -> None:
+    from src.ccda_parser import iter_ccda_documents, parse_ccda_document
+
+    source = SourceReference("bucket", "incoming/ccda/one.xml")
+    commented = b"<!-- <ClinicalDocument> -->" + _doc("a").split(b"\n", 1)[1]
+    for payload in (_doc("a"), commented):
+        (document,) = iter_ccda_documents(payload, source)
+        assert document == parse_ccda_document(payload, source)
+        assert "documentOrdinal" not in document
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (_doc("a") + b"<Other/>" + _doc("b"), "not an HL7 ClinicalDocument"),
+        (_doc("a") + _doc("b").replace(b"UTF-8", b"ISO-8859-1"), "well-formed"),
+        (_doc("a") + b"<ClinicalDocument xmlns='urn:hl7-org:v3'><broken>", "well-formed"),
+        (_doc("a") + b'<!DOCTYPE x [<!ENTITY e "boom">]>' + _doc("b"), "well-formed"),
+    ],
+)
+def test_bad_batches_are_rejected(payload: bytes, message: str) -> None:
+    from src.ccda_parser import iter_ccda_documents
+
+    with pytest.raises(ParseError, match=message):
+        list(iter_ccda_documents(payload, SourceReference("bucket", "incoming/ccda/x.xml")))

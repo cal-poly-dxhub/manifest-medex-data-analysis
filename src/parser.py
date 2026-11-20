@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import codecs
 import hashlib
 import re
 from collections import Counter
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -80,22 +82,115 @@ def parse_hl7_file(
     ingested_at: str | None = None,
 ) -> list[dict[str, Any]]:
     """Split, deduplicate, and parse HL7 messages from one raw object."""
+    # One code path for whole-file and chunked processing keeps their output identical.
+    raw_checksum = hashlib.sha256(payload).hexdigest()
+    return [
+        document
+        for chunk in iter_hl7_document_chunks(
+            [payload],
+            source,
+            raw_checksum=raw_checksum,
+            ingested_at=ingested_at,
+            chunk_messages=1 << 30,
+        )
+        for document in chunk
+    ]
+
+
+# Large HL7 batches are processed in chunks of this many messages, so memory stays bounded
+# by the chunk rather than the file.
+HL7_CHUNK_MESSAGES = 500
+_SEGMENT_SEPARATOR = re.compile(r"[\r\n]")
+
+
+def _iter_segments(chunks: Iterable[bytes]) -> Iterator[str]:
+    """Decode a byte stream and yield non-empty segments, exactly as split_hl7_messages does.
+
+    Splitting on every CR or LF and dropping empty pieces equals normalizing CRLF/LF to CR
+    first, and it stays correct when a CRLF pair straddles two reads.
+    """
+    decoder = codecs.getincrementaldecoder("utf-8-sig")(errors="strict")
+    pending = ""
     try:
-        text = payload.decode("utf-8-sig")
+        for chunk in chunks:
+            text = pending + decoder.decode(chunk).replace("\x0b", "").replace("\x1c", "")
+            pieces = _SEGMENT_SEPARATOR.split(text)
+            pending = pieces.pop()
+            yield from (piece for piece in pieces if piece)
+        text = pending + decoder.decode(b"", final=True).replace("\x0b", "").replace("\x1c", "")
     except UnicodeDecodeError as error:
         raise ParseError(INVALID_UTF8) from error
+    yield from (piece for piece in _SEGMENT_SEPARATOR.split(text) if piece)
 
-    messages = split_hl7_messages(text)
-    raw_checksum = hashlib.sha256(payload).hexdigest()
-    documents: list[dict[str, Any]] = []
-    seen_messages: set[str] = set()
-    for ordinal, message in enumerate(messages):
-        # Identity is based on normalized message content; retain only its first occurrence.
-        if message in seen_messages:
-            continue
-        seen_messages.add(message)
+
+def _iter_messages(segments: Iterable[str]) -> Iterator[str]:
+    """Group segments into messages at MSH boundaries (streaming split_hl7_messages)."""
+    current: list[str] = []
+    found = False
+    for segment in segments:
+        if segment.startswith("MSH"):
+            if current:
+                yield "\r".join(current)
+            current = [segment]
+            found = True
+        elif current:
+            current.append(segment)
+        else:
+            raise ParseError(CONTENT_BEFORE_MSH)
+    if current:
+        yield "\r".join(current)
+    if not found:
+        raise ParseError(MISSING_MSH)
+
+
+def scan_hl7_stream(chunks: Iterable[bytes]) -> tuple[str, int]:
+    """First pass over a large file: return (raw SHA-256, message count) and validate it.
+
+    Encoding and structure errors surface here, before any destination is written.
+    """
+    digest = hashlib.sha256()
+
+    def hashed() -> Iterator[bytes]:
+        for chunk in chunks:
+            digest.update(chunk)
+            yield chunk
+
+    count = 0
+    for message in _iter_messages(_iter_segments(hashed())):
+        _require_valid_msh(message)
+        count += 1
+    return digest.hexdigest(), count
+
+
+def _require_valid_msh(message: str) -> None:
+    # The same header check _parse_message applies first, cheap enough for a full pass.
+    msh = message.partition("\r")[0]
+    if len(msh) < 9 or not msh.startswith("MSH") or msh[8] != msh[3]:
+        raise ParseError(INVALID_MSH)
+
+
+def iter_hl7_document_chunks(
+    chunks: Iterable[bytes],
+    source: SourceReference,
+    *,
+    raw_checksum: str,
+    ingested_at: str | None = None,
+    chunk_messages: int = HL7_CHUNK_MESSAGES,
+) -> Iterator[list[dict[str, Any]]]:
+    """Parse a byte stream into lists of at most ``chunk_messages`` documents.
+
+    Ordinals, duplicate collapsing, and document IDs are identical to parse_hl7_file, so a
+    file yields the same documents whether it is processed whole or in chunks.
+    """
+    seen: set[str] = set()
+    batch: list[dict[str, Any]] = []
+    for ordinal, message in enumerate(_iter_messages(_iter_segments(chunks))):
         message_checksum = hashlib.sha256(message.encode()).hexdigest()
-        documents.append(
+        # Identity is based on normalized message content; keep only the first occurrence.
+        if message_checksum in seen:
+            continue
+        seen.add(message_checksum)
+        batch.append(
             _parse_message(
                 message,
                 source,
@@ -105,7 +200,11 @@ def parse_hl7_file(
                 ingested_at=ingested_at,
             )
         )
-    return documents
+        if len(batch) >= chunk_messages:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
 
 
 def split_hl7_messages(text: str) -> list[str]:
@@ -142,9 +241,7 @@ def _parse_message(
     ordinal: int,
     ingested_at: str | None,
 ) -> dict[str, Any]:
-    msh = message.partition("\r")[0]
-    if len(msh) < 9 or not msh.startswith("MSH") or msh[8] != msh[3]:
-        raise ParseError(INVALID_MSH)
+    _require_valid_msh(message)
 
     parsed = _parse_with_library(message)
     # python-hl7 exposes separators in library order; _SegmentView assigns semantic names.
