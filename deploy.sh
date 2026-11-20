@@ -32,6 +32,7 @@ cd "$(dirname "$0")"
 
 die()  { echo "ERROR: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
+warn() { echo "WARNING: $*" >&2; }
 
 need() { command -v "$1" >/dev/null 2>&1 || die "'$1' is required but not installed. See DEPLOYMENT.md → Prerequisites."; }
 
@@ -126,6 +127,23 @@ if [[ -n "$VPC_ID$SUBNET_IDS$ROUTE_TABLE_IDS$AVAILABILITY_ZONES" ]]; then
     -c "availability_zones=$AVAILABILITY_ZONES"
   )
 
+  # Private DNS for interface endpoints (including OpenSearch Serverless) only works when
+  # lookups go through the VPC's AmazonProvidedDNS. Custom DNS servers that do not forward
+  # those names resolve the public address instead, and OpenSearch then rejects every write
+  # with HTTP 401. Warn rather than fail: the customer may already forward the names.
+  DHCP_ID="$(aws ec2 describe-vpcs "${AWS_ARGS[@]}" --vpc-ids "$VPC_ID" \
+      --query 'Vpcs[0].DhcpOptionsId' --output text 2>/dev/null || true)"
+  if [[ -n "$DHCP_ID" && "$DHCP_ID" != "None" && "$DHCP_ID" != "default" ]]; then
+    DNS_SERVERS="$(aws ec2 describe-dhcp-options "${AWS_ARGS[@]}" --dhcp-options-ids "$DHCP_ID" \
+        --query "DhcpOptions[0].DhcpConfigurations[?Key=='domain-name-servers'].Values[].Value" \
+        --output text 2>/dev/null || true)"
+    if [[ -n "$DNS_SERVERS" && "$DNS_SERVERS" != *AmazonProvidedDNS* ]]; then
+      warn "VPC $VPC_ID uses custom DNS servers ($DNS_SERVERS) instead of AmazonProvidedDNS."
+      warn "Private endpoint names (OpenSearch Serverless in particular) must be forwarded to the VPC resolver,"
+      warn "or indexing fails with HTTP 401. See DEPLOYMENT.md -> 'DNS requirement for existing VPCs'."
+    fi
+  fi
+
   # Discover VPC endpoints that already exist for the services the stack needs. A second
   # interface endpoint for a service with private DNS cannot be created, so existing ones
   # are passed to the stack, which imports them instead of creating duplicates.
@@ -150,8 +168,14 @@ for ep in json.load(sys.stdin):
     key = wanted.get(ep["svc"])
     if key is None or ep.get("stack") == stack_name:
         continue
+    if key in ("s3", "dynamodb"):
+        # The stack only ever imports gateway endpoints for these services. An interface
+        # endpoint for the same service (common for S3) coexists with the gateway one and
+        # is ignored rather than reported as a second, invalid entry.
+        if ep["type"] == "Gateway" and key not in entries:
+            entries.append(key)
+        continue
     if ep["type"] == "Gateway":
-        entries.append(key)
         continue
     sgs = ep.get("sgs") or []
     if not sgs:
@@ -208,7 +232,9 @@ if is_true "$DO_VALIDATE"; then
   info "Running validation (lint, types, tests, synth)"
   make validate
 else
-  info "Skipping validation; building frontend and synthesizing only"
+  warn "validate is false in $CONFIG_FILE: lint, type checks, unit tests, and cdk-nag are SKIPPED."
+  warn "Use this only for a re-deploy of already-validated code; keep validate: true otherwise."
+  info "Building frontend and synthesizing only"
   make synth
 fi
 

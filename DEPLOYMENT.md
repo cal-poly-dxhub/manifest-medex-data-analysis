@@ -6,6 +6,8 @@ This deploys the Manifest MedEx data-quality platform into an AWS account with C
 
 Install these first; each links to its official installation guide.
 
+**Supported platforms:** macOS, Linux, or AWS CloudShell. `deploy.sh` is a bash script that also needs `python3` and `make`. Windows is not supported directly: in Git Bash, `python3` is usually only the Microsoft Store placeholder and `make` is missing. On Windows, deploy from WSL2 or CloudShell.
+
 - **Git** — [install](https://git-scm.com/downloads), to clone the repository.
 - **An AWS account with credentials configured**, so that `aws sts get-caller-identity` works ([configure the AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/cli-chap-configure.html); for IAM Identity Center use [`aws configure sso`](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sso.html)). Use an administrator or equivalent deployment role; the stack creates IAM roles, a VPC, KMS keys, and an OpenSearch Serverless collection.
 - **The AWS CLI v2** — [install](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html).
@@ -91,6 +93,30 @@ aws ec2 describe-route-tables \
 ```
 
 If a subnet has no explicit association, it uses the VPC's main route table (`aws ec2 describe-route-tables --filters Name=vpc-id,Values=<vpc-id> Name=association.main,Values=true`).
+
+#### DNS requirement for existing VPCs
+
+Interface endpoints with private DNS, including the **OpenSearch Serverless** endpoint, only work when DNS lookups inside the VPC go through the VPC's **AmazonProvidedDNS** resolver. Many enterprise VPCs use a custom DHCP options set that points at their own DNS servers, for example Active Directory domain controllers. If those servers do not forward the endpoint names to the VPC resolver, the names resolve to **public** addresses. For OpenSearch Serverless this fails in a confusing way: the collection rejects the traffic with **HTTP 401 at the indexing stage** (`failureCategory: document_indexing_failed`, `httpStatus: 401` in the worker logs), and every message ends up in the dead-letter queue, even though IAM, the data access policy, and the security groups are all correct. Other services (SQS, Data API, ECR, Logs) keep working over the public path if the subnets have a NAT gateway, but their endpoint policies are then not applied.
+
+`deploy.sh` prints a warning when the VPC's DHCP options use custom DNS servers.
+
+**Before deploying**, check the VPC's DNS servers:
+
+```bash
+aws ec2 describe-dhcp-options \
+  --dhcp-options-ids "$(aws ec2 describe-vpcs --vpc-ids <vpc-id> --query 'Vpcs[0].DhcpOptionsId' --output text)" \
+  --query "DhcpOptions[0].DhcpConfigurations[?Key=='domain-name-servers'].Values[].Value"
+```
+
+`["AmazonProvidedDNS"]` needs no action. Anything else means the custom DNS servers must forward the relevant names to the VPC resolver (the VPC CIDR base + 2, e.g. `10.0.0.2`), typically with a conditional forwarder for `<collection-id>.<region>.aoss.amazonaws.com` (or `aoss.amazonaws.com`) and, if you want endpoint policies enforced, the other service names.
+
+**After deploying**, from an instance or CloudShell VPC environment in the same subnets:
+
+```bash
+nslookup <collection-id>.<region>.aoss.amazonaws.com
+```
+
+It must return **private** IP addresses from the endpoint's subnets. The collection ID is the host part of the `OpenSearchEndpoint` stack output. If it returns public addresses, fix DNS forwarding before loading data. If forwarding is pinned to specific endpoint IPs (for example a Route 53 private hosted zone with A records), update those records whenever the OpenSearch VPC endpoint is replaced.
 
 People on your network reach the PHI Explorer through CloudFront and Cognito, not directly, so no security group changes are needed for it. In this mode the stack does not create VPC flow logs (the VPC is not ours to log). The OpenSearch Serverless endpoint is always created, because it is bound to this stack's collection. Everything else — security groups, any missing endpoints, the Aurora subnet group — is created inside your subnets exactly as in the default mode. Defaults deploy the `dev` environment with OpenSearch Dashboards browser access enabled for the role you deploy with. `config.yaml` is git-ignored.
 

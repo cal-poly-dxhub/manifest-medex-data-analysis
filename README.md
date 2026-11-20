@@ -543,6 +543,7 @@ Confirm that:
 - The key starts with `incoming/hl7/` or `incoming/ccda/`.
 - HL7 uses `.hl7` or `.txt`; CCDA uses `.xml`.
 - The EventBridge rule target and corresponding SQS queue are healthy.
+- In an existing VPC, indexing failures with `httpStatus: 401` almost always mean DNS: the OpenSearch Serverless hostname resolves to a public address. See DEPLOYMENT.md, "DNS requirement for existing VPCs".
 - The format's ECS service has running tasks. If tasks keep stopping, check the service events: `CannotPullContainerError` means the ECR or S3 endpoint path is blocked, and a placeholder image means the stack was deployed without `deploy.sh`.
 
 ### OpenSearch indexing fails for one large document
