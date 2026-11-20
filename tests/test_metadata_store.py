@@ -4,6 +4,7 @@ import pytest
 from src.metadata_store import (
     CREATE_INDEX_SQLS,
     CREATE_TABLE_SQL,
+    UPSERT_BATCH_SIZE,
     UPSERT_SQL,
     DataApiMetadataStore,
     MetadataRecord,
@@ -185,3 +186,30 @@ def test_data_api_errors_are_sanitized_without_original_details(
 
     assert captured.value.__cause__ is None
     assert "sensitive" not in str(captured.value)
+
+
+def test_large_upsert_is_split_into_bounded_batches_in_order() -> None:
+    client = FakeDataApi()
+    records = [_record(suffix=str(index)) for index in range(UPSERT_BATCH_SIZE * 2 + 7)]
+
+    _store(client).upsert(records)
+
+    sizes = [len(call["parameterSets"]) for call in client.batch_calls]
+    assert sizes == [UPSERT_BATCH_SIZE, UPSERT_BATCH_SIZE, 7]
+    written = [
+        parameters[0]["value"]["stringValue"]
+        for call in client.batch_calls
+        for parameters in call["parameterSets"]
+    ]
+    assert written == [record.document_id for record in records]
+
+
+def test_failed_batch_stops_the_upsert_and_is_sanitized() -> None:
+    client = FakeDataApi(batch_error=True)
+    records = [_record(suffix=str(index)) for index in range(UPSERT_BATCH_SIZE + 1)]
+
+    with pytest.raises(MetadataStoreError) as raised:
+        _store(client).upsert(records)
+
+    assert len(client.batch_calls) == 1
+    assert UPSERT_FAILURE_DETAIL not in str(raised.value)

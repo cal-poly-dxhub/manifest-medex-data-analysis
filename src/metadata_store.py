@@ -67,6 +67,11 @@ SQL_IDENTIFIER_PATTERN = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 INVALID_IDENTIFIER = "Aurora database and table names must be safe SQL identifiers"
 SCHEMA_INITIALIZATION_FAILED = "Aurora metadata schema initialization failed"
 UPSERT_FAILED = "Aurora metadata upsert failed"
+# One source file can hold thousands of HL7 messages. The Data API caps request size, so a
+# file's rows are written in bounded batches (each row is ~1.5 KB of parameters, so 500 rows
+# stay well under the limit). Batches commit independently; the upsert is idempotent, so a
+# retry after a partial write converges to the same rows.
+UPSERT_BATCH_SIZE = 500
 
 
 class MetadataStoreError(RuntimeError):
@@ -130,11 +135,14 @@ class DataApiMetadataStore:
             return
         self._ensure_schema()
         try:
-            self._client.batch_execute_statement(
-                **self._request,
-                sql=self._upsert_sql,
-                parameterSets=[_parameters(record) for record in records],
-            )
+            for start in range(0, len(records), UPSERT_BATCH_SIZE):
+                self._client.batch_execute_statement(
+                    **self._request,
+                    sql=self._upsert_sql,
+                    parameterSets=[
+                        _parameters(record) for record in records[start : start + UPSERT_BATCH_SIZE]
+                    ],
+                )
         except Exception:
             raise MetadataStoreError(UPSERT_FAILED) from None
 
