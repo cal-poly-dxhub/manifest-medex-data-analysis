@@ -12,6 +12,13 @@ SIGKILL after the container stop timeout. On SIGTERM every process stops polling
 the batch it already holds, deletes what succeeded, and exits, so stopping a task does not
 leave messages waiting for their visibility timeout.
 
+Long files: one SQS message is one source file, and a large multi-message HL7 file can take
+longer than the queue's visibility timeout (15 minutes). While a batch is being processed, a
+background heartbeat extends the visibility of the received messages every few minutes, so
+SQS never hands the same file to a second worker mid-processing. The heartbeat stops when
+the batch finishes, and gives up after MAX_PROCESSING_SECONDS so a hung handler cannot hold a
+message forever (it then returns to the queue and is retried normally).
+
 Environment:
     QUEUE_URL           queue to poll (required)
     FORMAT              hl7 | ccda (required); must match the handler's SOURCE_FORMAT
@@ -29,6 +36,7 @@ import multiprocessing
 import os
 import signal
 import sys
+import threading
 import time
 from collections.abc import Callable
 from multiprocessing.synchronize import Event as EventType
@@ -38,6 +46,9 @@ LOGGER = logging.getLogger("ingestion_worker")
 WAIT_SECONDS = 20
 ERROR_BACKOFF_SECONDS = 5
 SUPERVISOR_POLL_SECONDS = 2
+HEARTBEAT_SECONDS = 300  # extend visibility every 5 minutes while a batch is in progress
+VISIBILITY_EXTENSION_SECONDS = 900  # each extension restores the queue's 15-minute timeout
+MAX_PROCESSING_SECONDS = 6 * 3600  # stop extending after 6 hours (SQS allows up to 12)
 FORMATS = frozenset({"hl7", "ccda"})
 
 Handler = Callable[[dict[str, Any], Any], dict[str, list[dict[str, str]]]]
@@ -47,6 +58,62 @@ class _SqsClient(Protocol):
     def receive_message(self, **kwargs: Any) -> dict[str, Any]: ...
 
     def delete_message_batch(self, **kwargs: Any) -> dict[str, Any]: ...
+
+    def change_message_visibility_batch(self, **kwargs: Any) -> dict[str, Any]: ...
+
+
+class _VisibilityHeartbeat:
+    """Keep received messages invisible to other consumers while they are processed."""
+
+    def __init__(
+        self,
+        sqs: _SqsClient,
+        queue_url: str,
+        messages: list[dict[str, Any]],
+        *,
+        interval: float = HEARTBEAT_SECONDS,
+        max_seconds: float = MAX_PROCESSING_SECONDS,
+    ) -> None:
+        self._sqs = sqs
+        self._queue_url = queue_url
+        self._entries = [
+            {
+                "Id": str(index),
+                "ReceiptHandle": message["ReceiptHandle"],
+                "VisibilityTimeout": VISIBILITY_EXTENSION_SECONDS,
+            }
+            for index, message in enumerate(messages)
+        ]
+        self._interval = interval
+        self._max_seconds = max_seconds
+        self._done = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="visibility-heartbeat", daemon=True)
+        self.extensions = 0
+
+    def __enter__(self) -> _VisibilityHeartbeat:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._done.set()
+        self._thread.join()
+
+    def _run(self) -> None:
+        started = time.monotonic()
+        while not self._done.wait(self._interval):
+            if time.monotonic() - started >= self._max_seconds:
+                _log("visibility_heartbeat_stopped", messages=len(self._entries))
+                return
+            try:
+                self._sqs.change_message_visibility_batch(
+                    QueueUrl=self._queue_url, Entries=self._entries
+                )
+                self.extensions += 1
+                _log("visibility_extended", messages=len(self._entries), extensions=self.extensions)
+            except Exception as error:
+                # A failed extension is not fatal: the batch keeps processing, and at worst
+                # the message becomes visible again and is retried (writes are idempotent).
+                _log("visibility_extend_failed", errorType=type(error).__name__)
 
 
 class WorkerConfigError(ValueError):
@@ -130,7 +197,8 @@ def process_once(
     if not messages:
         return 0, 0
     try:
-        result = handler(_to_event(messages), None)
+        with _VisibilityHeartbeat(sqs, queue_url, messages):
+            result = handler(_to_event(messages), None)
     except Exception as error:
         # Leave the whole batch on the queue; it is retried after the visibility timeout.
         _log("batch_failed", errorType=type(error).__name__, messages=len(messages))

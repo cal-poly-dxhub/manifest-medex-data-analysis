@@ -1,6 +1,7 @@
 import json
 import logging
 import threading
+import time
 from typing import Any
 
 import pytest
@@ -12,6 +13,7 @@ class FakeSqs:
         self.batches = batches
         self.receive_calls: list[dict[str, Any]] = []
         self.deleted: list[dict[str, Any]] = []
+        self.visibility_calls: list[dict[str, Any]] = []
 
     def receive_message(self, **kwargs: Any) -> dict[str, Any]:
         self.receive_calls.append(kwargs)
@@ -21,6 +23,10 @@ class FakeSqs:
 
     def delete_message_batch(self, **kwargs: Any) -> dict[str, Any]:
         self.deleted.append(kwargs)
+        return {"Successful": [{"Id": entry["Id"]} for entry in kwargs["Entries"]]}
+
+    def change_message_visibility_batch(self, **kwargs: Any) -> dict[str, Any]:
+        self.visibility_calls.append(kwargs)
         return {"Successful": [{"Id": entry["Id"]} for entry in kwargs["Entries"]]}
 
 
@@ -161,3 +167,55 @@ def test_load_handler_returns_the_format_handler() -> None:
 
     assert worker.load_handler("hl7") is hl7_handler.handler
     assert worker.load_handler("ccda") is ccda_handler.handler
+
+
+def test_heartbeat_extends_visibility_while_a_long_batch_runs() -> None:
+    sqs = FakeSqs([])
+    with worker._VisibilityHeartbeat(sqs, "q", [_message(1), _message(2)], interval=0.02) as beat:
+        time.sleep(0.15)
+    calls_after_exit = len(sqs.visibility_calls)
+    time.sleep(0.06)
+
+    assert beat.extensions >= 3
+    assert len(sqs.visibility_calls) == calls_after_exit  # stops when the batch finishes
+    entries = sqs.visibility_calls[0]["Entries"]
+    assert [entry["ReceiptHandle"] for entry in entries] == ["r1", "r2"]
+    assert {entry["VisibilityTimeout"] for entry in entries} == {
+        worker.VISIBILITY_EXTENSION_SECONDS
+    }
+
+
+def test_heartbeat_gives_up_after_the_processing_cap(caplog: pytest.LogCaptureFixture) -> None:
+    sqs = FakeSqs([])
+    with (
+        caplog.at_level(logging.INFO, logger="ingestion_worker"),
+        worker._VisibilityHeartbeat(sqs, "q", [_message(1)], interval=0.02, max_seconds=0.05),
+    ):
+        time.sleep(0.2)
+
+    assert len(sqs.visibility_calls) <= 3
+    assert "visibility_heartbeat_stopped" in caplog.text
+
+
+def test_heartbeat_failures_do_not_stop_processing(caplog: pytest.LogCaptureFixture) -> None:
+    class BrokenVisibility(FakeSqs):
+        def change_message_visibility_batch(self, **_kwargs: Any) -> dict[str, Any]:
+            msg = "throttled with receipt r1"
+            raise ConnectionError(msg)
+
+    with (
+        caplog.at_level(logging.INFO, logger="ingestion_worker"),
+        worker._VisibilityHeartbeat(BrokenVisibility([]), "q", [_message(1)], interval=0.02),
+    ):
+        time.sleep(0.08)
+
+    assert "visibility_extend_failed" in caplog.text
+    assert "ConnectionError" in caplog.text
+    assert "r1" not in caplog.text
+
+
+def test_fast_batch_never_extends_visibility() -> None:
+    sqs = FakeSqs([[_message(1)]])
+
+    assert worker.process_once(sqs, _ok_handler, queue_url="q", batch_size=10) == (1, 0)
+    assert sqs.visibility_calls == []
