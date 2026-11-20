@@ -353,6 +353,7 @@ def _checked_chunks(
             raise ParseError(INVALID_SOURCE_ROUTE)
         if envelope is not None:
             _apply_envelope(documents, envelope, source)
+        _add_derived_fields(documents)
         produced = produced or bool(documents)
         yield documents
     if not produced:
@@ -453,6 +454,30 @@ def _apply_envelope(
             f"{source.bucket}\0{source.key}\0intake\0{ordinal}".encode()
         ).hexdigest()
         document.update(fields)
+
+
+SOURCE_MESSAGE_TYPES = {"hl7-v2": "HL7V2", "ccda": "CCDA"}
+PROCESSED_STATUS = "PROCESSED"
+
+
+def _add_derived_fields(documents: list[dict[str, Any]]) -> None:
+    """Add Prism's bookkeeping fields, computed after the envelope so its values win."""
+    for document in documents:
+        ingested = document.get("ingestTime")
+        if ingested:
+            document["createdTime"] = ingested
+            document["updatedTime"] = ingested
+            document.setdefault("messageReceivedDate", ingested)
+        patient_id = document.get("patientId")
+        if patient_id:
+            authority = document.get("patientIdAa")
+            document["patientFullId"] = f"{patient_id}^{authority}" if authority else patient_id
+        source_type = document.get("clinicalMessageType") or SOURCE_MESSAGE_TYPES.get(
+            str(document.get("sourceFormat"))
+        )
+        if source_type:
+            document["sourceMessageType"] = source_type
+        document["messageStatus"] = PROCESSED_STATUS
 
 
 def _write_parsed_documents(

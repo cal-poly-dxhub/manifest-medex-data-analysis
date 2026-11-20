@@ -104,7 +104,7 @@ def test_ccda_document_id_uses_bucket_key_and_raw_xml_content() -> None:
     checksum = hashlib.sha256(SYNTHETIC_CCDA).hexdigest()
     expected = hashlib.sha256(f"raw\0document.xml\0{checksum}".encode()).hexdigest()
 
-    assert first["parserVersion"] == "1.0.0"
+    assert first["parserVersion"] == "1.1.0"
     assert first["documentId"] == expected
     assert second["documentId"] == expected
     assert first["rawObject"]["sha256"] == checksum
@@ -244,3 +244,119 @@ def test_bad_batches_are_rejected(payload: bytes, message: str) -> None:
 
     with pytest.raises(ParseError, match=message):
         list(iter_ccda_documents(payload, SourceReference("bucket", "incoming/ccda/x.xml")))
+
+
+PRISM_CCDA = b"""<?xml version="1.0" encoding="UTF-8"?>
+<ClinicalDocument xmlns="urn:hl7-org:v3">
+  <id root="2.16.840.1.113883.19.5" extension="DOC-42"/>
+  <effectiveTime value="20260810120000-0700"/>
+  <recordTarget><patientRole>
+    <id root="2.16.840.1.113883.19.5.99" extension="MRN-1" assigningAuthorityName="KHS"/>
+  </patientRole></recordTarget>
+  <author>
+    <time value="20260810"/>
+    <assignedAuthor>
+      <id root="2.16.840.1.113883.4.6" extension="1234567890" assigningAuthorityName="NPI"/>
+      <id root="2.16.840.1.113883.19.5" extension="LOCAL-9"/>
+      <code code="207Q00000X" codeSystem="2.16.840.1.113883.6.101" codeSystemName="NUCC"
+            displayName="Family Medicine"/>
+      <addr use="WP"><streetAddressLine>1 Main St</streetAddressLine>
+        <streetAddressLine>Suite 2</streetAddressLine><city>Riverside</city>
+        <state>CA</state><postalCode>92501</postalCode><country>US</country></addr>
+      <telecom use="WP" value="tel:+1-555-0100"/>
+      <telecom value="mailto:doc@example.invalid"/>
+      <telecom use="HP" value="tel:+1-555-0101"/>
+      <assignedPerson>
+        <name><prefix>Dr.</prefix><given>Ann</given><given>B</given><family>Smith</family></name>
+      </assignedPerson>
+      <representedOrganization>
+        <id root="2.16.840.1.113883.19.5" extension="ORG-1"/>
+        <name>Synthetic Clinic</name>
+        <telecom use="WP" value="tel:+1-555-0199"/>
+      </representedOrganization>
+    </assignedAuthor>
+  </author>
+  <author>
+    <time value="202608101230"/>
+    <assignedAuthor>
+      <id root="2.16.840.1.113883.19.5" extension="DEVICE-1"/>
+      <assignedAuthoringDevice>
+        <manufacturerModelName>EHR Model</manufacturerModelName>
+        <softwareName>EHR 9</softwareName>
+      </assignedAuthoringDevice>
+    </assignedAuthor>
+  </author>
+  <component><structuredBody>
+    <component><section><code code="10154-3"/><title>Chief Complaint</title>
+      <text><paragraph>Synthetic   cough</paragraph> for 3 days</text></section></component>
+    <component><section><title>Reason for Visit</title>
+      <text>Follow-up</text></section></component>
+  </structuredBody></component>
+</ClinicalDocument>"""
+
+
+def test_prism_top_level_fields_and_authors() -> None:
+    document = parse_ccda_document(
+        PRISM_CCDA, SourceReference(bucket="raw", key="incoming/ccda/participant=F/x.xml")
+    )
+    assert document["sourceMessageId"] == "DOC-42"
+    assert document["patientId"] == "MRN-1"
+    assert document["patientIdAa"] == "KHS"
+    assert document["messageTime"] == document["clinicalTime"] == "2026-08-10T19:00:00Z"
+    assert len(document["sha256"]) == 64
+    assert document["chiefComplaint"] == "Synthetic cough for 3 days"
+    assert document["reasonForVisit"] == "Follow-up"
+
+    author = document["author"]
+    assert author["effectiveDate"] == {
+        "value": "2026-08-10T00:00:00Z",
+        "text": "20260810",
+        "resolution": "day",
+    }
+    assert author["identifier"] == {
+        "id": "1234567890",
+        "idAuthority": "2.16.840.1.113883.4.6",
+        "idFacility": "NPI",
+    }
+    assert author["identifierOther"] == {
+        "count": 1,
+        "entry": [{"id": "LOCAL-9", "idAuthority": "2.16.840.1.113883.19.5"}],
+    }
+    assert author["code"]["description"] == "Family Medicine"
+    assert author["address"] == {
+        "streetAddress": "1 Main St, Suite 2",
+        "city": "Riverside",
+        "state": "CA",
+        "zip": "92501",
+        "country": "US",
+        "use": "WP",
+    }
+    assert author["phone"] == {"phoneNumber": "+1-555-0100", "use": "WP"}
+    assert author["phoneOther"] == {
+        "count": 1,
+        "entry": [{"phoneNumber": "+1-555-0101", "use": "HP"}],
+    }
+    assert author["name"] == {
+        "firstName": "Ann",
+        "middleName": "B",
+        "lastName": "Smith",
+        "prefix": "Dr.",
+        "fullName": "Dr. Ann B Smith",
+    }
+    assert author["organization"]["name"] == "Synthetic Clinic"
+    assert author["organization"]["telecom"] == {"phoneNumber": "+1-555-0199", "use": "WP"}
+
+    (device,) = document["authorOther"]
+    assert device["deviceManufacturerModel"] == "EHR Model"
+    assert device["deviceSoftware"] == "EHR 9"
+    assert device["effectiveDate"]["resolution"] == "minute"
+
+
+def test_prism_fields_absent_when_document_has_none() -> None:
+    document = parse_ccda_document(
+        b"<ClinicalDocument xmlns='urn:hl7-org:v3'/>",
+        SourceReference(bucket="raw", key="incoming/ccda/x.xml"),
+    )
+    for name in ("author", "authorOther", "chiefComplaint", "reasonForVisit", "patientId"):
+        assert name not in document
+    assert len(document["sha256"]) == 64

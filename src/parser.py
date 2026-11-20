@@ -18,7 +18,7 @@ from src.customer_field_catalog import HL7_DATATYPE_CATALOG, HL7_FIELD_CATALOG
 
 # Bumping this marks every previously parsed document as stale for reingestion
 # accounting (reindexed_stale_parser). Bump deliberately, not for cosmetic changes.
-PARSER_VERSION = "1.0.0"
+PARSER_VERSION = "1.1.0"
 INVALID_UTF8 = "Raw object is not valid UTF-8"
 CONTENT_BEFORE_MSH = "Content appeared before the first MSH segment"
 MISSING_MSH = "No HL7 MSH segment was found"
@@ -314,7 +314,44 @@ def _parse_message(
     }
     if ingested_at is not None:
         document["ingestTime"] = ingested_at
+    document.update(
+        _prism_fields(
+            header,
+            next((segment for segment in parsed_segments if segment.name == "PID"), None),
+            message_checksum=message_checksum,
+            message_time=message_time,
+        )
+    )
     return document
+
+
+def _prism_fields(
+    header: _SegmentView,
+    pid: _SegmentView | None,
+    *,
+    message_checksum: str,
+    message_time: str | None,
+) -> dict[str, Any]:
+    """Prism-named top-level fields derived from the message itself.
+
+    Messages delivered through the intake API later have the patient, message, and
+    application values replaced by the sender's envelope; for files dropped into S3 these
+    content values are the only source.
+    """
+    message_type = header.component(9, 1)
+    trigger_event = header.component(9, 2)
+    fields: dict[str, Any] = {
+        "sha256": message_checksum,
+        "clinicalTime": message_time,
+        "sourceMessageId": header.field(10),
+        "sendingApplication": header.component(3, 1),
+        "messageEventType": f"{message_type}_{trigger_event}" if trigger_event else message_type,
+    }
+    if pid is not None:
+        # PID-3 first repetition: CX.1 is the identifier, CX.4.1 its assigning authority.
+        fields["patientId"] = pid.component(3, 1)
+        fields["patientIdAa"] = pid.component(3, 4).split(pid.subcomponent_separator, 1)[0]
+    return {name: value for name, value in fields.items() if value not in (None, "")}
 
 
 def _parse_with_library(message: str) -> Message:

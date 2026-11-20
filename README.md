@@ -113,17 +113,40 @@ The HL7 parser supports:
 
 The indexed `ROOT` projection is driven by the committed customer field catalog. It contains 621 unambiguous, standards-backed HL7 v2.6 fields across 30 segment families whose exact output labels occur in the August 24 Kibana export. Composite datatype and subcomponent names are projected recursively, and repetitions remain arrays. Elasticsearch metadata, Prism enrichment keys, derived `_text`/`_resolution`/`_string` fields, and numeric nodes beyond valid segment ranges are intentionally excluded. `segmentCounts` still records every observed segment type; locally defined segments remain counted but are not fabricated into the customer projection.
 
-Parser output identifies the implementation as version `1.0.0`. HL7 document IDs are `SHA-256(bucket + key + SHA-256(normalized message))`; exact duplicate messages under one S3 key collapse to the first occurrence and retain its `messageOrdinal`. S3 version IDs and ETags remain provenance metadata but do not affect HL7 identity.
+Parser output identifies the implementation as version `1.1.0`. HL7 document IDs are `SHA-256(bucket + key + SHA-256(normalized message))`; exact duplicate messages under one S3 key collapse to the first occurrence and retain its `messageOrdinal`. S3 version IDs and ETags remain provenance metadata but do not affect HL7 identity.
 
 ## CCDA processing
 
 CCDA XML is parsed with `defusedxml`. The parser rejects DTDs, entities, external references, excessive markup, unsafe nesting depth, malformed XML, and roots other than `ClinicalDocument`.
 
-The indexed `CD` projection covers structured fields used by supplied dashboard queries for patient role, custodian, medications, immunizations, problems, procedures, results, vital signs, and social history. Seven canonical sections are resolved by their standard LOINC codes. Other structured sections can be resolved by title or code display name through 108 normalized concepts representing all 116 exact section aliases observed in the August 24 Kibana export. Recognized sections generically project supported `substanceAdministration`, `organizer`, `act`, `observation`, and `procedure` entries. Narrative section bodies remain intentionally excluded.
+The indexed `CD` projection covers structured fields used by supplied dashboard queries for patient role, custodian, medications, immunizations, problems, procedures, results, vital signs, and social history. Seven canonical sections are resolved by their standard LOINC codes. Other structured sections can be resolved by title or code display name through 108 normalized concepts representing all 116 exact section aliases observed in the August 24 Kibana export. Recognized sections generically project supported `substanceAdministration`, `organizer`, `act`, `observation`, and `procedure` entries. Narrative section bodies remain excluded from `CD`; only chief complaint and reason for visit are copied to top-level fields (see below).
 
 A file may also contain **several concatenated CCDA documents** (each with or without its own `<?xml?>` declaration). The XML parser itself splits them, so text inside comments or CDATA cannot cause a false split. Each document is parsed with the same protections and stored as its own document with a `documentOrdinal`; its ID uses the document's own content, so exact duplicates in one file collapse. Concatenated files must be UTF-8. Single-document files are unchanged.
 
-CCDA parser output identifies the implementation as version `1.0.0`. CCDA document IDs are `SHA-256(bucket + key + SHA-256(exact raw XML bytes))` (for a document within a multi-document file, the SHA-256 of that document's XML). Identical XML bytes under one S3 key resolve to the same logical document across source versions; byte-level formatting changes create a new ID. S3 version IDs and ETags remain provenance metadata but do not affect CCDA identity.
+CCDA parser output identifies the implementation as version `1.1.0`. CCDA document IDs are `SHA-256(bucket + key + SHA-256(exact raw XML bytes))` (for a document within a multi-document file, the SHA-256 of that document's XML). Identical XML bytes under one S3 key resolve to the same logical document across source versions; byte-level formatting changes create a new ID. S3 version IDs and ETags remain provenance metadata but do not affect CCDA identity.
+
+## Prism top-level fields
+
+Besides `ROOT` (HL7) and `CD` (CCDA), documents carry the top-level fields of the customer's Prism indexes (August 24 Kibana export), with the same names and types. The index mappings declare them; an index created by an earlier version gets the missing ones added on the first write after upgrading (fields it already has keep their type).
+
+| Field | HL7 | CCDA |
+| --- | --- | --- |
+| `patientId`, `patientIdAa` | PID-3 first repetition (CX.1, CX.4.1) | `recordTarget/patientRole/id` (`@extension`; `@assigningAuthorityName`, else `@root`) |
+| `sourceMessageId` | MSH-10 | `ClinicalDocument/id` (`@extension`, else `@root`) |
+| `sendingApplication` | MSH-3.1 | envelope only |
+| `messageEventType` | MSH-9 as `ADT_A08` | envelope only |
+| `messageTime`, `clinicalTime` | MSH-7 | `effectiveTime` |
+| `sha256` | SHA-256 of the normalized message | SHA-256 of the document XML |
+| `createdTime`, `updatedTime` | ingestion time of this write | same |
+| `messageReceivedDate` | envelope, else ingestion time | same |
+| `patientFullId` | `patientId^patientIdAa` | same |
+| `sourceMessageType` | `HL7V2` | `CCDA` |
+| `messageStatus` | `PROCESSED` | same |
+| `author`, `authorOther` | — | first CDA author, and the rest: name, identifiers, code, address, phones, device, organization, and time, in Prism's `x` / `xOther {count, entry}` shape |
+| `chiefComplaint`, `reasonForVisit` | — | narrative text of section 10154-3 / 29299-5 (46239-0 fills both), or a section titled so; whitespace collapsed, first 2,000 characters |
+| `patientMpiId`, `patientMpiId_old`, `sourceFacility`, `messageProcessedLevel`, `resultType`, `sourceLastUpdatedTime`, `timeZoneId` | envelope only | envelope only |
+
+For messages received through the intake API, envelope values replace the values read from the message. Prism-internal fields are not produced: `*Keys` (allergy, condition, medication, and so on), `documentKey`, `messageKey`, `messagePatientKey`, `visitKey`, `carePlanKey`, `objectKey`, `objectKeyRaw`, `entityType`, `messageIteration`, `createdBy`, `updatedBy`, and `prism.*`. They reference records and processing inside Prism.
 
 ## Metadata contract
 
@@ -593,6 +616,8 @@ Correct the context values rather than bypassing validation.
 - Duplicates are collapsed only within one file. Document IDs include the S3 key, so the same message in two files, or a file re-uploaded under a different key, becomes two documents.
 - HL7 files and multi-document CCDA files must be UTF-8.
 - Existing raw objects are not backfilled automatically.
+- Some Prism top-level fields follow a chosen definition rather than a confirmed Prism one: `patientFullId` (`id^authority`), `sourceMessageType` (`HL7V2`/`CCDA`), `messageStatus` (`PROCESSED`), `clinicalTime` (message or document time), and `createdTime`/`updatedTime` (time of this write, so a re-sent message gets a new `createdTime`). Prism-internal key fields are not produced.
+- Documents indexed before parser 1.1.0 lack the Prism top-level fields until their raw files are processed again; parsed-zone reingestion restores them unchanged. In an index created before 1.1.0, a field that was already mapped dynamically keeps that type (for example envelope strings as `text` in the CCDA index).
 
 **Ingestion and scale**
 
@@ -609,7 +634,7 @@ Correct the context values rather than bypassing validation.
 - A `200` response means the message was stored, not that it parsed. Parse failures afterwards are not reported back to the sender; they appear in the error bucket, worker logs, and DLQ.
 - Only `POST /prism/ods/clinical-message` (and `/clinical-message`) and an authenticated status check are implemented; other Prism endpoints are not.
 - Requests are capped at `intake_max_request_mb` (150 MB). The load balancer accepts chunked uploads and forwards them with a `Content-Length`; a client connecting to the service directly (bypassing it) must send `Content-Length`. Each request reserves three times its size from a per-task budget of one third of the task memory (about 1.3 GiB at the default 4 GB), so a task handles roughly four 100 MB requests at once; others wait up to 30 seconds, then get `503` ("Busy, retry later").
-- Envelope fields (patient IDs, MPI ID, facility, and the rest) are merged into the parsed JSON and the search index, not into the Aurora `document_metadata` table, so the explorer's SQL console cannot filter on them. Files dropped directly into S3 have no envelope fields.
+- Envelope fields (patient IDs, MPI ID, facility, and the rest) are merged into the parsed JSON and the search index, not into the Aurora `document_metadata` table, so the explorer's SQL console cannot filter on them. Files dropped directly into S3 get the patient and message fields read from the content (see Prism top-level fields), but not envelope-only ones such as the MPI ID.
 - Free-form `otherAttributes` over 200 values or 5 levels are dropped.
 - A re-sent message replaces the earlier one in the order the workers finish them, not the order they were sent. If the first copy fails and its retry finishes after the re-send, the older content wins. Re-send again to correct it.
 - The request archive keeps a full copy of every accepted request, including PHI, for `intake_archive_retention_days` (90).

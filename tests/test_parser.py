@@ -139,7 +139,7 @@ def test_library_parsing_handles_custom_delimiters_and_unknown_segments() -> Non
 
     document = parse_hl7_file(payload.encode(), SourceReference(bucket="raw", key="custom.hl7"))[0]
 
-    assert document["parserVersion"] == "1.0.0"
+    assert document["parserVersion"] == "1.1.0"
     assert document["sourceFacilityId"] == "FACILITY"
     assert document["messageType"] == "ORU"
     assert document["triggerEvent"] == "R01"
@@ -292,3 +292,30 @@ def test_first_pass_rejects_bad_files_before_any_write(payload: bytes, message: 
 
     with pytest.raises(ParseError, match=message):
         scan_hl7_stream([payload])
+
+
+def test_prism_fields_come_from_the_message() -> None:
+    message = (
+        b"MSH|^~\\&|LAB_APP^1.2&ISO|FAC_A|DEST|DEST|20260810120000-0700||ORU^R01|CTRL-9|P|2.5.1\r"
+        b"PID|1||MRN-77^^^KHS&1.2.840.1&ISO^MR~ALT-1^^^OTHER||Doe^Jane\r"
+    )
+    (document,) = parse_hl7_file(
+        message, SourceReference(bucket="raw", key="incoming/hl7/x.hl7"), ingested_at="t"
+    )
+    assert document["patientId"] == "MRN-77"
+    assert document["patientIdAa"] == "KHS"
+    assert document["sourceMessageId"] == "CTRL-9"
+    assert document["sendingApplication"] == "LAB_APP"
+    assert document["messageEventType"] == "ORU_R01"
+    assert document["clinicalTime"] == document["messageTime"] == "2026-08-10T19:00:00Z"
+    assert len(document["sha256"]) == 64
+
+
+def test_prism_patient_fields_are_omitted_without_pid() -> None:
+    (document,) = parse_hl7_file(
+        b"MSH|^~\\&|APP|FAC|DEST|DEST|20260810120000||ACK|C1|P|2.5.1\r",
+        SourceReference(bucket="raw", key="incoming/hl7/ack.hl7"),
+    )
+    assert "patientId" not in document
+    assert "patientIdAa" not in document
+    assert document["messageEventType"] == "ACK"

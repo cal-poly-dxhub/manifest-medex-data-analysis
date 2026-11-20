@@ -570,6 +570,12 @@ def test_intake_envelope_fields_are_merged_and_identity_is_stable(
     assert parsed["messageProcessedLevel"] == "PROCESSED"
     assert parsed["otherAttributes"] == {"isPartTwo": True, "testFlag": 1}
     assert parsed["contentOtherAttributes"] == {"lane": "a"}
+    # Envelope values win over the ones read from the message (PID-3, MSH-3, MSH-9).
+    assert parsed["sendingApplication"] == "Rhapsody"
+    assert parsed["patientFullId"] == "12345^KHS"
+    assert parsed["sourceMessageType"] == "HL7V2"
+    # messageReceivedDate comes from the envelope, createdTime from ingestion.
+    assert parsed["createdTime"] == parsed["ingestTime"] != parsed["messageReceivedDate"]
 
     # A corrected re-send (same key, different content) keeps the same document identity.
     corrected = EnvelopeS3(SYNTHETIC_HL7.replace(b"MSG-1", b"MSG-1-FIX"), ENVELOPE)
@@ -635,7 +641,21 @@ def test_files_uploaded_directly_never_look_for_an_envelope(
     )
     assert all(not call["Key"].startswith("envelopes/") for call in s3.get_calls)
     parsed = json.loads(next(c for c in s3.put_calls if c["Bucket"] == "parsed-bucket")["Body"])
-    assert "patientId" not in parsed
+    # Without an envelope, Prism fields come from the message itself; envelope-only
+    # fields (MPI ID, facility name, processed level) stay absent.
+    assert parsed["patientId"] == "SYNTHETIC-ID"
+    assert parsed["patientFullId"] == "SYNTHETIC-ID"
+    assert parsed["sourceMessageId"] == "MSG-1"
+    assert parsed["sendingApplication"] == "SYNTH"
+    assert parsed["messageEventType"] == "ORU_R01"
+    assert parsed["sourceMessageType"] == "HL7V2"
+    assert parsed["messageStatus"] == "PROCESSED"
+    assert parsed["createdTime"] == parsed["updatedTime"] == parsed["ingestTime"]
+    assert parsed["messageReceivedDate"] == parsed["ingestTime"]
+    assert parsed["clinicalTime"] == parsed["messageTime"]
+    assert len(parsed["sha256"]) == 64
+    for envelope_only in ("patientMpiId", "sourceFacility", "messageProcessedLevel"):
+        assert envelope_only not in parsed
 
 
 def test_envelope_key_mapping() -> None:

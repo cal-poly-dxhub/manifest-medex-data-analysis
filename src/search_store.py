@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import urllib.error
 import urllib.request
@@ -40,6 +41,102 @@ _ALLOWED_BACKEND_ERROR_TYPES = frozenset(
     }
 )
 
+LOGGER = logging.getLogger(__name__)
+
+# ---- Prism top-level fields --------------------------------------------------------------
+# Field names and types follow the customer's Prism index export (August 24 Kibana field
+# list). Declared explicitly so both indexes use Prism's types instead of each index's
+# dynamic default (keyword for HL7, text + keyword for CCDA).
+_KEYWORD: dict[str, Any] = {"type": "keyword", "ignore_above": 2048}
+_TEXT_KEYWORD: dict[str, Any] = {
+    "type": "text",
+    "fields": {"keyword": {"type": "keyword", "ignore_above": 2048}},
+}
+_DATE: dict[str, Any] = {"type": "date"}
+
+
+def _object(**properties: dict[str, Any]) -> dict[str, Any]:
+    return {"properties": properties}
+
+
+def _keywords(*names: str) -> dict[str, Any]:
+    return _object(**dict.fromkeys(names, _KEYWORD))
+
+
+def _other(entry: dict[str, Any]) -> dict[str, Any]:
+    return _object(count={"type": "long"}, entry=entry)
+
+
+_IDENTIFIER = _keywords("id", "idAuthority", "idFacility")
+_ADDRESS = _keywords("streetAddress", "city", "county", "state", "zip", "country", "use")
+_PHONE = _keywords("phoneNumber", "use")
+_NAME = _keywords("firstName", "middleName", "lastName", "prefix", "suffix", "fullName")
+_AUTHOR = _object(
+    effectiveDate=_object(value=_DATE, text=_KEYWORD, resolution=_KEYWORD),
+    identifier=_IDENTIFIER,
+    identifierOther=_other(_IDENTIFIER),
+    code=_object(
+        code=_TEXT_KEYWORD,
+        codeSystem=_TEXT_KEYWORD,
+        codeSystemName=_TEXT_KEYWORD,
+        description=_KEYWORD,
+    ),
+    address=_ADDRESS,
+    phone=_PHONE,
+    phoneOther=_other(_PHONE),
+    name=_NAME,
+    nameOther=_other(_NAME),
+    deviceManufacturerModel=_KEYWORD,
+    deviceSoftware=_KEYWORD,
+    organization=_object(
+        name=_KEYWORD,
+        identifier=_IDENTIFIER,
+        identifierOther=_other(_IDENTIFIER),
+        address=_ADDRESS,
+        telecom=_PHONE,
+        telecomOther=_other(_PHONE),
+    ),
+)
+PRISM_COMMON_PROPERTIES: dict[str, Any] = {
+    **dict.fromkeys(
+        (
+            "patientId",
+            "patientIdAa",
+            "patientMpiId",
+            "patientMpiId_old",
+            "sourceFacility",
+            "sourceMessageId",
+            "sendingApplication",
+            "messageProcessedLevel",
+            "resultType",
+            "sha256",
+            "messageStatus",
+            "sourceMessageType",
+        ),
+        _KEYWORD,
+    ),
+    "messageEventType": _TEXT_KEYWORD,
+    "patientFullId": _TEXT_KEYWORD,
+    **dict.fromkeys(
+        (
+            "createdTime",
+            "updatedTime",
+            "clinicalTime",
+            "messageReceivedDate",
+            "sourceLastUpdatedTime",
+        ),
+        _DATE,
+    ),
+}
+PRISM_CCDA_PROPERTIES: dict[str, Any] = {
+    "messageTime": _DATE,
+    "timeZoneId": _KEYWORD,
+    "chiefComplaint": _KEYWORD,
+    "reasonForVisit": _KEYWORD,
+    "author": _AUTHOR,
+    "authorOther": _AUTHOR,
+}
+
 # The customer-backed projection can produce ~6,700 distinct object and leaf paths.
 INDEX_TOTAL_FIELDS_LIMIT = 10_000
 
@@ -71,6 +168,7 @@ HL7_INDEX_MAPPING: dict[str, Any] = {
             # only, no UpdateIndex) is not permitted to perform.
             "originalIngestTime": {"type": "date"},
             "rawObject": {"type": "object", "enabled": False},
+            **PRISM_COMMON_PROPERTIES,
         },
     },
 }
@@ -100,6 +198,8 @@ CCDA_INDEX_MAPPING: dict[str, Any] = {
             "ingestTime": {"type": "date"},
             "originalIngestTime": {"type": "date"},
             "rawObject": {"type": "object", "enabled": False},
+            **PRISM_COMMON_PROPERTIES,
+            **PRISM_CCDA_PROPERTIES,
         },
     },
 }
@@ -219,6 +319,69 @@ def _ensure_index(
             http_status=status,
             backend_error_type=_response_error_type(response),
         )
+    elif index_name not in _MAPPINGS_CHECKED:
+        _add_missing_properties(transport, index_name, mapping["mappings"]["properties"])
+    _MAPPINGS_CHECKED.add(index_name)
+
+
+# Indexes whose mapping this process already brought up to date (once per process).
+_MAPPINGS_CHECKED: set[str] = set()
+
+
+def _add_missing_properties(
+    transport: SearchTransport, index_name: str, declared: dict[str, Any]
+) -> None:
+    """Add declared top-level fields an older index lacks, without touching existing ones.
+
+    Indexes created by an earlier version only have that version's explicit mappings.
+    Adding new properties is allowed on a live index; changing an existing field's type is
+    not, so fields already present (explicitly or dynamically) are left as they are. A
+    failure here only means new fields fall back to dynamic mapping, so it never blocks
+    ingestion.
+    """
+    index_path = f"/{quote(index_name, safe='')}/_mapping"
+    status, response = transport.request("GET", index_path)
+    if status < 200 or status >= 300:
+        _log_mapping_issue(index_name, "lookup", status, response)
+        return
+    current: dict[str, Any] = (
+        next(iter(response.values()), {}) if isinstance(response, dict) else {}
+    )
+    existing = set((current.get("mappings") or {}).get("properties") or {})
+    missing = {name: value for name, value in declared.items() if name not in existing}
+    if not missing:
+        return
+    status, response = transport.request(
+        "PUT", index_path, json.dumps({"properties": missing}, separators=(",", ":")).encode()
+    )
+    if status < 200 or status >= 300:
+        _log_mapping_issue(index_name, "update", status, response)
+        return
+    LOGGER.info(
+        json.dumps(
+            {"event": "index_mapping_extended", "index": index_name, "fields": len(missing)},
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
+
+
+def _log_mapping_issue(index_name: str, step: str, status: int, response: object) -> None:
+    LOGGER.warning(
+        json.dumps(
+            {
+                "event": "index_mapping_update_skipped",
+                "index": index_name,
+                "step": step,
+                "httpStatus": status,
+                "backendErrorType": _response_error_type(response)
+                if isinstance(response, dict)
+                else None,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
 
 
 def _require_index(transport: SearchTransport, index_name: str) -> None:

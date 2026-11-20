@@ -409,3 +409,154 @@ def test_create_index_false_fails_clearly_when_index_is_missing() -> None:
     assert captured.value.http_status == 404
     # No creation attempt and no bulk write were made.
     assert [call[0] for call in transport.calls] == ["HEAD"]
+
+
+# ---- Prism field mappings ------------------------------------------------------------------
+
+# Top-level fields from the customer's Prism export that this platform produces (Prism-internal
+# *Keys, documentKey/messageKey/objectKey, entityType, messageIteration, createdBy/updatedBy,
+# and prism.* are intentionally absent).
+PRISM_HL7_FIELDS = {
+    "clinicalTime": "date",
+    "createdTime": "date",
+    "updatedTime": "date",
+    "messageReceivedDate": "date",
+    "sourceLastUpdatedTime": "date",
+    "messageTime": "date",
+    "messageEventType": "text",
+    "patientFullId": "text",
+    **dict.fromkeys(
+        (
+            "messageProcessedLevel",
+            "messageStatus",
+            "patientId",
+            "patientIdAa",
+            "patientMpiId",
+            "patientMpiId_old",
+            "resultType",
+            "sendingApplication",
+            "sha256",
+            "sourceFacility",
+            "sourceFacilityId",
+            "sourceMessageId",
+            "sourceMessageType",
+        ),
+        "keyword",
+    ),
+}
+PRISM_CCDA_FIELDS = {
+    **PRISM_HL7_FIELDS,
+    "timeZoneId": "keyword",
+    "chiefComplaint": "keyword",
+    "reasonForVisit": "keyword",
+}
+
+
+@pytest.mark.parametrize(
+    ("mapping_name", "expected"),
+    [("HL7_INDEX_MAPPING", PRISM_HL7_FIELDS), ("CCDA_INDEX_MAPPING", PRISM_CCDA_FIELDS)],
+)
+def test_new_indexes_declare_prism_field_types(mapping_name: str, expected: dict[str, str]) -> None:
+    from src import search_store
+
+    properties = getattr(search_store, mapping_name)["mappings"]["properties"]
+    assert {name: properties[name]["type"] for name in expected} == expected
+
+
+def test_ccda_author_mapping_matches_prism_shape() -> None:
+    from src.search_store import CCDA_INDEX_MAPPING
+
+    properties = CCDA_INDEX_MAPPING["mappings"]["properties"]
+    for name in ("author", "authorOther"):
+        author = properties[name]["properties"]
+        assert author["name"]["properties"]["fullName"]["type"] == "keyword"
+        assert author["nameOther"]["properties"]["count"]["type"] == "long"
+        assert author["effectiveDate"]["properties"]["value"]["type"] == "date"
+        assert author["code"]["properties"]["code"]["type"] == "text"
+        assert author["code"]["properties"]["description"]["type"] == "keyword"
+        organization = author["organization"]["properties"]
+        assert organization["telecom"]["properties"]["phoneNumber"]["type"] == "keyword"
+        assert organization["identifierOther"]["properties"]["entry"]["properties"]["id"]
+
+
+def _existing_index_transport(existing: dict[str, Any], put_status: int = 200) -> FakeTransport:
+    return FakeTransport(
+        [
+            (200, {}),  # HEAD: index exists
+            (200, {"hl7-messages-v1": {"mappings": {"properties": existing}}}),  # GET _mapping
+            (put_status, {"acknowledged": True}),  # PUT _mapping
+            (200, {"items": [{"index": {"status": 201}}]}),  # bulk
+        ]
+    )
+
+
+def test_existing_index_gains_only_the_missing_declared_fields() -> None:
+    from src import search_store
+
+    search_store._MAPPINGS_CHECKED.clear()
+    # An older index: patientId was dynamically mapped earlier and must not be redeclared.
+    transport = _existing_index_transport({"documentId": {}, "patientId": {"type": "keyword"}})
+
+    index_documents([_document()], transport)
+
+    methods = [(method, path) for method, path, _ in transport.calls]
+    assert methods == [
+        ("HEAD", "/hl7-messages-v1"),
+        ("GET", "/hl7-messages-v1/_mapping"),
+        ("PUT", "/hl7-messages-v1/_mapping"),
+        ("POST", "/_bulk"),
+    ]
+    added = json.loads(cast(bytes, transport.calls[2][2]))["properties"]
+    assert "patientId" not in added
+    assert "documentId" not in added
+    assert added["sha256"]["type"] == "keyword"
+    assert added["createdTime"]["type"] == "date"
+
+    # Checked once per process: the next batch goes straight to bulk.
+    transport.responses = [(200, {}), (200, {"items": [{"index": {"status": 201}}]})]
+    index_documents([_document("doc-2")], transport)
+    assert [method for method, _, _ in transport.calls[4:]] == ["HEAD", "POST"]
+
+
+def test_up_to_date_index_issues_no_mapping_update() -> None:
+    from src import search_store
+    from src.search_store import HL7_INDEX_MAPPING
+
+    search_store._MAPPINGS_CHECKED.clear()
+    current: dict[str, Any] = {name: {} for name in HL7_INDEX_MAPPING["mappings"]["properties"]}
+    transport = FakeTransport(
+        [
+            (200, {}),
+            (200, {"hl7-messages-v1": {"mappings": {"properties": current}}}),
+            (200, {"items": [{"index": {"status": 201}}]}),
+        ]
+    )
+    index_documents([_document()], transport)
+    assert [method for method, _, _ in transport.calls] == ["HEAD", "GET", "POST"]
+
+
+@pytest.mark.parametrize("failing_step", ["lookup", "update"])
+def test_mapping_upgrade_failure_never_blocks_indexing(
+    failing_step: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    from src import search_store
+
+    search_store._MAPPINGS_CHECKED.clear()
+    if failing_step == "lookup":
+        transport = FakeTransport(
+            [
+                (200, {}),
+                (403, {"error": {"type": "security_exception"}}),
+                (200, {"items": [{"index": {"status": 201}}]}),
+            ]
+        )
+    else:
+        transport = _existing_index_transport({}, put_status=400)
+
+    with caplog.at_level("WARNING"):
+        index_documents([_document()], transport)
+
+    assert transport.calls[-1][0] == "POST"
+    event = json.loads(caplog.records[-1].getMessage())
+    assert event["event"] == "index_mapping_update_skipped"
+    assert event["step"] == failing_step

@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from typing import Any
@@ -20,7 +20,7 @@ from src.parser import ParseError, SourceReference
 
 # Bumping this marks every previously parsed document as stale for reingestion
 # accounting (reindexed_stale_parser). Bump deliberately, not for cosmetic changes.
-PARSER_VERSION = "1.0.0"
+PARSER_VERSION = "1.1.0"
 INVALID_XML = "Raw object is not a safe, well-formed XML document"
 INVALID_DOCUMENT = "XML root is not an HL7 ClinicalDocument"
 XML_TOO_COMPLEX = "XML document exceeds the configured structural complexity limit"
@@ -227,7 +227,186 @@ def _document_from_root(
     }
     if ingested_at is not None:
         document["ingestTime"] = ingested_at
+    document.update(_prism_fields(root, identity_checksum, document["documentTime"]))
     return document
+
+
+# Narrative sections Prism exposes as top-level text. 46239-0 carries both values.
+_CHIEF_COMPLAINT_CODES = frozenset({"10154-3", "46239-0"})
+_REASON_FOR_VISIT_CODES = frozenset({"29299-5", "46239-0"})
+MAX_NARRATIVE_CHARACTERS = 2_000
+
+
+def _prism_fields(root: Element, checksum: str, document_time: str | None) -> dict[str, Any]:
+    """Prism-named top-level fields derived from the document itself.
+
+    Messages delivered through the intake API later have the patient and message values
+    replaced by the sender's envelope; for files dropped into S3 these are the only source.
+    """
+    patient_identifier = _child(_child(_child(root, "recordTarget"), "patientRole"), "id")
+    document_identifier = _child(root, "id")
+    authors = [author for item in _children(root, "author") if (author := _author(item))]
+    fields: dict[str, Any] = {
+        "sha256": checksum,
+        "messageTime": document_time,
+        "clinicalTime": document_time,
+        "sourceMessageId": _attribute(document_identifier, "extension")
+        or _attribute(document_identifier, "root"),
+        "patientId": _attribute(patient_identifier, "extension"),
+        "patientIdAa": _attribute(patient_identifier, "assigningAuthorityName")
+        or _attribute(patient_identifier, "root"),
+        "author": authors[0] if authors else None,
+        "authorOther": authors[1:] or None,
+        "chiefComplaint": _narrative(root, _CHIEF_COMPLAINT_CODES, "chief complaint"),
+        "reasonForVisit": _narrative(root, _REASON_FOR_VISIT_CODES, "reason for visit"),
+    }
+    return {name: value for name, value in fields.items() if value not in (None, "", [], {})}
+
+
+def _narrative(root: Element, codes: frozenset[str], title: str) -> str | None:
+    """Return a section's narrative text (whitespace collapsed, bounded) by code or title."""
+    for section in root.findall(".//{*}structuredBody/{*}component/{*}section"):
+        code = _attribute(_child(section, "code"), "code")
+        section_title = (_text(_child(section, "title")) or "").casefold()
+        if code in codes or (code is None and title in section_title):
+            text = " ".join("".join(_child_text(section)).split())
+            if text:
+                return text[:MAX_NARRATIVE_CHARACTERS]
+    return None
+
+
+def _child_text(section: Element) -> list[str]:
+    text = _child(section, "text")
+    return list(text.itertext()) if text is not None else []
+
+
+def _author(element: Element) -> dict[str, Any] | None:
+    """Project one CDA author into Prism's author shape."""
+    assigned = _child(element, "assignedAuthor")
+    if assigned is None:
+        return None
+    person = _child(assigned, "assignedPerson")
+    device = _child(assigned, "assignedAuthoringDevice")
+    code = _child(assigned, "code")
+    names = [name for item in _children(person, "name") if (name := _prism_name(item))]
+    author = {
+        "effectiveDate": _prism_date(_attribute(_child(element, "time"), "value")),
+        **_first_and_other("identifier", [_prism_identifier(i) for i in _children(assigned, "id")]),
+        "code": _compact_dict(
+            {
+                "code": _attribute(code, "code"),
+                "codeSystem": _attribute(code, "codeSystem"),
+                "codeSystemName": _attribute(code, "codeSystemName"),
+                "description": _attribute(code, "displayName"),
+            }
+        ),
+        "address": _prism_address(_child(assigned, "addr")),
+        **_first_and_other("phone", _prism_phones(assigned)),
+        **_first_and_other("name", names),
+        "deviceManufacturerModel": _text(_child(device, "manufacturerModelName")),
+        "deviceSoftware": _text(_child(device, "softwareName")),
+        "organization": _prism_organization(_child(assigned, "representedOrganization")),
+    }
+    return _compact_dict(author) or None
+
+
+def _first_and_other(name: str, values: Sequence[dict[str, Any] | None]) -> dict[str, Any]:
+    """Prism keeps the first value under ``name`` and the rest under ``nameOther``."""
+    present = [value for value in values if value]
+    if not present:
+        return {}
+    projected: dict[str, Any] = {name: present[0]}
+    if len(present) > 1:
+        projected[f"{name}Other"] = {"count": len(present) - 1, "entry": present[1:]}
+    return projected
+
+
+def _prism_identifier(element: Element) -> dict[str, Any] | None:
+    return (
+        _compact_dict(
+            {
+                "id": element.get("extension") or element.get("root"),
+                "idAuthority": element.get("root") if element.get("extension") else None,
+                "idFacility": element.get("assigningAuthorityName"),
+            }
+        )
+        or None
+    )
+
+
+def _prism_name(element: Element) -> dict[str, Any] | None:
+    given = [value for item in _children(element, "given") if (value := _text(item))]
+    family = _text(_child(element, "family"))
+    prefix = _text(_child(element, "prefix"))
+    suffix = _text(_child(element, "suffix"))
+    full = " ".join(part for part in (prefix, *given, family, suffix) if part)
+    return (
+        _compact_dict(
+            {
+                "firstName": given[0] if given else None,
+                "middleName": " ".join(given[1:]) or None,
+                "lastName": family,
+                "prefix": prefix,
+                "suffix": suffix,
+                "fullName": full or _text(element),
+            }
+        )
+        or None
+    )
+
+
+def _prism_address(element: Element | None) -> dict[str, Any] | None:
+    if element is None:
+        return None
+    lines = [value for item in _children(element, "streetAddressLine") if (value := _text(item))]
+    return (
+        _compact_dict(
+            {
+                "streetAddress": ", ".join(lines) or None,
+                "city": _text(_child(element, "city")),
+                "county": _text(_child(element, "county")),
+                "state": _text(_child(element, "state")),
+                "zip": _text(_child(element, "postalCode")),
+                "country": _text(_child(element, "country")),
+                "use": element.get("use"),
+            }
+        )
+        or None
+    )
+
+
+def _prism_phones(parent: Element | None) -> list[dict[str, Any] | None]:
+    phones: list[dict[str, Any] | None] = []
+    for item in _children(parent, "telecom"):
+        value = item.get("value") or ""
+        if value.lower().startswith(("tel:", "fax:")):
+            number = value.split(":", 1)[1].strip()
+            phones.append(_compact_dict({"phoneNumber": number, "use": item.get("use")}) or None)
+    return phones
+
+
+def _prism_organization(element: Element | None) -> dict[str, Any] | None:
+    if element is None:
+        return None
+    organization = {
+        "name": _text(_child(element, "name")),
+        **_first_and_other("identifier", [_prism_identifier(i) for i in _children(element, "id")]),
+        "address": _prism_address(_child(element, "addr")),
+        **_first_and_other("telecom", _prism_phones(element)),
+    }
+    return _compact_dict(organization) or None
+
+
+_DATE_RESOLUTIONS = {4: "year", 6: "month", 8: "day", 10: "hour", 12: "minute", 14: "second"}
+
+
+def _prism_date(value: str | None) -> dict[str, Any] | None:
+    normalized = _normalize_cda_timestamp(value)
+    if value is None or normalized is None:
+        return None
+    digits = re.match(r"\d+", value)
+    resolution = _DATE_RESOLUTIONS.get(len(digits.group(0))) if digits else None
+    return _compact_dict({"value": normalized, "text": value, "resolution": resolution})
 
 
 def _record_target(record_target: Element | None) -> dict[str, Any] | None:
