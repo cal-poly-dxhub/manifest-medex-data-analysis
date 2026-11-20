@@ -217,7 +217,9 @@ def test_ingestion_workers_are_private_arm_fargate_tasks_with_lane_settings() ->
 
     hl7, ccda = by_format["hl7"], by_format["ccda"]
     assert (hl7["Cpu"], hl7["Memory"]) == ("1024", "2048")
-    assert (ccda["Cpu"], ccda["Memory"]) == ("1024", "4096")
+    assert (ccda["Cpu"], ccda["Memory"]) == ("1024", "8192")
+    assert hl7["environment"]["MAX_OBJECT_BYTES"] == str(512 * 1024 * 1024)
+    assert ccda["environment"]["MAX_OBJECT_BYTES"] == str(110 * 1024 * 1024)
     assert hl7["environment"]["SOURCE_FORMAT"] == "hl7-v2"
     assert ccda["environment"]["SOURCE_FORMAT"] == "ccda"
     assert (hl7["environment"]["WORKERS"], hl7["environment"]["RECEIVE_BATCH_SIZE"]) == (

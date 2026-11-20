@@ -1115,7 +1115,7 @@ class DataQualityStack(Stack):
                 "ERROR_BUCKET": self.error_bucket.bucket_name,
                 "FORMAT": worker_format,
                 "MAX_BULK_BYTES": str(5 * 1024 * 1024),
-                "MAX_OBJECT_BYTES": str(50 * 1024 * 1024),
+                "MAX_OBJECT_BYTES": str(lane.max_object_mb * 1024 * 1024),
                 "METADATA_CLUSTER_ARN": self.metadata_cluster.cluster_arn,
                 "METADATA_DATABASE": METADATA_DATABASE_NAME,
                 "METADATA_SECRET_ARN": self.metadata_cluster.secret.secret_arn,

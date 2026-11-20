@@ -106,7 +106,7 @@ The HL7 parser supports:
 - Unknown and locally defined segments.
 - Whole-object provenance checksums and deterministic per-message content IDs.
 - HL7 timestamp normalization; timestamps without offsets are interpreted as UTC.
-- A 50 MiB raw-object limit.
+- A 512 MiB raw-object limit (`hl7_max_object_mb`). Files over 8 MiB are streamed and processed 500 messages at a time, so memory does not grow with the file (a 126 MB, 8,000-message batch peaks at ~170 MB) and batches never need to be split by hand.
 
 The indexed `ROOT` projection is driven by the committed customer field catalog. It contains 621 unambiguous, standards-backed HL7 v2.6 fields across 30 segment families whose exact output labels occur in the August 24 Kibana export. Composite datatype and subcomponent names are projected recursively, and repetitions remain arrays. Elasticsearch metadata, Prism enrichment keys, derived `_text`/`_resolution`/`_string` fields, and numeric nodes beyond valid segment ranges are intentionally excluded. `segmentCounts` still records every observed segment type; locally defined segments remain counted but are not fabricated into the customer projection.
 
@@ -187,7 +187,8 @@ Each format has its own ECS service. A task runs a small supervisor (`worker/wor
 
 | Setting | HL7 | CCDA | Why |
 | --- | --- | --- | --- |
-| Task size | 1 vCPU / 2 GB | 1 vCPU / 4 GB | Measured peak memory: HL7 ~420 MB, large CCDA ~1.2 GB |
+| Task size | 1 vCPU / 2 GB | 1 vCPU / 8 GB | Measured: HL7 ~420 MB per task; CCDA ~18-20x the file size per document while parsing (16 MB → ~300 MB), so four ~100 MB CCDAs fit in 8 GB |
+| Largest file | 512 MiB (streamed in 500-message chunks) | 110 MiB | Per-lane `*_max_object_mb`; MX sends 20-30 MB CCDAs routinely and up to ~100 MB longitudinal CCDAs |
 | Worker processes per task | 8 | 4 | HL7 is I/O-bound; CCDA parsing is CPU-bound at 4 |
 | Messages per receive | 10 | 1 | CCDA documents are large; one at a time bounds memory |
 | Tasks (min / max) | 2 / 10 | 2 / 10 | Two tasks across AZs for availability |
@@ -197,6 +198,7 @@ All values are production defaults in every environment and can be overridden in
 
 **Scaling.** Target tracking keeps *visible messages ÷ running tasks* (SQS `ApproximateNumberOfMessagesVisible` ÷ Container Insights `RunningTaskCount`) near the backlog target, scaling out after 60 s and in after 300 s. The service template has no desired count, so a deploy never resets a scaled-out service. Optional work-hours scaling (`work_hours_min_tasks`, off by default) raises the minimum on weekdays 07:45–17:30 in `work_hours_timezone`. A `WorkerAtMaxTasks` alarm fires when a service has been at its maximum for 15 minutes; raise `*_max_tasks` if that happens regularly, after checking Aurora and OpenSearch headroom.
 
+**Long files.** One queue message is one source file, so a large multi-message HL7 file can take longer than the 15-minute visibility timeout. While a batch is processing, the worker extends its visibility every 5 minutes (for up to 6 hours), so SQS never hands the same file to a second worker partway through. Logs show `visibility_extended`. Parsed documents are written 8 at a time and Aurora rows in batches of 500, so a file with thousands of messages finishes in minutes. Large HL7 batches are streamed twice: the first pass computes the file checksum and validates encoding and every MSH header before anything is written; the second processes 500 messages at a time. Each chunk is written to parsed S3, then Aurora, then the search index. A file that fails partway has its earlier chunks fully stored, and the retry completes the rest with the same document IDs. Size limits: HL7 512 MiB, CCDA 110 MiB.
 **Graceful shutdown.** On scale-in or deployment, ECS sends SIGTERM. Every worker stops polling, finishes the batch it holds, deletes what succeeded, and exits. The container stop timeout is 120 seconds (the Fargate maximum); a batch still running after that is killed and its messages are retried after the visibility timeout, so nothing is lost.
 
 **Image.** `deploy.sh` deploys a small companion stack (`<stack>-worker-build`: a private ECR repository and an ARM64 CodeBuild project), uploads the worker source, builds the image in CodeBuild, and pins the ECS task definitions to the image digest. The image tag is a hash of the source, so an unchanged worker is not rebuilt. Plain `cdk deploy` without a digest produces a placeholder image that cannot start; use `deploy.sh`.
@@ -545,12 +547,13 @@ Confirm that:
 - The key starts with `incoming/hl7/` or `incoming/ccda/`.
 - HL7 uses `.hl7` or `.txt`; CCDA uses `.xml`.
 - The EventBridge rule target and corresponding SQS queue are healthy.
+- The object is under the lane's size limit (HL7 512 MiB, CCDA 110 MiB). An oversized file fails with `failureCategory: object_too_large`; its error record shows `objectBytes` and `maxObjectBytes`.
 - In an existing VPC, indexing failures with `httpStatus: 401` almost always mean DNS: the OpenSearch Serverless hostname resolves to a public address. See DEPLOYMENT.md, "DNS requirement for existing VPCs".
 - The format's ECS service has running tasks. If tasks keep stopping, check the service events: `CannotPullContainerError` means the ECR or S3 endpoint path is blocked, and a placeholder image means the stack was deployed without `deploy.sh`.
 
 ### OpenSearch indexing fails for one large document
 
-The application limits raw objects to 50 MiB and bulk requests to approximately 5 MiB, but one projected document may still exceed an OpenSearch request limit when sent alone. Such a record remains retryable and eventually reaches the DLQ. Test limits with synthetic data and revise the indexing model before production if needed.
+The application limits raw objects per lane (HL7 512 MiB, CCDA 110 MiB) and bulk requests to approximately 5 MiB, but one projected document may still exceed an OpenSearch request limit when sent alone. Such a record remains retryable and eventually reaches the DLQ. Test limits with synthetic data and revise the indexing model before production if needed.
 
 ### Deployment configuration is rejected
 

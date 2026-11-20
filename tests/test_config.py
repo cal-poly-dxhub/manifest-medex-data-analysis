@@ -240,7 +240,8 @@ def test_ingestion_and_aurora_defaults_are_production_sized_in_every_environment
         assert (config.hl7.workers, config.hl7.receive_batch_size) == (8, 10)
         assert (config.hl7.min_tasks, config.hl7.max_tasks) == (2, 10)
         assert config.hl7.backlog_target == 1000
-        assert (config.ccda.task_cpu, config.ccda.task_memory) == (1024, 4096)
+        assert (config.ccda.task_cpu, config.ccda.task_memory) == (1024, 8192)
+        assert (config.hl7.max_object_mb, config.ccda.max_object_mb) == (512, 110)
         assert (config.ccda.workers, config.ccda.receive_batch_size) == (4, 1)
         assert (config.ccda.min_tasks, config.ccda.max_tasks) == (2, 10)
         assert config.ccda.backlog_target == 200

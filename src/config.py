@@ -81,6 +81,9 @@ class IngestionLaneConfig(BaseModel):
     # Target tracking keeps (visible messages / running tasks) near this value. Derived from
     # measured per-task throughput x acceptable queue delay (about 1-2 minutes).
     backlog_target: int = Field(ge=1, le=100_000)
+    # Largest raw file this lane accepts. The whole file is parsed in memory, so the limit
+    # must fit the task: CCDA peaks at roughly 18-20x the file size per document in flight.
+    max_object_mb: int = Field(default=50, ge=1, le=1024)
 
     @model_validator(mode="after")
     def require_valid_fargate_sizing(self) -> Self:
@@ -106,15 +109,21 @@ HL7_LANE_DEFAULTS = IngestionLaneConfig(
     min_tasks=2,
     max_tasks=10,
     backlog_target=1000,
+    # Large HL7 batches are streamed and processed 500 messages at a time, so memory does
+    # not grow with the file; the limit bounds processing time, not memory.
+    max_object_mb=512,
 )
 CCDA_LANE_DEFAULTS = IngestionLaneConfig(
     task_cpu=1024,
-    task_memory=4096,
+    # 8 GB: MX sends 20-30 MB CCDAs routinely and up to ~100 MB longitudinal CCDAs (about
+    # 2 GB each while parsing), so four in flight at once must still fit.
+    task_memory=8192,
     workers=4,
     receive_batch_size=1,
     min_tasks=2,
     max_tasks=10,
     backlog_target=200,
+    max_object_mb=110,
 )
 _LANE_KEYS = (
     "task_cpu",
@@ -124,6 +133,7 @@ _LANE_KEYS = (
     "min_tasks",
     "max_tasks",
     "backlog_target",
+    "max_object_mb",
 )
 
 

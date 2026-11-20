@@ -105,9 +105,9 @@ CONTEXT_ARGS=(
 
 # Optional sizing and scaling overrides; unset keys keep the stack's production defaults.
 for key in \
-  hl7_task_cpu hl7_task_memory hl7_workers hl7_receive_batch_size hl7_min_tasks hl7_max_tasks hl7_backlog_target \
-  ccda_task_cpu ccda_task_memory ccda_workers ccda_receive_batch_size ccda_min_tasks ccda_max_tasks ccda_backlog_target \
   work_hours_min_tasks work_hours_timezone aurora_min_acu aurora_max_acu; do
+  hl7_task_cpu hl7_task_memory hl7_workers hl7_receive_batch_size hl7_min_tasks hl7_max_tasks hl7_backlog_target hl7_max_object_mb \
+  ccda_task_cpu ccda_task_memory ccda_workers ccda_receive_batch_size ccda_min_tasks ccda_max_tasks ccda_backlog_target ccda_max_object_mb \
   value="$(cfg "$key")"
   if [[ -n "$value" ]]; then
     CONTEXT_ARGS+=(-c "$key=$value")

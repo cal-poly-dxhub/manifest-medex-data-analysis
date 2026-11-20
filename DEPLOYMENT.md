@@ -271,7 +271,8 @@ Configuration is supplied through CDK context. Defaults are defined in `cdk.json
 | `hl7_workers`, `hl7_receive_batch_size` | HL7 worker processes per task; messages per receive (1–10) | `8`, `10` |
 | `hl7_min_tasks`, `hl7_max_tasks` | HL7 service scaling bounds | `2`, `10` |
 | `hl7_backlog_target` | HL7 visible messages per running task that target tracking aims for | `1000` |
-| `ccda_task_cpu`, `ccda_task_memory` | CCDA worker Fargate task size | `1024`, `4096` |
+| `ccda_task_cpu`, `ccda_task_memory` | CCDA worker Fargate task size | `1024`, `8192` |
+| `hl7_max_object_mb`, `ccda_max_object_mb` | Largest raw file each lane accepts (MiB). HL7 is streamed in chunks; CCDA must fit the task memory | `512`, `110` |
 | `ccda_workers`, `ccda_receive_batch_size` | CCDA worker processes per task; messages per receive | `4`, `1` |
 | `ccda_min_tasks`, `ccda_max_tasks` | CCDA service scaling bounds | `2`, `10` |
 | `ccda_backlog_target` | CCDA visible messages per running task | `200` |
@@ -474,8 +475,9 @@ Requirements and behavior to plan around:
 | Filenames | Free-form, but keep them non-identifying. Facility, message type, and MSH-7 date in the name are fine and useful for browsing. |
 | Ordering | Not guaranteed. Objects are processed by parallel consumers from a standard queue, so arrival order is not preserved. This does not affect counts or report results. |
 | Re-uploads | Safe. Document identity is derived from the object (bucket, key, version) so a re-drop of an unchanged object updates rather than duplicates. Note that a *changed* object body under a new version produces a new document. |
-| Throughput | Default ingestion concurrency is 10 (HL7) and 5 (CCDA). For multi-million-object backfills, upload in batches and watch the queue-age and DLQ alarms rather than dropping everything at once; the queue absorbs bursts but end-to-end latency grows with backlog. |
-| Size | Objects over 50 MB are rejected. Multi-megabyte CCDAs are supported. |
+| Throughput | Ingestion runs on ECS workers that scale with the queue backlog (2–10 tasks per format by default; see README "Ingestion workers"). For multi-million-object backfills, upload in batches and watch the queue-age and DLQ alarms rather than dropping everything at once; the queue absorbs bursts but end-to-end latency grows with backlog. |
+| Size | Objects over the lane limit (**HL7 512 MiB, CCDA 110 MiB**, configurable) are rejected (`failureCategory: object_too_large`; the error record includes `objectBytes` and `maxObjectBytes`) and reach the DLQ after five attempts. HL7 batches of any message count are processed in 500-message chunks, so there is no need to split them. One file is still handled by one worker, so many medium files finish sooner than one huge file. CCDAs up to ~100 MB, and files with several concatenated CCDAs, are supported. |
+| S3 console folders | Creating a "folder" in the S3 console adds a zero-byte key ending in `/`. Workers recognize these and skip them (logged as `record_skipped`, `reason: folder_marker`); they never reach the DLQ. |
 
 Example uploads with synthetic, non-PHI data:
 

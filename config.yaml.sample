@@ -79,14 +79,16 @@ hl7_receive_batch_size:    # messages per receive (1-10), default 10
 hl7_min_tasks:             # default 2
 hl7_max_tasks:             # default 10
 hl7_backlog_target:        # visible messages per task to scale toward, default 1000
+hl7_max_object_mb:         # largest HL7 file in MiB, default 512 (streamed in 500-message chunks)
 
 ccda_task_cpu:             # default 1024
-ccda_task_memory:          # default 4096
+ccda_task_memory:          # default 8192 (fits four ~100 MB CCDAs in flight)
 ccda_workers:              # default 4
 ccda_receive_batch_size:   # default 1
 ccda_min_tasks:            # default 2
 ccda_max_tasks:            # default 10
 ccda_backlog_target:       # default 200
+ccda_max_object_mb:        # largest CCDA file in MiB, default 110
 
 # Scheduled work-hours scaling (off by default). When set, both services keep at least
 # this many tasks on weekdays 07:45-17:30 in work_hours_timezone. Must lie within each
