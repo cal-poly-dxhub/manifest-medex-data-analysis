@@ -1,5 +1,6 @@
 """Validate deployment context and enforce environment-specific safety constraints."""
 
+import ipaddress
 import os
 import re
 from enum import StrEnum
@@ -27,8 +28,11 @@ def _context_bool(value: object, *, default: bool) -> bool:
 
 
 _GATEWAY_SERVICES = frozenset({"s3", "dynamodb"})
-# ecr.api, ecr.dkr, and logs let the ECS ingestion tasks pull their image and write logs.
-_INTERFACE_SERVICES = frozenset({"rds-data", "sqs", "lambda", "ecr.api", "ecr.dkr", "logs"})
+# ecr.api, ecr.dkr, and logs let the ECS ingestion tasks pull their image and write logs;
+# secretsmanager lets the optional intake service read its API key at task start.
+_INTERFACE_SERVICES = frozenset(
+    {"rds-data", "sqs", "lambda", "ecr.api", "ecr.dkr", "logs", "secretsmanager"}
+)
 _ENDPOINT_SERVICES = _GATEWAY_SERVICES | _INTERFACE_SERVICES
 
 
@@ -64,6 +68,11 @@ def _context_float(value: object, *, default: float) -> float:
 _FARGATE_MEMORY_BY_CPU = {
     1024: frozenset(range(2048, 8193, 1024)),
     2048: frozenset(range(4096, 16385, 1024)),
+}
+# The intake service is I/O-light, so it also allows 0.5 vCPU tasks.
+_INTAKE_FARGATE_MEMORY_BY_CPU = {
+    512: frozenset(range(1024, 4097, 1024)),
+    **_FARGATE_MEMORY_BY_CPU,
 }
 
 
@@ -215,6 +224,24 @@ class AppConfig(BaseModel):
     # use, so max_acu is a ceiling against runaway cost, not a standing charge.
     aurora_min_acu: float = Field(default=2.0, ge=0.5, le=256)
     aurora_max_acu: float = Field(default=16.0, ge=1, le=256)
+    # Optional Prism-compatible message intake API (off by default). It runs behind an
+    # internal (never internet-facing) HTTPS load balancer that admits only
+    # intake_source_cidrs, and authenticates one sender with an API key kept in Secrets
+    # Manager. The API key scheme is a documented decision made at the customer's request
+    # for Prism compatibility; mutual TLS is the recommended upgrade.
+    enable_intake: bool = False
+    intake_sender_id: str = Field(default="sender", pattern=r"^[a-z][a-z0-9-]{0,31}$")
+    intake_source_cidrs: tuple[str, ...] = ()
+    intake_certificate_arn: str | None = Field(
+        default=None, pattern=r"^arn:aws[a-z-]*:acm:[a-z0-9-]+:\d{12}:certificate/[0-9a-f-]{36}$"
+    )
+    # 150 MB covers a ~110 MiB CCDA after base64 (x4/3) plus the JSON envelope.
+    intake_max_request_mb: int = Field(default=150, ge=1, le=1024)
+    intake_task_cpu: int = 1024
+    intake_task_memory: int = 4096
+    intake_min_tasks: int = Field(default=2, ge=1, le=20)
+    intake_max_tasks: int = Field(default=4, ge=1, le=20)
+    intake_archive_retention_days: int = Field(default=90, ge=1, le=3650)
 
     @property
     def uses_existing_vpc(self) -> bool:
@@ -317,6 +344,7 @@ class AppConfig(BaseModel):
                 if not lane.min_tasks <= self.work_hours_min_tasks <= lane.max_tasks:
                     msg = f"work_hours_min_tasks must be between {name} min_tasks and max_tasks"
                     raise ValueError(msg)
+        self._validate_intake()
         try:
             ZoneInfo(self.work_hours_timezone)
         except (ZoneInfoNotFoundError, ValueError):
@@ -328,6 +356,33 @@ class AppConfig(BaseModel):
                 msg = "Dashboard principal must belong to the deployment account"
                 raise ValueError(msg)
         return self
+
+    def _validate_intake(self) -> None:
+        for cidr in self.intake_source_cidrs:
+            try:
+                network = ipaddress.ip_network(cidr, strict=True)
+            except ValueError:
+                msg = f"Invalid intake_source_cidrs entry {cidr!r} (host bits set or malformed)"
+                raise ValueError(msg) from None
+            # Only private sender networks, and never a range broader than /16: the intake
+            # endpoint must not become reachable from the internet or an entire 10.0.0.0/8.
+            if not network.is_private or network.version != 4 or network.prefixlen < 16:
+                msg = f"intake_source_cidrs entry {cidr!r} must be a private IPv4 /16 or narrower"
+                raise ValueError(msg)
+        allowed = _INTAKE_FARGATE_MEMORY_BY_CPU.get(self.intake_task_cpu)
+        if allowed is None or self.intake_task_memory not in allowed:
+            msg = "intake_task_cpu/intake_task_memory is not a valid Fargate size"
+            raise ValueError(msg)
+        if self.intake_min_tasks > self.intake_max_tasks:
+            msg = "intake_min_tasks must not exceed intake_max_tasks"
+            raise ValueError(msg)
+        if self.enable_intake:
+            if not self.intake_source_cidrs:
+                msg = "enable_intake requires intake_source_cidrs (the senders' networks)"
+                raise ValueError(msg)
+            if self.intake_certificate_arn is None:
+                msg = "enable_intake requires intake_certificate_arn (an ACM certificate)"
+                raise ValueError(msg)
 
     @classmethod
     def from_context(cls, node: Node) -> Self:
@@ -397,4 +452,24 @@ class AppConfig(BaseModel):
             ),
             aurora_min_acu=_context_float(node.try_get_context("aurora_min_acu"), default=2.0),
             aurora_max_acu=_context_float(node.try_get_context("aurora_max_acu"), default=16.0),
+            enable_intake=_context_bool(node.try_get_context("enable_intake"), default=False),
+            intake_sender_id=str(node.try_get_context("intake_sender_id") or "sender").strip(),
+            intake_source_cidrs=_context_list(node.try_get_context("intake_source_cidrs")),
+            intake_certificate_arn=(
+                str(value).strip()
+                if (value := node.try_get_context("intake_certificate_arn"))
+                else None
+            ),
+            intake_max_request_mb=_context_int(
+                node.try_get_context("intake_max_request_mb"), default=150
+            ),
+            intake_task_cpu=_context_int(node.try_get_context("intake_task_cpu"), default=1024),
+            intake_task_memory=_context_int(
+                node.try_get_context("intake_task_memory"), default=4096
+            ),
+            intake_min_tasks=_context_int(node.try_get_context("intake_min_tasks"), default=2),
+            intake_max_tasks=_context_int(node.try_get_context("intake_max_tasks"), default=4),
+            intake_archive_retention_days=_context_int(
+                node.try_get_context("intake_archive_retention_days"), default=90
+            ),
         )

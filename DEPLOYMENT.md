@@ -158,6 +158,41 @@ No manual steps are needed; run `./deploy.sh` as usual. If you reuse a customer-
 
 Running the CDK commands directly is not supported. They are documented under "Manual deployment" in Reference below so you can see what `deploy.sh` does, or adapt it for CI. Anything you run yourself must repeat every step `deploy.sh` performs, including the endpoint detection described there.
 
+### Optional: message intake API (Prism-compatible)
+
+Senders that today post Prism's **Clinical Message Intake** JSON (`POST /prism/ods/clinical-message`, base64 HL7 v2 or CCDA in `contents[]`) can keep doing so unchanged. Only the hostname and API key change. The intake service validates each request, stores the decoded message under `incoming/...` so the normal pipeline processes it, stores the envelope (patient IDs, MPI ID, facility, event type, and the other fields) as an encrypted sidecar so those fields become searchable, and archives the exact request body in a private bucket. It answers `200` with Prism's `importStatus` only after S3 has stored everything.
+
+**Network.** The load balancer is **internal** (no public address) in the stack's private subnets, listens on **HTTPS 443 only** (TLS 1.2/1.3), and its security group admits only `intake_source_cidrs`. Intake tasks have no public IP and accept traffic only from the load balancer. Senders reach it over your VPN or transit gateway.
+
+**Authentication.** One sender, one API key, generated into Secrets Manager. Senders send it exactly as they did to Prism: `Authorization: ApiKey base64(<sender_id>:<secret>)` (or `Basic` with the same pair). Requests without a valid key get `401` before the body is read; without a configured key the service accepts nothing. This API-key scheme is a deliberate decision made for Prism compatibility. **Mutual TLS (client certificates on the load balancer) is the recommended upgrade** and needs no payload change.
+
+**Before enabling:**
+1. **Certificate.** Production: import the intake hostname's certificate from your internal CA into ACM (`aws acm import-certificate`). Testing: a self-signed certificate imported into ACM is fine. Put the ARN in `intake_certificate_arn`.
+2. **Sender networks.** Set `intake_source_cidrs` to the sender's source ranges (private IPv4, /16 or narrower).
+3. Set `enable_intake: true` and `intake_sender_id` (e.g. `rhapsody`), then run `./deploy.sh`.
+
+**After deploying:**
+1. Point the hostname on the certificate at the `IntakeLoadBalancerDnsName` output (a CNAME in your internal DNS).
+2. Read the key and hand it to the sender's administrator through your normal secret-sharing process (never email or chat):
+   ```bash
+   aws secretsmanager get-secret-value --secret-id <IntakeApiKeySecretArn> --query SecretString --output text
+   ```
+   The value is `{"id": "<sender_id>", "secret": "<secret>"}`; the sender's header is `ApiKey ` + base64 of `<id>:<secret>`.
+3. Confirm the gate from inside the network: a request **without** credentials must return `401` with `WWW-Authenticate: ApiKey`, before you send any real message:
+   ```bash
+   curl -s -o /dev/null -w "%{http_code}\n" -X POST https://<intake-host>/prism/ods/clinical-message -d '{}'
+   ```
+   Add `-k` only when testing with a self-signed certificate.
+
+**Behavior to know:**
+- Required fields (as in Prism's spec): `sourceMessageId`, `messageDate`, `clinicalMessageType` (`HL7V2` or `CCDA`), `sourceFacilityId`, `patientId`, `patientIdAa`, `contents`. Missing or invalid ones get `400`. Requests over `intake_max_request_mb` get `413`. A storage problem returns `503` with `Retry-After`, so the sender retries.
+- If `contents` has both, the `PROCESSED` entry is used (Prism's recommendation), otherwise `RAW`.
+- A re-sent message (same facility, message date, and `sourceMessageId`) **replaces** the earlier one, as in Prism.
+- The envelope's `sourceFacilityId` takes precedence over MSH-4 for facility attribution.
+- Archived request bodies are deleted after `intake_archive_retention_days`. Logs never contain bodies, envelope fields, or keys.
+
+**Rotating the key:** `aws secretsmanager put-secret-value` with a new `{"id": ..., "secret": ...}`, then force a new deployment of the intake service (`aws ecs update-service --force-new-deployment`), and update the sender at the same time.
+
 ## 3. Create the first user
 
 Self-signup is turned off, so there is no public "sign up" page. An administrator creates every user directly in the Cognito user pool; the same applies to adding users later or resetting a password. The username is the user's email address.
@@ -273,6 +308,7 @@ Configuration is supplied through CDK context. Defaults are defined in `cdk.json
 | `hl7_backlog_target` | HL7 visible messages per running task that target tracking aims for | `1000` |
 | `ccda_task_cpu`, `ccda_task_memory` | CCDA worker Fargate task size | `1024`, `8192` |
 | `hl7_max_object_mb`, `ccda_max_object_mb` | Largest raw file each lane accepts (MiB). HL7 is streamed in chunks; CCDA must fit the task memory | `512`, `110` |
+| `enable_intake` and `intake_*` | Optional message intake API (see "Optional: message intake API"); request cap `intake_max_request_mb` | off; `150` MB, 1 vCPU / 4 GB |
 | `ccda_workers`, `ccda_receive_batch_size` | CCDA worker processes per task; messages per receive | `4`, `1` |
 | `ccda_min_tasks`, `ccda_max_tasks` | CCDA service scaling bounds | `2`, `10` |
 | `ccda_backlog_target` | CCDA visible messages per running task | `200` |
@@ -447,7 +483,7 @@ This stack is not a free-tier architecture. Major recurring cost drivers include
 - OpenSearch Serverless OCUs and managed storage; the classic model used here does not scale to zero.
 - Aurora Serverless v2 ACUs, storage, backup retention, and I/O.
 - Six interface VPC endpoints (plus the OpenSearch Serverless endpoint) across the configured Availability Zones.
-- ECS Fargate ingestion tasks: at least two tasks per format run at all times (at the defaults in us-west-2, about $58/month for HL7 and $68/month for CCDA), scaling with backlog.
+- ECS Fargate ingestion tasks: at least two tasks per format run at all times (at the defaults in us-west-2, about $58/month for HL7 and $89/month for CCDA, plus ~$85/month for the intake API if enabled: two 1 vCPU / 4 GB tasks and the internal load balancer), scaling with backlog.
 - Lambda duration and concurrency for the explorer, reports, and reingestion.
 - CodeBuild minutes and ECR storage for the worker image.
 - SQS, EventBridge, S3 storage/versioning, KMS requests, and CloudWatch logs.

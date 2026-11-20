@@ -1,5 +1,6 @@
 # Ingestion worker image. Built by AWS CodeBuild during ./deploy.sh (no local Docker needed)
-# from a source bundle containing src/, worker/, and lambda-requirements.txt.
+# from a source bundle containing src/, worker/, intake/, and lambda-requirements.txt.
+# The same image runs the queue workers (default CMD) and the optional intake service.
 FROM public.ecr.aws/docker/library/python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
@@ -11,6 +12,7 @@ RUN python -m pip install --no-cache-dir --require-hashes -r lambda-requirements
 
 COPY src/ src/
 COPY worker/ worker/
+COPY intake/ intake/
 # Infrastructure modules never enter the runtime image.
 RUN rm -f src/stack.py src/config.py \
  && chmod -R a+rX /app \

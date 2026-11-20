@@ -631,8 +631,9 @@ def test_kms_key_allows_logs_for_only_stack_log_groups() -> None:
         if statement.get("Sid") == "AllowCloudWatchLogsForStackLogGroups"
     )
     contexts = logs_statement["Condition"]["ArnEquals"]["kms:EncryptionContext:aws:logs:arn"]
-    assert len(contexts) == 9
+    assert len(contexts) == 10
     context_json = json.dumps(contexts)
+    assert "/ecs/manifest-medex-data-quality-dev-intake" in context_json
     # Worker log groups, plus the former ingestion Lambda log groups kept readable.
     assert "/ecs/manifest-medex-data-quality-dev-hl7-worker" in context_json
     assert "/ecs/manifest-medex-data-quality-dev-ccda-worker" in context_json
@@ -1815,3 +1816,179 @@ def test_ingress_granted_before_import_is_replayed_onto_imported_endpoint() -> N
         "HTTPS from the explorer Lambda to the RDS Data API",
         "HTTPS from the reingestion planner Lambda to the RDS Data API",
     ]
+
+
+_INTAKE_CERT = "arn:aws:acm:us-west-2:111122223333:certificate/12345678-1234-1234-1234-123456789012"
+
+
+def _build_intake_stack(**overrides: Any) -> Template:
+    app = App()
+    values: dict[str, Any] = {
+        "project_name": "manifest-medex-data-quality",
+        "environment": DeploymentEnvironment.DEV,
+        "enable_intake": True,
+        "intake_sender_id": "rhapsody",
+        "intake_source_cidrs": ("10.50.0.0/16", "192.168.192.0/19"),
+        "intake_certificate_arn": _INTAKE_CERT,
+    }
+    values.update(overrides)
+    return Template.from_stack(DataQualityStack(app, "TestStack", config=AppConfig(**values)))
+
+
+def test_intake_is_off_by_default() -> None:
+    _, _, template = build_stack()
+    assert template.find_resources("AWS::ElasticLoadBalancingV2::LoadBalancer") == {}
+    assert "Intake" not in json.dumps(template.to_json()["Outputs"])
+    assert not any(
+        "secretsmanager" in json.dumps(endpoint)
+        for endpoint in template.find_resources("AWS::EC2::VPCEndpoint").values()
+    )
+
+
+def test_intake_load_balancer_is_internal_https_and_admits_only_sender_networks() -> None:
+    template = _build_intake_stack()
+    (load_balancer,) = template.find_resources("AWS::ElasticLoadBalancingV2::LoadBalancer").values()
+    assert load_balancer["Properties"]["Scheme"] == "internal"
+    attributes = {
+        a["Key"]: a["Value"] for a in load_balancer["Properties"]["LoadBalancerAttributes"]
+    }
+    assert attributes["routing.http.drop_invalid_header_fields.enabled"] == "true"
+    (listener,) = template.find_resources("AWS::ElasticLoadBalancingV2::Listener").values()
+    assert listener["Properties"]["Port"] == 443
+    assert listener["Properties"]["Protocol"] == "HTTPS"
+    assert listener["Properties"]["Certificates"] == [{"CertificateArn": _INTAKE_CERT}]
+    assert listener["Properties"]["SslPolicy"].startswith("ELBSecurityPolicy-TLS13")
+
+    groups = template.find_resources("AWS::EC2::SecurityGroup")
+    alb_group = next(
+        g for k, g in groups.items() if k.startswith("IntakeLoadBalancerSecurityGroup")
+    )
+    ingress = alb_group["Properties"]["SecurityGroupIngress"]
+    assert sorted((rule["CidrIp"], rule["FromPort"], rule["ToPort"]) for rule in ingress) == [
+        ("10.50.0.0/16", 443, 443),
+        ("192.168.192.0/19", 443, 443),
+    ]
+    for group in groups.values():
+        for rule in group["Properties"].get("SecurityGroupIngress", []):
+            assert rule.get("CidrIp") != "0.0.0.0/0"
+    for rule in template.find_resources("AWS::EC2::SecurityGroupIngress").values():
+        assert rule["Properties"].get("CidrIp") != "0.0.0.0/0"
+
+    task_ingress = [
+        rule["Properties"]
+        for key, rule in template.find_resources("AWS::EC2::SecurityGroupIngress").items()
+        if key.startswith("IntakeTaskSecurityGroup")
+    ]
+    assert len(task_ingress) == 1
+    assert task_ingress[0]["FromPort"] == 8080
+    assert "IntakeLoadBalancerSecurityGroup" in json.dumps(task_ingress[0]["SourceSecurityGroupId"])
+
+
+def test_intake_service_is_private_and_gets_its_key_from_secrets_manager() -> None:
+    template = _build_intake_stack()
+    service = next(
+        s
+        for k, s in template.find_resources("AWS::ECS::Service").items()
+        if k.startswith("IntakeService")
+    )
+    assert (
+        service["Properties"]["NetworkConfiguration"]["AwsvpcConfiguration"]["AssignPublicIp"]
+        == "DISABLED"
+    )
+    task = next(
+        t
+        for k, t in template.find_resources("AWS::ECS::TaskDefinition").items()
+        if k.startswith("IntakeTask")
+    )
+    (container,) = task["Properties"]["ContainerDefinitions"]
+    assert container["Command"] == ["python", "-m", "intake.server"]
+    assert [secret["Name"] for secret in container["Secrets"]] == ["INTAKE_API_SECRET"]
+    assert ":secret::" in json.dumps(container["Secrets"][0]["ValueFrom"])
+    assert not any("SECRET" in item["Name"] for item in container["Environment"])
+    environment = {item["Name"]: item["Value"] for item in container["Environment"]}
+    assert environment["INTAKE_SENDER_ID"] == "rhapsody"
+    assert environment["MAX_REQUEST_BYTES"] == str(150 * 1024 * 1024)
+    assert environment["MAX_CCDA_OBJECT_BYTES"] == str(110 * 1024 * 1024)
+    assert environment["MAX_HL7_OBJECT_BYTES"] == str(512 * 1024 * 1024)
+    assert int(environment["MAX_INFLIGHT_BYTES"]) == 4096 * 1024 * 1024 // 3
+
+    (secret,) = [
+        s
+        for k, s in template.find_resources("AWS::SecretsManager::Secret").items()
+        if k.startswith("IntakeApiKey")
+    ]
+    generator = secret["Properties"]["GenerateSecretString"]
+    assert generator["GenerateStringKey"] == "secret"
+    assert generator["PasswordLength"] == 48
+    assert json.loads(generator["SecretStringTemplate"]) == {"id": "rhapsody"}
+    assert "KmsKeyId" in secret["Properties"]
+    assert any(
+        "secretsmanager" in json.dumps(endpoint)
+        for endpoint in template.find_resources("AWS::EC2::VPCEndpoint").values()
+    )
+
+
+def test_intake_role_writes_only_and_archive_bucket_is_private_and_expiring() -> None:
+    template = _build_intake_stack(intake_archive_retention_days=30)
+    role_id = next(
+        k for k in template.find_resources("AWS::IAM::Role") if k.startswith("IntakeTaskRole")
+    )
+    statements = [
+        statement
+        for policy in template.find_resources("AWS::IAM::Policy").values()
+        if role_id in json.dumps(policy["Properties"]["Roles"])
+        for statement in policy["Properties"]["PolicyDocument"]["Statement"]
+    ]
+    actions = {
+        action
+        for statement in statements
+        for action in (
+            statement["Action"] if isinstance(statement["Action"], list) else [statement["Action"]]
+        )
+    }
+    assert "s3:PutObject" in actions
+    assert not any(action.startswith("s3:Get") or action == "s3:*" for action in actions)
+
+    archive = next(
+        b
+        for k, b in template.find_resources("AWS::S3::Bucket").items()
+        if k.startswith("IntakeArchiveBucket")
+    )["Properties"]
+    assert archive["PublicAccessBlockConfiguration"] == {
+        "BlockPublicAcls": True,
+        "BlockPublicPolicy": True,
+        "IgnorePublicAcls": True,
+        "RestrictPublicBuckets": True,
+    }
+    assert (
+        archive["BucketEncryption"]["ServerSideEncryptionConfiguration"][0][
+            "ServerSideEncryptionByDefault"
+        ]["SSEAlgorithm"]
+        == "aws:kms"
+    )
+    assert archive["LifecycleConfiguration"]["Rules"][0]["ExpirationInDays"] == 30
+
+    outputs = template.to_json()["Outputs"]
+    for name in ("IntakeLoadBalancerDnsName", "IntakeApiKeySecretArn", "IntakeArchiveBucketName"):
+        assert name in outputs
+
+
+def test_ingestion_workers_may_read_their_lane_envelopes() -> None:
+    _, _, template = build_stack()
+    rendered = json.dumps(template.find_resources("AWS::IAM::Policy"))
+    assert "envelopes/hl7/*" in rendered
+    assert "envelopes/ccda/*" in rendered
+
+
+def test_intake_stack_passes_cdk_nag() -> None:
+    app = App()
+    config = AppConfig(
+        project_name="manifest-medex-data-quality",
+        environment=DeploymentEnvironment.DEV,
+        enable_intake=True,
+        intake_source_cidrs=("10.50.0.0/16",),
+        intake_certificate_arn=_INTAKE_CERT,
+    )
+    DataQualityStack(app, "IntakeNagStack", config=config)
+    Aspects.of(app).add(AwsSolutionsChecks())
+    assert _aws_solutions_errors(app, "IntakeNagStack") == []

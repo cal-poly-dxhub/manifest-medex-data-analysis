@@ -101,3 +101,18 @@ work_hours_timezone:       # IANA name, default America/Los_Angeles
 # Values are multiples of 0.5. Raising max later is an in-place change.
 aurora_min_acu:            # default 2
 aurora_max_acu:            # default 16
+
+# --- Optional: Prism-compatible message intake API (off by default) ------------------
+# Lets an integration engine (e.g. Rhapsody) keep posting Prism's Clinical Message Intake
+# JSON. Runs behind an INTERNAL HTTPS load balancer (never internet-facing). See
+# DEPLOYMENT.md "Optional: message intake API" before enabling.
+enable_intake: false
+intake_sender_id: sender            # lowercase name of the one sender, e.g. rhapsody
+intake_source_cidrs:                # sender networks, private IPv4 /16 or narrower, comma-separated
+intake_certificate_arn:             # ACM certificate for the intake hostname (required when enabled)
+intake_max_request_mb:              # largest accepted request, default 150 (a ~110 MiB CCDA after base64)
+intake_task_cpu:                    # default 1024
+intake_task_memory:                 # default 4096
+intake_min_tasks:                   # default 2
+intake_max_tasks:                   # default 4
+intake_archive_retention_days:      # days to keep archived request bodies, default 90

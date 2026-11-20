@@ -31,6 +31,7 @@ addopts = [
   "--strict-markers",
   "--cov=src",
   "--cov=worker",
+  "--cov=intake",
   "--cov-report=term-missing",
   "--cov-fail-under=90",
 ]
@@ -69,7 +70,7 @@ python_version = "3.12"
 strict = true
 explicit_package_bases = true
 plugins = ["pydantic.mypy"]
-files = ["app.py", "src", "tests", "worker"]
+files = ["app.py", "src", "tests", "worker", "intake"]
 exclude = ["cdk.out"]
 
 [[tool.mypy.overrides]]

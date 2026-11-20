@@ -105,9 +105,11 @@ CONTEXT_ARGS=(
 
 # Optional sizing and scaling overrides; unset keys keep the stack's production defaults.
 for key in \
-  work_hours_min_tasks work_hours_timezone aurora_min_acu aurora_max_acu; do
   hl7_task_cpu hl7_task_memory hl7_workers hl7_receive_batch_size hl7_min_tasks hl7_max_tasks hl7_backlog_target hl7_max_object_mb \
   ccda_task_cpu ccda_task_memory ccda_workers ccda_receive_batch_size ccda_min_tasks ccda_max_tasks ccda_backlog_target ccda_max_object_mb \
+  work_hours_min_tasks work_hours_timezone aurora_min_acu aurora_max_acu \
+  enable_intake intake_sender_id intake_source_cidrs intake_certificate_arn intake_max_request_mb \
+  intake_task_cpu intake_task_memory intake_min_tasks intake_max_tasks intake_archive_retention_days; do
   value="$(cfg "$key")"
   if [[ -n "$value" ]]; then
     CONTEXT_ARGS+=(-c "$key=$value")
@@ -161,7 +163,7 @@ stack_name = os.environ["STACK_NAME"]
 prefix = "com.amazonaws." + region + "."
 wanted = {
     prefix + name: name
-    for name in ("s3", "dynamodb", "rds-data", "sqs", "lambda", "ecr.api", "ecr.dkr", "logs")
+    for name in ("s3", "dynamodb", "rds-data", "sqs", "lambda", "ecr.api", "ecr.dkr", "logs", "secretsmanager")
 }
 entries = []
 for ep in json.load(sys.stdin):
@@ -264,7 +266,7 @@ from pathlib import Path
 
 bundle = sys.argv[1]
 files = [Path("lambda-requirements.txt")]
-for root in ("src", "worker"):
+for root in ("src", "worker", "intake"):
     for path in sorted(Path(root).rglob("*")):
         if not path.is_file() or "__pycache__" in path.parts or path.suffix == ".pyc":
             continue

@@ -19,11 +19,13 @@ from aws_cdk import (
     Stack,
     Tags,
     TimeZone,
+    Token,
 )
 from aws_cdk import aws_apigatewayv2 as apigwv2
 from aws_cdk import aws_apigatewayv2_authorizers as apigwv2_authorizers
 from aws_cdk import aws_apigatewayv2_integrations as apigwv2_integrations
 from aws_cdk import aws_applicationautoscaling as appscaling
+from aws_cdk import aws_certificatemanager as acm
 from aws_cdk import aws_cloudfront as cloudfront
 from aws_cdk import aws_cloudfront_origins as cloudfront_origins
 from aws_cdk import aws_cloudwatch as cloudwatch
@@ -32,6 +34,7 @@ from aws_cdk import aws_dynamodb as dynamodb
 from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_ecr as ecr
 from aws_cdk import aws_ecs as ecs
+from aws_cdk import aws_elasticloadbalancingv2 as elbv2
 from aws_cdk import aws_events as events
 from aws_cdk import aws_events_targets as events_targets
 from aws_cdk import aws_iam as iam
@@ -43,6 +46,7 @@ from aws_cdk import aws_opensearchserverless as opensearchserverless
 from aws_cdk import aws_rds as rds
 from aws_cdk import aws_s3 as s3
 from aws_cdk import aws_s3_deployment as s3_deployment
+from aws_cdk import aws_secretsmanager as secretsmanager
 from aws_cdk import aws_sqs as sqs
 from cdk_nag import NagSuppressions
 from constructs import Construct
@@ -62,6 +66,7 @@ MAX_EXPLORER_BODY_BYTES = 4 * 1024 * 1024
 WORKER_IMAGE_PLACEHOLDER = "worker-image-not-built-run-deploy-sh"
 # Fargate's maximum container stop timeout: workers finish their batch within this window.
 WORKER_STOP_TIMEOUT = Duration.seconds(120)
+INTAKE_CONTAINER_PORT = 8080
 FRONTEND_DIST_MISSING = (
     "Frontend build output was not found at web/dist; run 'make web-build' before synthesis"
 )
@@ -281,6 +286,8 @@ class DataQualityStack(Stack):
             "Ccda", "incoming/ccda/", self.ccda_queue, self.ccda_dead_letter_queue
         )
         self._create_operational_alarms()
+        if self.config.enable_intake:
+            self._create_intake()
 
         # Authenticated read-only explorer API and CloudFront/S3 single-page frontend.
         self.report_runner_function = self._create_report_runner_function()
@@ -334,6 +341,7 @@ class DataQualityStack(Stack):
                 f"/aws/lambda/{self.stack_prefix}-ccda",
                 f"/ecs/{self.stack_prefix}-hl7-worker",
                 f"/ecs/{self.stack_prefix}-ccda-worker",
+                f"/ecs/{self.stack_prefix}-intake",
                 f"/aws/lambda/{self.stack_prefix}-explorer",
                 f"/aws/lambda/{self.stack_prefix}-report-runner",
                 f"/aws/lambda/{self.stack_prefix}-reingest-planner",
@@ -699,10 +707,15 @@ class DataQualityStack(Stack):
             assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
             description=f"Least-privilege execution role for {construct_id.upper()} ingestion",
         )
+        envelope_key_pattern = "envelopes/" + raw_key_pattern.removeprefix("incoming/")
         role.add_to_policy(
             iam.PolicyStatement(
                 actions=["s3:GetObject", "s3:GetObjectVersion"],
-                resources=[self.raw_bucket.arn_for_objects(raw_key_pattern)],
+                resources=[
+                    self.raw_bucket.arn_for_objects(raw_key_pattern),
+                    # Envelope sidecars written by the optional intake API.
+                    self.raw_bucket.arn_for_objects(envelope_key_pattern),
+                ],
             )
         )
         role.add_to_policy(
@@ -2315,6 +2328,276 @@ class DataQualityStack(Stack):
                     apply_to_children=True,
                 )
 
+    def _create_intake(self) -> None:
+        """Prism-compatible message intake: internal HTTPS ALB -> ECS service -> raw bucket.
+
+        Never internet-facing: the load balancer is internal, in the isolated subnets, and its
+        security group admits HTTPS only from the configured sender networks. Tasks have no
+        public IP and admit traffic only from the load balancer. The sender authenticates with
+        an API key generated into Secrets Manager (a documented, customer-requested decision;
+        mutual TLS is the recommended upgrade).
+        """
+        config = self.config
+        self.intake_archive_bucket = s3.Bucket(
+            self,
+            "IntakeArchiveBucket",
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            bucket_key_enabled=True,
+            encryption=s3.BucketEncryption.KMS,
+            encryption_key=self.encryption_key,
+            enforce_ssl=True,
+            minimum_tls_version=1.2,
+            object_ownership=s3.ObjectOwnership.BUCKET_OWNER_ENFORCED,
+            removal_policy=RemovalPolicy.RETAIN,
+            server_access_logs_bucket=self.access_logs_bucket,
+            server_access_logs_prefix="intake-archive/",
+            lifecycle_rules=[
+                s3.LifecycleRule(
+                    id="ExpireArchivedRequests",
+                    expiration=Duration.days(config.intake_archive_retention_days),
+                    noncurrent_version_expiration=Duration.days(1),
+                )
+            ],
+            versioned=True,
+        )
+        self.intake_secret = secretsmanager.Secret(
+            self,
+            "IntakeApiKey",
+            secret_name=f"{self.stack_prefix}/intake/{config.intake_sender_id}",
+            description="API key for the clinical message intake sender (ApiKey/Basic id:secret)",
+            encryption_key=self.encryption_key,
+            generate_secret_string=secretsmanager.SecretStringGenerator(
+                secret_string_template=self.to_json_string({"id": config.intake_sender_id}),
+                generate_string_key="secret",
+                exclude_punctuation=True,
+                password_length=48,
+            ),
+            removal_policy=RemovalPolicy.RETAIN,
+        )
+        NagSuppressions.add_resource_suppressions(
+            self.intake_secret,
+            [
+                {
+                    "id": "AwsSolutions-SMG4",
+                    "reason": (
+                        "The sender stores this key in its own configuration, so rotation is a "
+                        "coordinated manual step with the sender (documented in DEPLOYMENT.md)."
+                    ),
+                }
+            ],
+        )
+
+        self.intake_load_balancer_security_group = ec2.SecurityGroup(
+            self,
+            "IntakeLoadBalancerSecurityGroup",
+            vpc=self.vpc,
+            allow_all_outbound=False,
+            description="HTTPS to the clinical message intake only from approved sender networks",
+        )
+        for cidr in config.intake_source_cidrs:
+            self.intake_load_balancer_security_group.add_ingress_rule(
+                ec2.Peer.ipv4(cidr), ec2.Port.tcp(443), f"HTTPS from intake sender network {cidr}"
+            )
+        self.intake_task_security_group = ec2.SecurityGroup(
+            self,
+            "IntakeTaskSecurityGroup",
+            vpc=self.vpc,
+            allow_all_outbound=True,
+            description="Intake tasks accept traffic only from the internal intake load balancer",
+        )
+        self.intake_task_security_group.add_ingress_rule(
+            self.intake_load_balancer_security_group,
+            ec2.Port.tcp(INTAKE_CONTAINER_PORT),
+            "Intake load balancer to intake tasks",
+        )
+        self.intake_load_balancer_security_group.add_egress_rule(
+            self.intake_task_security_group,
+            ec2.Port.tcp(INTAKE_CONTAINER_PORT),
+            "Intake load balancer to intake tasks",
+        )
+        # Image pull, logs, and the API key reach AWS through private endpoints.
+        for service_key in ("ecr.api", "ecr.dkr", "logs"):
+            self._allow_endpoint_ingress(
+                service_key,
+                self.container_endpoint_security_group,
+                self.intake_task_security_group,
+                "HTTPS from intake tasks to ECR and CloudWatch Logs",
+            )
+        secrets_endpoint_security_group = self._create_endpoint_security_group(
+            "SecretsManagerEndpointSecurityGroup",
+            "AWS Secrets Manager",
+            service_key="secretsmanager",
+            allow_ingestion=False,
+        )
+        self._allow_endpoint_ingress(
+            "secretsmanager",
+            secrets_endpoint_security_group,
+            self.intake_task_security_group,
+            "HTTPS from intake tasks to AWS Secrets Manager",
+        )
+        self._interface_endpoint(
+            "SecretsManagerEndpoint",
+            "secretsmanager",
+            ec2.InterfaceVpcEndpointAwsService.SECRETS_MANAGER,
+            secrets_endpoint_security_group,
+        )
+
+        role = iam.Role(
+            self,
+            "IntakeTaskRole",
+            assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
+            description="Writes intake messages, envelopes, and request archives; reads nothing",
+        )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["s3:PutObject"],
+                resources=[
+                    self.raw_bucket.arn_for_objects("incoming/hl7/*"),
+                    self.raw_bucket.arn_for_objects("incoming/ccda/*"),
+                    self.raw_bucket.arn_for_objects("envelopes/*"),
+                    self.intake_archive_bucket.arn_for_objects("requests/*"),
+                ],
+            )
+        )
+        self.encryption_key.grant_encrypt(role)
+        log_group = self._create_log_group("IntakeLogGroup", f"/ecs/{self.stack_prefix}-intake")
+        task_definition = ecs.FargateTaskDefinition(
+            self,
+            "IntakeTaskDefinition",
+            cpu=config.intake_task_cpu,
+            memory_limit_mib=config.intake_task_memory,
+            runtime_platform=ecs.RuntimePlatform(
+                cpu_architecture=ecs.CpuArchitecture.ARM64,
+                operating_system_family=ecs.OperatingSystemFamily.LINUX,
+            ),
+            task_role=role,
+        )
+        task_definition.add_container(
+            "Intake",
+            image=self._worker_image(),
+            command=["python", "-m", "intake.server"],
+            essential=True,
+            linux_parameters=ecs.LinuxParameters(
+                self, "IntakeLinuxParameters", init_process_enabled=True
+            ),
+            stop_timeout=Duration.seconds(60),
+            port_mappings=[ecs.PortMapping(container_port=INTAKE_CONTAINER_PORT)],
+            logging=ecs.LogDrivers.aws_logs(stream_prefix="intake", log_group=log_group),
+            environment={
+                "ARCHIVE_BUCKET": self.intake_archive_bucket.bucket_name,
+                "AWS_REGION": self.region,
+                "INTAKE_SENDER_ID": config.intake_sender_id,
+                "MAX_CCDA_OBJECT_BYTES": str(config.ccda.max_object_mb * 1024 * 1024),
+                "MAX_HL7_OBJECT_BYTES": str(config.hl7.max_object_mb * 1024 * 1024),
+                # Total request bytes held in memory at once; extra requests wait, then 503.
+                "MAX_INFLIGHT_BYTES": str(config.intake_task_memory * 1024 * 1024 // 3),
+                "MAX_REQUEST_BYTES": str(config.intake_max_request_mb * 1024 * 1024),
+                "PORT": str(INTAKE_CONTAINER_PORT),
+                "RAW_BUCKET": self.raw_bucket.bucket_name,
+            },
+            secrets={
+                "INTAKE_API_SECRET": ecs.Secret.from_secrets_manager(self.intake_secret, "secret"),
+            },
+        )
+        service = ecs.FargateService(
+            self,
+            "IntakeService",
+            cluster=self.ingestion_cluster,
+            task_definition=task_definition,
+            assign_public_ip=False,
+            security_groups=[self.intake_task_security_group],
+            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_ISOLATED),
+            capacity_provider_strategies=[
+                ecs.CapacityProviderStrategy(capacity_provider="FARGATE", weight=1)
+            ],
+            circuit_breaker=ecs.DeploymentCircuitBreaker(enable=True, rollback=True),
+            min_healthy_percent=100,
+            max_healthy_percent=200,
+        )
+        scaling = service.auto_scale_task_count(
+            min_capacity=config.intake_min_tasks, max_capacity=config.intake_max_tasks
+        )
+        scaling.scale_on_cpu_utilization(
+            "IntakeCpuScaling",
+            target_utilization_percent=60,
+            scale_out_cooldown=Duration.seconds(60),
+            scale_in_cooldown=Duration.seconds(300),
+        )
+
+        self.intake_load_balancer = elbv2.ApplicationLoadBalancer(
+            self,
+            "IntakeLoadBalancer",
+            vpc=self.vpc,
+            internet_facing=False,
+            security_group=self.intake_load_balancer_security_group,
+            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_ISOLATED),
+            drop_invalid_header_fields=True,
+            # Large CCDs upload slowly over VPN links; keep the connection open long enough.
+            idle_timeout=Duration.seconds(300),
+        )
+        if Token.is_unresolved(self.region):
+            # Environment-agnostic synthesis (tests, local synth) cannot configure ELB log
+            # delivery; every real deployment passes a region and enables it below.
+            NagSuppressions.add_resource_suppressions(
+                self.intake_load_balancer,
+                [{"id": "AwsSolutions-ELB2", "reason": "Enabled whenever the region is known."}],
+            )
+        else:
+            self.intake_load_balancer.log_access_logs(self.access_logs_bucket, "intake-alb")
+        listener = self.intake_load_balancer.add_listener(
+            "IntakeHttpsListener",
+            port=443,
+            protocol=elbv2.ApplicationProtocol.HTTPS,
+            certificates=[
+                acm.Certificate.from_certificate_arn(
+                    self, "IntakeCertificate", cast(str, config.intake_certificate_arn)
+                )
+            ],
+            ssl_policy=elbv2.SslPolicy.RECOMMENDED_TLS,
+            open=False,
+        )
+        listener.add_targets(
+            "IntakeTargets",
+            port=INTAKE_CONTAINER_PORT,
+            protocol=elbv2.ApplicationProtocol.HTTP,
+            targets=[service],
+            health_check=elbv2.HealthCheck(path="/healthz", healthy_http_codes="200"),
+            deregistration_delay=Duration.seconds(30),
+        )
+        NagSuppressions.add_resource_suppressions(
+            task_definition,
+            [
+                {
+                    "id": "AwsSolutions-ECS2",
+                    "reason": (
+                        "Environment variables hold only bucket names and limits; the API key "
+                        "is injected from Secrets Manager, not set as plain text."
+                    ),
+                },
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": (
+                        "The CDK-generated execution role needs ecr:GetAuthorizationToken, "
+                        "which supports only Resource '*'."
+                    ),
+                },
+            ],
+            apply_to_children=True,
+        )
+        NagSuppressions.add_resource_suppressions(
+            role,
+            [
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": (
+                        "Write-only S3 permissions use suffix wildcards within named prefixes; "
+                        "KMS APIs use service-defined wildcards."
+                    ),
+                }
+            ],
+            apply_to_children=True,
+        )
+
     def _create_outputs(self) -> None:
         if self.metadata_cluster.secret is None:
             raise RuntimeError(AURORA_CREDENTIALS_MISSING)
@@ -2356,5 +2639,9 @@ class DataQualityStack(Stack):
             "FrontendDistributionId": self.distribution.distribution_id,
             "FrontendDistributionDomainName": self.distribution.distribution_domain_name,
         }
+        if self.config.enable_intake:
+            outputs["IntakeLoadBalancerDnsName"] = self.intake_load_balancer.load_balancer_dns_name
+            outputs["IntakeApiKeySecretArn"] = self.intake_secret.secret_arn
+            outputs["IntakeArchiveBucketName"] = self.intake_archive_bucket.bucket_name
         for output_id, value in outputs.items():
             CfnOutput(self, output_id, value=value)
